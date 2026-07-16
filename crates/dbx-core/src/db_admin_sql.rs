@@ -11,6 +11,12 @@ pub enum DatabaseObjectType {
     MaterializedView,
     Procedure,
     Function,
+    Trigger,
+    Sequence,
+    Synonym,
+    Package,
+    PackageBody,
+    Type,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -80,6 +86,8 @@ pub struct DropObjectSqlOptions {
     pub name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signature: Option<String>,
+    #[serde(default)]
+    pub is_public: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -313,6 +321,16 @@ pub fn build_create_user_sql(username: &str, password: &str, tablespace: &str) -
 }
 
 pub fn build_drop_object_sql(options: DropObjectSqlOptions) -> String {
+    if options.database_type == Some(DatabaseType::Xugu) && options.object_type == DatabaseObjectType::Synonym {
+        let name = quote_table_identifier(options.database_type, &options.name);
+        if options.is_public {
+            return format!("DROP PUBLIC SYNONYM {name};");
+        }
+        return format!(
+            "DROP SYNONYM {};",
+            qualified_name(options.database_type, options.schema.as_deref(), &options.name)
+        );
+    }
     let signature = if matches!(options.database_type, Some(DatabaseType::Postgres))
         && matches!(options.object_type, DatabaseObjectType::Function | DatabaseObjectType::Procedure)
     {
@@ -764,6 +782,12 @@ fn object_type_keyword(object_type: DatabaseObjectType) -> &'static str {
         DatabaseObjectType::MaterializedView => "MATERIALIZED VIEW",
         DatabaseObjectType::Procedure => "PROCEDURE",
         DatabaseObjectType::Function => "FUNCTION",
+        DatabaseObjectType::Trigger => "TRIGGER",
+        DatabaseObjectType::Sequence => "SEQUENCE",
+        DatabaseObjectType::Synonym => "SYNONYM",
+        DatabaseObjectType::Package => "PACKAGE",
+        DatabaseObjectType::PackageBody => "PACKAGE BODY",
+        DatabaseObjectType::Type => "TYPE",
     }
 }
 
@@ -1217,6 +1241,7 @@ mod tests {
                 schema: Some("dbo".to_string()),
                 name: "refresh_cache".to_string(),
                 signature: None,
+                is_public: false,
             }),
             "DROP PROCEDURE [dbo].[refresh_cache];"
         );
@@ -1227,8 +1252,64 @@ mod tests {
                 schema: Some("public".to_string()),
                 name: "calc".to_string(),
                 signature: Some("integer, integer".to_string()),
+                is_public: false,
             }),
             "DROP FUNCTION \"public\".\"calc\"(integer, integer);"
+        );
+        assert_eq!(
+            build_drop_object_sql(DropObjectSqlOptions {
+                database_type: Some(DatabaseType::Xugu),
+                object_type: DatabaseObjectType::Type,
+                schema: Some("APP".to_string()),
+                name: "ADDRESS_T".to_string(),
+                signature: None,
+                is_public: false,
+            }),
+            "DROP TYPE \"APP\".\"ADDRESS_T\";"
+        );
+        assert_eq!(
+            build_drop_object_sql(DropObjectSqlOptions {
+                database_type: Some(DatabaseType::Xugu),
+                object_type: DatabaseObjectType::Synonym,
+                schema: Some("APP".to_string()),
+                name: "CUSTOMERS".to_string(),
+                signature: None,
+                is_public: false,
+            }),
+            "DROP SYNONYM \"APP\".\"CUSTOMERS\";"
+        );
+        assert_eq!(
+            build_drop_object_sql(DropObjectSqlOptions {
+                database_type: Some(DatabaseType::Xugu),
+                object_type: DatabaseObjectType::Synonym,
+                schema: Some("APP".to_string()),
+                name: "CUSTOMERS".to_string(),
+                signature: None,
+                is_public: true,
+            }),
+            "DROP PUBLIC SYNONYM \"CUSTOMERS\";"
+        );
+        assert_eq!(
+            build_drop_object_sql(DropObjectSqlOptions {
+                database_type: Some(DatabaseType::Xugu),
+                object_type: DatabaseObjectType::Trigger,
+                schema: Some("APP".to_string()),
+                name: "AUDIT_ORDERS".to_string(),
+                signature: None,
+                is_public: false,
+            }),
+            "DROP TRIGGER \"APP\".\"AUDIT_ORDERS\";"
+        );
+        assert_eq!(
+            build_drop_object_sql(DropObjectSqlOptions {
+                database_type: Some(DatabaseType::Xugu),
+                object_type: DatabaseObjectType::Package,
+                schema: Some("APP".to_string()),
+                name: "ORDERS_API".to_string(),
+                signature: None,
+                is_public: false,
+            }),
+            "DROP PACKAGE \"APP\".\"ORDERS_API\";"
         );
         assert_eq!(
             build_drop_database_sql(DatabaseNameSqlOptions {

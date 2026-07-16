@@ -80,6 +80,10 @@ export function getTreeNodeIconInfo(node: TreeNode): TreeNodeIconInfo | null {
       return { icon: Package, colorClass: "text-cyan-500" };
     case "package-body":
       return { icon: FileCode, colorClass: "text-cyan-400" };
+    case "type":
+      return { icon: Braces, colorClass: "text-violet-500" };
+    case "type-body":
+      return { icon: FileCode, colorClass: "text-violet-400" };
     case "group-tables":
       return { icon: Table, colorClass: "text-green-500" };
     case "group-views":
@@ -94,6 +98,8 @@ export function getTreeNodeIconInfo(node: TreeNode): TreeNodeIconInfo | null {
       return { icon: ListTree, colorClass: "text-emerald-500" };
     case "group-packages":
       return { icon: Package, colorClass: "text-cyan-500" };
+    case "group-types":
+      return { icon: Braces, colorClass: "text-violet-500" };
     case "group-partitions":
       return { icon: node.isExpanded ? FolderOpen : FolderClosed, colorClass: "text-green-400" };
     case "group-extensions":

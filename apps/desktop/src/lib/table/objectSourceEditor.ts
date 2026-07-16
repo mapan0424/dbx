@@ -17,9 +17,10 @@ export type ObjectSourceSaveExecutionMode = "single" | "script";
 
 const postgresLikeRoutineRenameTypes = new Set<DatabaseType>(["postgres", "redshift", "gaussdb", "kwdb", "kingbase", "highgo", "vastbase"]);
 const mysqlLikeRoutineRenameTypes = new Set<DatabaseType>(["mysql", "goldendb"]);
-const oracleLikeRoutineRenameTypes = new Set<DatabaseType>(["oracle", "dameng"]);
+const oracleLikeRoutineRenameTypes = new Set<DatabaseType>(["oracle", "dameng", "xugu"]);
 
 export function supportsSourceBackedRoutineRename(databaseType: DatabaseType | undefined, objectType: ObjectSourceKind): boolean {
+  if (objectType === "SYNONYM") return databaseType === "xugu";
   if (objectType !== "FUNCTION" && objectType !== "PROCEDURE") return false;
   if (!databaseType || databaseType === "sqlserver") return false;
   return mysqlLikeRoutineRenameTypes.has(databaseType) || postgresLikeRoutineRenameTypes.has(databaseType) || oracleLikeRoutineRenameTypes.has(databaseType);

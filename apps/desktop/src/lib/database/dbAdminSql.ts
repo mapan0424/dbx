@@ -7,6 +7,7 @@ export interface DropObjectSqlOptions {
   schema?: string | null;
   name: string;
   signature?: string | null;
+  isPublic?: boolean;
 }
 
 export interface TableAdminSqlOptions {

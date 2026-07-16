@@ -104,7 +104,9 @@ const INSERT_BODY_KEYWORDS = new Set(["SELECT", "WITH"]);
 const ALTER_BODY_KEYWORDS = new Set(["ADD", "ALTER", "COMMENT", "DROP", "MODIFY", "RENAME", "SET"]);
 const SET_OPERATION_KEYWORDS = new Set(["UNION", "INTERSECT", "EXCEPT", "MINUS"]);
 const SET_OPERATION_MODIFIER_KEYWORDS = new Set(["ALL", "DISTINCT"]);
-const ORACLE_LIKE_PL_SQL_DATABASES: ReadonlySet<DatabaseType> = new Set(["oracle", "dameng", "gaussdb", "yashandb", "oscar", "oceanbase-oracle"]);
+// XuguDB uses the same PL/SQL-style BEGIN...END routine bodies as Oracle.
+// Its internal semicolons are not independent editor execution targets.
+const ORACLE_LIKE_PL_SQL_DATABASES: ReadonlySet<DatabaseType> = new Set(["oracle", "dameng", "gaussdb", "yashandb", "oscar", "oceanbase-oracle", "xugu"]);
 const MYSQL_ROUTINE_BLOCK_DATABASES: ReadonlySet<DatabaseType> = new Set(["mysql", "doris", "starrocks", "manticoresearch", "goldendb"]);
 const MYSQL_CREATE_TABLE_OPTION_DATABASES: ReadonlySet<DatabaseType> = new Set(["mysql", "doris", "starrocks", "manticoresearch", "goldendb", "gbase"]);
 const MYSQL_ROUTINE_OBJECT_TYPES = new Set(["PROCEDURE", "FUNCTION", "TRIGGER", "EVENT"]);
@@ -1342,45 +1344,39 @@ function oraclePlSqlBlockIsComplete(sql: string): boolean {
   const tokens = oraclePlSqlTokens(sql);
   if (!startsWithOraclePlSqlBlock(sql)) return false;
 
-  const stack: string[] = [];
-  for (let index = 0; index < tokens.length; index += 1) {
-    const token = tokens[index];
-    if (token.kind !== "word") continue;
+  // A declaration section may contain several semicolons before its BEGIN.
+  // Only an outer END; completes a PL/SQL block.  Mirror the backend parser
+  // so the cursor action and whole-script execution select the same SQL.
+  let depth = 0;
+  let sawBegin = false;
+  let complete = false;
+  let pendingEnd: boolean | null = null;
 
-    if (token.value === "DECLARE") {
-      stack.push("BLOCK");
+  for (const token of tokens) {
+    if (token.kind === "semicolon") {
+      if (pendingEnd === true && depth > 0) {
+        depth -= 1;
+        complete = depth === 0;
+      }
+      pendingEnd = null;
       continue;
     }
+
+    if (pendingEnd !== null) {
+      if (ORACLE_PL_SQL_TERMINATORS.has(token.value)) pendingEnd = false;
+      continue;
+    }
+
     if (token.value === "BEGIN") {
-      if (tokens[index - 1]?.kind === "word" && tokens[index - 1]?.value === "TRANSACTION") continue;
-      const previous = previousWordToken(tokens, index);
-      if (previous === "END") continue;
-      if (stack[stack.length - 1] !== "BLOCK") stack.push("BLOCK");
-      continue;
-    }
-    if (token.value === "IF") {
-      const previous = previousWordToken(tokens, index);
-      if (previous !== "END" && previous !== "ELSIF") stack.push("IF");
-      continue;
-    }
-    if (token.value === "LOOP") {
-      if (previousWordToken(tokens, index) !== "END") stack.push("LOOP");
-      continue;
-    }
-    if (token.value === "CASE") {
-      if (previousWordToken(tokens, index) !== "END") stack.push("CASE");
-      continue;
-    }
-    if (token.value === "END") {
-      const next = nextWordToken(tokens, index);
-      const target = ORACLE_PL_SQL_TERMINATORS.has(next ?? "") ? next : "BLOCK";
-      const top = stack[stack.length - 1];
-      if (top === target || (target === "BLOCK" && top === "BLOCK")) stack.pop();
-      continue;
+      depth += 1;
+      sawBegin = true;
+      complete = false;
+    } else if (token.value === "END") {
+      pendingEnd = true;
     }
   }
 
-  return stack.length === 0 && tokens[tokens.length - 1]?.kind === "semicolon";
+  return sawBegin && complete;
 }
 
 function oraclePlSqlWords(sql: string): string[] {

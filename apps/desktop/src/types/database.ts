@@ -354,14 +354,16 @@ export interface TableInfo {
   parent_name?: string | null;
 }
 
-export type DatabaseObjectType = "TABLE" | "VIEW" | "MATERIALIZED_VIEW" | "PROCEDURE" | "FUNCTION" | "SEQUENCE" | "PACKAGE" | "PACKAGE_BODY";
+export type DatabaseObjectType = "TABLE" | "VIEW" | "MATERIALIZED_VIEW" | "PROCEDURE" | "FUNCTION" | "TRIGGER" | "SEQUENCE" | "SYNONYM" | "PACKAGE" | "PACKAGE_BODY" | "TYPE";
 
 export interface ObjectInfo {
   name: string;
   object_type: DatabaseObjectType | string;
   schema?: string | null;
   signature?: string | null;
+  valid?: boolean | null;
   comment?: string | null;
+  is_public?: boolean | null;
   created_at?: string | null;
   updated_at?: string | null;
   parent_schema?: string | null;
@@ -375,7 +377,7 @@ export interface ObjectStatistics {
   total_bytes?: number | null;
 }
 
-export type ObjectSourceKind = "VIEW" | "MATERIALIZED_VIEW" | "PROCEDURE" | "FUNCTION" | "SEQUENCE" | "PACKAGE" | "PACKAGE_BODY";
+export type ObjectSourceKind = "VIEW" | "MATERIALIZED_VIEW" | "PROCEDURE" | "FUNCTION" | "TRIGGER" | "SEQUENCE" | "SYNONYM" | "PACKAGE" | "PACKAGE_BODY" | "TYPE" | "TYPE_BODY";
 
 export interface ObjectSource {
   name: string;
@@ -427,6 +429,17 @@ export interface TriggerInfo {
   event: string;
   timing: string;
   statement?: string | null;
+  enabled?: boolean | null;
+  valid?: boolean | null;
+  condition?: string | null;
+  trigger_type?: string | null;
+}
+
+export interface XuguPartitionInfo {
+  number: string;
+  name: string;
+  value: string;
+  online?: string;
 }
 
 export interface FunctionInfo {
@@ -587,8 +600,11 @@ export type TreeNodeType =
   | "procedure"
   | "function"
   | "sequence"
+  | "synonym"
   | "package"
   | "package-body"
+  | "type"
+  | "type-body"
   | "group-columns"
   | "group-indexes"
   | "group-fkeys"
@@ -599,13 +615,20 @@ export type TreeNodeType =
   | "group-procedures"
   | "group-functions"
   | "group-sequences"
+  | "group-synonyms"
   | "group-packages"
+  | "group-types"
   | "group-partitions"
+  | "group-subpartitions"
+  | "group-program-members"
+  | "group-program-member-parameters"
   | "group-extensions"
   | "extension"
   | "object-browser"
   | "user-admin"
   | "dameng-job-admin"
+  | "xugu-scheduler"
+  | "xugu-monitor"
   | "saved-sql-root"
   | "saved-sql-folder"
   | "saved-sql-file"
@@ -615,6 +638,10 @@ export type TreeNodeType =
   | "index"
   | "fkey"
   | "trigger"
+  | "partition"
+  | "subpartition"
+  | "program-member"
+  | "program-member-parameter"
   | "redis-db"
   | "mq-tenant"
   | "nacos-namespace"
@@ -665,6 +692,8 @@ export interface TreeNode {
   tableName?: string;
   objectName?: string;
   signature?: string;
+  valid?: boolean;
+  isPublic?: boolean;
   tableType?: string;
   comment?: string | null;
   objectCount?: number;
@@ -676,7 +705,7 @@ export interface TreeNode {
   tableSearchParentId?: string;
   savedSqlId?: string;
   savedSqlFolderId?: string;
-  meta?: ColumnInfo | IndexInfo | ForeignKeyInfo | TriggerInfo | ExtensionInfo | VectorCollectionMeta;
+  meta?: ColumnInfo | IndexInfo | ForeignKeyInfo | TriggerInfo | XuguPartitionInfo | ExtensionInfo | VectorCollectionMeta | import("@/lib/database/xuguProgramMembers").XuguProgramMember | import("@/lib/database/xuguProgramMembers").XuguProgramParameter;
   loadMore?: {
     parentId: string;
     offset: number;
@@ -782,7 +811,7 @@ export interface QueryTab {
   explainExecutionId?: string;
   /** Per-run connection session for sequential MySQL explain formats. */
   explainClientSessionId?: string;
-  mode: "data" | "query" | "redis" | "redis-dashboard" | "mongo" | "mongo-gridfs" | "mongo-bucket" | "vector" | "etcd" | "zookeeper" | "mq" | "nacos" | "objects" | "structure" | "users" | "dameng-jobs" | "processlist" | "mysql-dashboard";
+  mode: "data" | "query" | "redis" | "redis-dashboard" | "mongo" | "mongo-gridfs" | "mongo-bucket" | "vector" | "etcd" | "zookeeper" | "mq" | "nacos" | "objects" | "structure" | "users" | "dameng-jobs" | "xugu-scheduler" | "xugu-monitor" | "processlist" | "mysql-dashboard";
   mqTenant?: string;
   mqInitialTab?: "topics";
   nacosNamespace?: string;

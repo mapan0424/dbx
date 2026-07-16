@@ -105,6 +105,7 @@ pub async fn list_objects(pool: &mysql_async::Pool, schema: &str) -> Result<Vec<
             object_type: get_str(row, 1),
             schema: Some(schema.to_string()),
             signature: None,
+            valid: None,
             comment: None,
             created_at: None,
             updated_at: None,
@@ -273,7 +274,16 @@ pub async fn list_triggers(pool: &mysql_async::Pool, schema: &str, table: &str) 
             } else {
                 "INSTEAD OF"
             };
-            TriggerInfo { name: get_str(row, 0), event: get_str(row, 1), timing: timing.to_string(), statement: None }
+            TriggerInfo {
+                name: get_str(row, 0),
+                event: get_str(row, 1),
+                timing: timing.to_string(),
+                statement: None,
+                enabled: None,
+                valid: None,
+                condition: None,
+                trigger_type: None,
+            }
         })
         .collect())
 }

@@ -47,6 +47,7 @@ import { clearDataGridPendingSnapshotsForTab } from "@/composables/useDataGridEd
 import { buildTabResultSnapshot, deleteTabResultSnapshot, readTabResultSnapshot, tabResultCacheKey, writeTabResultSnapshot } from "@/lib/tabs/tabResultCache";
 import { queryResultBaseSql, queryResultExecutionSql } from "@/lib/tabs/tabPresentation";
 import { isMysqlExecutionErrorResult } from "@/lib/query/queryResultError";
+import { xuguCompileDiagnosticsResult } from "@/lib/database/xuguCompileDiagnostics";
 import { decodeQueryResultArchive, encodeQueryResultArchive, type DecodedQueryResultArchive } from "@/lib/query/queryResultArchive";
 import * as api from "@/lib/backend/api";
 import { useConnectionStore } from "@/stores/connectionStore";
@@ -1105,6 +1106,52 @@ export const useQueryStore = defineStore("query", () => {
     return id;
   }
 
+  function openXuguScheduler(connectionId: string) {
+    const existing = tabs.value.find((tab) => tab.mode === "xugu-scheduler" && tab.connectionId === connectionId);
+    if (existing) {
+      switchTab(existing.id);
+      return existing.id;
+    }
+    const conn = useConnectionStore().getConfig(connectionId);
+    const id = uuid();
+    tabs.value.push({
+      id,
+      title: t("xuguScheduler.title"),
+      connectionId,
+      database: conn?.database || "SYSTEM",
+      sql: "",
+      isExecuting: false,
+      isCancelling: false,
+      isExplaining: false,
+      mode: "xugu-scheduler",
+    });
+    activeTabId.value = id;
+    return id;
+  }
+
+  function openXuguMonitor(connectionId: string) {
+    const existing = tabs.value.find((tab) => tab.mode === "xugu-monitor" && tab.connectionId === connectionId);
+    if (existing) {
+      switchTab(existing.id);
+      return existing.id;
+    }
+    const conn = useConnectionStore().getConfig(connectionId);
+    const id = uuid();
+    tabs.value.push({
+      id,
+      title: t("xuguMonitor.title"),
+      connectionId,
+      database: conn?.database || "SYSTEM",
+      sql: "",
+      isExecuting: false,
+      isCancelling: false,
+      isExplaining: false,
+      mode: "xugu-monitor",
+    });
+    activeTabId.value = id;
+    return id;
+  }
+
   function openMongoBucket(connectionId: string, database: string, bucketName: string) {
     const title = `${database}.${bucketName}`;
     const existing = tabs.value.find((tab) => tab.mode === "mongo-bucket" && tab.connectionId === connectionId && tab.database === database && tab.mongoBucket?.bucketName === bucketName);
@@ -2107,6 +2154,8 @@ export const useQueryStore = defineStore("query", () => {
 
   function toErrorResult(e: any): NonNullable<QueryTab["result"]> {
     const message = e instanceof Error ? e.message : String(e);
+    const xuguDiagnostics = xuguCompileDiagnosticsResult(message);
+    if (xuguDiagnostics) return markQueryResultRowsRaw(xuguDiagnostics);
     return markQueryResultRowsRaw({
       columns: ["Error"],
       execution_error: true,
@@ -4009,6 +4058,8 @@ export const useQueryStore = defineStore("query", () => {
     openProcessList,
     openMysqlDashboard,
     openDamengJobAdmin,
+    openXuguScheduler,
+    openXuguMonitor,
     openMqAdmin,
     openNacosAdmin,
     openTableStructure,

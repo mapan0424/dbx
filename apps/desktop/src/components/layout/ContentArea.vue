@@ -57,6 +57,8 @@ const DatabaseUserAdmin = defineAsyncComponent(() => import("@/components/admin/
 const ProcessListPanel = defineAsyncComponent(() => import("@/components/admin/ProcessListPanel.vue"));
 const MySqlDashboard = defineAsyncComponent(() => import("@/components/admin/MySqlDashboard.vue"));
 const DamengJobAdmin = defineAsyncComponent(() => import("@/components/admin/DamengJobAdmin.vue"));
+const XuguSchedulerAdmin = defineAsyncComponent(() => import("@/components/admin/XuguSchedulerAdmin.vue"));
+const XuguMonitorAdmin = defineAsyncComponent(() => import("@/components/admin/XuguMonitorAdmin.vue"));
 const ExplainPlanViewer = defineAsyncComponent(() => import("@/components/explain/ExplainPlanViewer.vue"));
 const QueryChart = defineAsyncComponent(() => import("@/components/chart/QueryChart.vue"));
 import { useQueryStore } from "@/stores/queryStore";
@@ -1607,6 +1609,14 @@ defineExpose({ focusSearch, refreshData, handleModRTarget, requestQueryEditorExe
 
     <template v-else-if="activeTab.mode === 'dameng-jobs' && activeConnection">
       <DamengJobAdmin :key="activeTab.id" :connection="activeConnection" />
+    </template>
+
+    <template v-else-if="activeTab.mode === 'xugu-scheduler' && activeConnection">
+      <XuguSchedulerAdmin :key="activeTab.id" :connection="activeConnection" />
+    </template>
+
+    <template v-else-if="activeTab.mode === 'xugu-monitor' && activeConnection">
+      <XuguMonitorAdmin :key="activeTab.id" :connection="activeConnection" />
     </template>
   </div>
 </template>

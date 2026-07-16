@@ -189,6 +189,10 @@ impl SqlDialectProfile {
                 | DatabaseType::Yashandb
                 | DatabaseType::Oscar
                 | DatabaseType::OceanbaseOracle
+                // XuguDB supports PL/SQL-style CREATE PROCEDURE/FUNCTION,
+                // PACKAGE, TYPE, and anonymous BEGIN...END blocks.  Keep
+                // internal semicolons in the same top-level statement.
+                | DatabaseType::Xugu
         )
     }
 }
@@ -3037,6 +3041,19 @@ END;";
         assert_eq!(split_sql_statements_for_database(sql, DatabaseType::Oracle), vec![sql.to_string()]);
         assert_eq!(split_sql_statements_for_database(sql, DatabaseType::Dameng), vec![sql.to_string()]);
         assert_eq!(split_sql_statements_for_database(sql, DatabaseType::Gaussdb), vec![sql.to_string()]);
+    }
+
+    #[test]
+    fn xugu_split_keeps_create_procedure_body_together() {
+        let sql = "CREATE OR REPLACE PROCEDURE sp_drop_defaultVal (p_tableName IN VARCHAR, p_colName IN VARCHAR) AS v_sql VARCHAR(2000);\n\nBEGIN\n  v_sql := 'ALTER TABLE \"' || p_tableName || '\" ALTER COLUMN \"' || p_colName || '\" DROP DEFAULT';\n  EXECUTE IMMEDIATE v_sql;\nEND;\n\nSELECT 1;";
+
+        assert_eq!(
+            split_sql_statements_for_database(sql, DatabaseType::Xugu),
+            vec![
+                "CREATE OR REPLACE PROCEDURE sp_drop_defaultVal (p_tableName IN VARCHAR, p_colName IN VARCHAR) AS v_sql VARCHAR(2000);\n\nBEGIN\n  v_sql := 'ALTER TABLE \"' || p_tableName || '\" ALTER COLUMN \"' || p_colName || '\" DROP DEFAULT';\n  EXECUTE IMMEDIATE v_sql;\nEND;",
+                "SELECT 1",
+            ]
+        );
     }
 
     #[test]

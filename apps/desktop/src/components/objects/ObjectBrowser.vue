@@ -61,6 +61,7 @@ import { supportsSchemaDiagram, supportsTableImport, supportsTableStructureEditi
 import { codeMirrorSqlDialect, connectionUsesDatabaseObjectTreeMode, effectiveDatabaseTypeForConnection, tableStructureDatabaseTypeForConnection } from "@/lib/database/jdbcDialect";
 import { getTableMetadataCapabilities, type TableMetadataCapabilities } from "@/lib/table/tableMetadataCapabilities";
 import { buildTableSelectSql } from "@/lib/table/tableSelectSql";
+import { buildRoutineCompileSql, buildTriggerActionSql, buildXuguPackageCompileSql, buildXuguTypeCompileSql, type TriggerAction } from "@/lib/table/routineExecutionSql";
 import { buildDropObjectSql, buildDropTableSql, buildDuplicateTableStructureSql, buildCopyTableDataSql, buildEmptyTableSql, buildTruncateTableSql, supportsDropTableCascade, supportsTruncateTableCascade, type TableAdminSqlOptions } from "@/lib/database/dbAdminSql";
 import { useToast } from "@/composables/useToast";
 import { buildExecutableObjectSourceStatements, buildRoutineRenameObjectSourceStatements, executeObjectSourceSave, supportsSourceBackedRoutineRename } from "@/lib/table/objectSourceEditor";
@@ -98,7 +99,7 @@ import { resolveRowClickAction, shouldDeferSingleClick, type ObjectBrowserRowAct
 import { createSidePanelRequestGuard } from "@/lib/table/sidePanelRequestGuard";
 import { runBatchTableTruncate } from "@/lib/table/batchTableTruncate";
 
-type ObjectFilter = "all" | "tables" | "views" | "materializedViews" | "procedures" | "functions" | "sequences" | "packages";
+type ObjectFilter = "all" | "tables" | "views" | "materializedViews" | "procedures" | "functions" | "triggers" | "sequences" | "synonyms" | "packages" | "types";
 type ObjectBrowserColumnKey = "select" | "name" | "type" | "estimatedRows" | "totalBytes" | "created_at" | "updated_at" | "comment";
 
 const props = defineProps<{
@@ -235,8 +236,11 @@ const viewCount = computed(() => rows.value.filter((row) => row.type === "VIEW")
 const materializedViewCount = computed(() => rows.value.filter((row) => row.type === "MATERIALIZED_VIEW").length);
 const procedureCount = computed(() => rows.value.filter((row) => row.type === "PROCEDURE").length);
 const functionCount = computed(() => rows.value.filter((row) => row.type === "FUNCTION").length);
+const triggerCount = computed(() => rows.value.filter((row) => row.type === "TRIGGER").length);
 const sequenceCount = computed(() => rows.value.filter((row) => row.type === "SEQUENCE").length);
+const synonymCount = computed(() => rows.value.filter((row) => row.type === "SYNONYM").length);
 const packageCount = computed(() => rows.value.filter((row) => row.type === "PACKAGE" || row.type === "PACKAGE_BODY").length);
+const typeCount = computed(() => rows.value.filter((row) => row.type === "TYPE" || row.type === "TYPE_BODY").length);
 const canOpenStructureEditor = computed(() => supportsTableStructureEditing(tableStructureDatabaseType.value));
 const canOpenDiagram = computed(() => !!props.database && supportsSchemaDiagram(effectiveDatabaseType.value));
 const canOpenTableImport = computed(() => !!props.database && supportsTableImport(effectiveDatabaseType.value));
@@ -252,8 +256,11 @@ const objectFilters = computed<ObjectFilter[]>(() =>
       ["materializedViews", materializedViewCount.value],
       ["procedures", procedureCount.value],
       ["functions", functionCount.value],
+      ["triggers", triggerCount.value],
       ["sequences", sequenceCount.value],
+      ["synonyms", synonymCount.value],
       ["packages", packageCount.value],
+      ["types", typeCount.value],
     ] as Array<[ObjectFilter, number]>
   )
     .filter(([filter, count]) => filter === "all" || count > 0)
@@ -525,8 +532,11 @@ function iconFor(row: ObjectBrowserRow) {
   if (row.type === "VIEW" || row.type === "MATERIALIZED_VIEW") return Eye;
   if (row.type === "PROCEDURE") return ScrollText;
   if (row.type === "FUNCTION") return Braces;
+  if (row.type === "TRIGGER") return RotateCcw;
   if (row.type === "SEQUENCE") return ListTree;
+  if (row.type === "SYNONYM") return Link2;
   if (row.type === "PACKAGE" || row.type === "PACKAGE_BODY") return Package;
+  if (row.type === "TYPE" || row.type === "TYPE_BODY") return Braces;
   return Table2;
 }
 
@@ -535,9 +545,12 @@ function typeLabel(type: ObjectBrowserRow["type"]) {
   if (type === "VIEW") return t("objects.view");
   if (type === "PROCEDURE") return t("objects.procedure");
   if (type === "FUNCTION") return t("objects.function");
+  if (type === "TRIGGER") return t("tree.triggers");
   if (type === "SEQUENCE") return t("objects.sequence");
+  if (type === "SYNONYM") return "Synonym";
   if (type === "PACKAGE") return t("objects.package");
   if (type === "PACKAGE_BODY") return t("objects.packageBody");
+  if (type === "TYPE" || type === "TYPE_BODY") return t("tree.types");
   return t("objects.table");
 }
 
@@ -634,8 +647,11 @@ function rowMatchesObjectFilter(row: ObjectBrowserRow) {
   if (objectFilter.value === "materializedViews") return row.type === "MATERIALIZED_VIEW";
   if (objectFilter.value === "procedures") return row.type === "PROCEDURE";
   if (objectFilter.value === "functions") return row.type === "FUNCTION";
+  if (objectFilter.value === "triggers") return row.type === "TRIGGER";
   if (objectFilter.value === "sequences") return row.type === "SEQUENCE";
+  if (objectFilter.value === "synonyms") return row.type === "SYNONYM";
   if (objectFilter.value === "packages") return row.type === "PACKAGE" || row.type === "PACKAGE_BODY";
+  if (objectFilter.value === "types") return row.type === "TYPE" || row.type === "TYPE_BODY";
   return true;
 }
 
@@ -672,8 +688,11 @@ function iconClass(type: ObjectBrowserRow["type"]) {
   if (type === "VIEW" || type === "MATERIALIZED_VIEW") return "text-purple-500";
   if (type === "PROCEDURE") return "text-blue-500";
   if (type === "FUNCTION") return "text-amber-500";
+  if (type === "TRIGGER") return "text-rose-500";
   if (type === "SEQUENCE") return "text-emerald-500";
+  if (type === "SYNONYM") return "text-sky-500";
   if (type === "PACKAGE" || type === "PACKAGE_BODY") return "text-cyan-500";
+  if (type === "TYPE" || type === "TYPE_BODY") return "text-violet-500";
   return "text-green-500";
 }
 
@@ -681,8 +700,11 @@ function iconBgClass(type: ObjectBrowserRow["type"]) {
   if (type === "VIEW" || type === "MATERIALIZED_VIEW") return "object-browser-icon-bg object-browser-icon-bg-view";
   if (type === "PROCEDURE") return "object-browser-icon-bg object-browser-icon-bg-procedure";
   if (type === "FUNCTION") return "object-browser-icon-bg object-browser-icon-bg-function";
+  if (type === "TRIGGER") return "object-browser-icon-bg object-browser-icon-bg-procedure";
   if (type === "SEQUENCE") return "object-browser-icon-bg object-browser-icon-bg-sequence";
+  if (type === "SYNONYM") return "object-browser-icon-bg object-browser-icon-bg-view";
   if (type === "PACKAGE" || type === "PACKAGE_BODY") return "object-browser-icon-bg object-browser-icon-bg-package";
+  if (type === "TYPE" || type === "TYPE_BODY") return "object-browser-icon-bg object-browser-icon-bg-function";
   return "object-browser-icon-bg object-browser-icon-bg-table";
 }
 
@@ -699,6 +721,7 @@ function togglePartitionParent(row: ObjectBrowserRow) {
 }
 
 function canRename(row: ObjectBrowserRow) {
+  if (row.type === "TYPE_BODY") return false;
   return supportsObjectRename(effectiveDatabaseType.value, row.type) || supportsSourceBackedRoutineRename(effectiveDatabaseType.value, row.type as ObjectSourceKind);
 }
 
@@ -1057,7 +1080,7 @@ async function openNewQuery(row: ObjectBrowserRow) {
 }
 
 function openProcedureExecution(row: ObjectBrowserRow) {
-  if (row.type !== "PROCEDURE") return;
+  if (row.type !== "PROCEDURE" && row.type !== "FUNCTION") return;
   procedureExecutionTarget.value = row;
   showProcedureExecutionConfirm.value = true;
 }
@@ -1077,6 +1100,44 @@ async function executeProcedureSql(sql: string) {
   const tabId = queryStore.createTab(props.connection.id, props.database, `Execute - ${row.name}`, "query", schema);
   queryStore.updateSql(tabId, sql);
   await queryStore.executeTabSql(tabId, sql);
+}
+
+async function compileRoutine(row: ObjectBrowserRow) {
+  if (row.type !== "PROCEDURE" && row.type !== "FUNCTION" && row.type !== "PACKAGE" && row.type !== "PACKAGE_BODY" && row.type !== "TYPE" && row.type !== "TYPE_BODY") return;
+  const schema = row.schema || selectedSchema.value;
+  const sql = row.type === "PACKAGE" || row.type === "PACKAGE_BODY"
+    ? buildXuguPackageCompileSql({ databaseType: effectiveDatabaseType.value, schema, packageName: row.name })
+    : row.type === "TYPE" || row.type === "TYPE_BODY"
+      ? buildXuguTypeCompileSql({ databaseType: effectiveDatabaseType.value, schema, typeName: row.name })
+    : buildRoutineCompileSql({
+        databaseType: effectiveDatabaseType.value,
+        schema,
+        routineName: row.name,
+        routineKind: row.type,
+      });
+  if (!sql) return;
+  const tabId = queryStore.createTab(props.connection.id, props.database, `Compile - ${row.name}`, "query", schema);
+  queryStore.updateSql(tabId, sql);
+  await executeObjectBrowserSqlWithProductionGuard(sql, () => queryStore.executeTabSql(tabId, sql));
+  await connectionStore.refreshObjectListTreeNode(props.connection.id, props.database, schema);
+  await loadObjects();
+}
+
+async function alterTrigger(row: ObjectBrowserRow, action: TriggerAction) {
+  if (row.type !== "TRIGGER") return;
+  const schema = row.schema || selectedSchema.value;
+  const sql = buildTriggerActionSql({
+    databaseType: effectiveDatabaseType.value,
+    schema,
+    triggerName: row.name,
+    action,
+  });
+  if (!sql) return;
+  const tabId = queryStore.createTab(props.connection.id, props.database, `${action === "RECOMPILE" ? "Compile" : action} trigger - ${row.name}`, "query", schema);
+  queryStore.updateSql(tabId, sql);
+  await executeObjectBrowserSqlWithProductionGuard(sql, () => queryStore.executeTabSql(tabId, sql));
+  await connectionStore.refreshObjectListTreeNode(props.connection.id, props.database, schema);
+  await loadObjects();
 }
 
 function requestDrop(row: ObjectBrowserRow) {
@@ -1105,6 +1166,7 @@ async function refreshRenamePreviewSql() {
     renamePreviewSqlText.value = "";
     return;
   }
+  if (row.type === "TYPE_BODY") return;
   if (supportsSourceBackedRoutineRename(effectiveDatabaseType.value, row.type as ObjectSourceKind)) {
     renamePreviewSqlText.value = `-- Recreate ${row.type} from source, then drop the original object.`;
     return;
@@ -1131,6 +1193,7 @@ async function confirmRename() {
   const row = renameTarget.value;
   const newName = renameInput.value.trim();
   if (!row || !newName || newName === row.name) return;
+  if (row.type === "TYPE_BODY") return;
   renameError.value = "";
   try {
     const schema = row.schema || selectedSchema.value || props.database;
@@ -1179,7 +1242,7 @@ async function confirmDrop() {
     const sql = dropPreviewSql.value || (await buildDropSqlForRow(row, { cascade: canDropTargetCascade.value && dropTableCascade.value }));
     const executed = await executeObjectBrowserSqlWithProductionGuard(sql, () => api.executeQuery(props.connection.id, props.database, sql));
     if (!executed) return;
-    const successKey = row.type === "VIEW" ? "contextMenu.dropViewSuccess" : row.type === "PROCEDURE" ? "contextMenu.dropProcedureSuccess" : row.type === "FUNCTION" ? "contextMenu.dropFunctionSuccess" : "contextMenu.dropTableSuccess";
+    const successKey = row.type === "VIEW" ? "contextMenu.dropViewSuccess" : row.type === "PROCEDURE" ? "contextMenu.dropProcedureSuccess" : row.type === "FUNCTION" ? "contextMenu.dropFunctionSuccess" : row.type === "TYPE" ? "contextMenu.dropTypeSuccess" : row.type === "SYNONYM" ? "contextMenu.dropTableChildObjectSuccess" : "contextMenu.dropTableSuccess";
     toast(t(successKey, { name: row.name }));
     closeDroppedTableObjectTabsForRow(row);
     await reload();
@@ -1196,11 +1259,13 @@ async function buildDropSqlForRow(row: ObjectBrowserRow, options?: { cascade?: b
   if (row.type === "TABLE") {
     return buildDropTableSql(tableAdminSqlOptions(row, { cascade: options?.cascade && supportsDropTableCascade(effectiveDatabaseType.value) }));
   }
+  if (row.type === "TYPE_BODY") throw new Error("A Xugu type body is removed with its type specification.");
   return buildDropObjectSql({
     databaseType: effectiveDatabaseType.value,
     objectType: row.type,
     schema: row.schema || selectedSchema.value,
     name: row.name,
+    isPublic: row.isPublic,
   });
 }
 
@@ -1224,6 +1289,8 @@ function dropConfirmTitle(): string {
   if (type === "VIEW" || type === "MATERIALIZED_VIEW") return t("contextMenu.confirmDropViewTitle");
   if (type === "PROCEDURE") return t("contextMenu.confirmDropProcedureTitle");
   if (type === "FUNCTION") return t("contextMenu.confirmDropFunctionTitle");
+  if (type === "TYPE") return t("contextMenu.confirmDropTypeTitle");
+  if (type === "SYNONYM") return t("contextMenu.confirmDropObjectTitle");
   return t("contextMenu.confirmDropTableTitle");
 }
 
@@ -1234,6 +1301,8 @@ function dropConfirmMessage(): string {
   if (type === "VIEW" || type === "MATERIALIZED_VIEW") return t("contextMenu.confirmDropViewMessage", { name });
   if (type === "PROCEDURE") return t("contextMenu.confirmDropProcedureMessage", { name });
   if (type === "FUNCTION") return t("contextMenu.confirmDropFunctionMessage", { name });
+  if (type === "TYPE") return t("contextMenu.confirmDropTypeMessage", { name });
+  if (type === "SYNONYM") return t("contextMenu.confirmDropObjectMessage", { name });
   return t("contextMenu.confirmDropTableMessage", { name });
 }
 
@@ -2132,8 +2201,11 @@ function filterCount(filter: ObjectFilter) {
   if (filter === "materializedViews") return materializedViewCount.value;
   if (filter === "procedures") return procedureCount.value;
   if (filter === "functions") return functionCount.value;
+  if (filter === "triggers") return triggerCount.value;
   if (filter === "sequences") return sequenceCount.value;
+  if (filter === "synonyms") return synonymCount.value;
   if (filter === "packages") return packageCount.value;
+  if (filter === "types") return typeCount.value;
   return rows.value.length;
 }
 
@@ -2149,11 +2221,17 @@ function filterLabel(filter: ObjectFilter) {
             ? "objects.procedures"
             : filter === "functions"
               ? "objects.functions"
-              : filter === "sequences"
-                ? "objects.sequences"
-                : filter === "packages"
-                  ? "objects.packages"
-                  : "objects.all";
+              : filter === "triggers"
+                ? "tree.triggers"
+                : filter === "sequences"
+                  ? "objects.sequences"
+                  : filter === "synonyms"
+                    ? "Synonyms"
+                    : filter === "packages"
+                      ? "objects.packages"
+                      : filter === "types"
+                        ? "tree.types"
+                      : "objects.all";
   return `${t(key)} ${filterCount(filter)}`;
 }
 
@@ -2310,8 +2388,15 @@ function getViewMenuItems(item: ObjectBrowserRow): ContextMenuItem[] {
 }
 
 function getProcFuncMenuItems(item: ObjectBrowserRow): ContextMenuItem[] {
+  const canCompile = !!buildRoutineCompileSql({
+    databaseType: effectiveDatabaseType.value,
+    schema: item.schema || selectedSchema.value,
+    routineName: item.name,
+    routineKind: item.type === "FUNCTION" ? "FUNCTION" : "PROCEDURE",
+  });
   return [
-    ...(item.type === "PROCEDURE" ? [{ label: t("contextMenu.executeProcedure"), action: () => openProcedureExecution(item), icon: Play }] : []),
+    { label: item.type === "FUNCTION" ? t("contextMenu.executeFunction") : t("contextMenu.executeProcedure"), action: () => openProcedureExecution(item), icon: Play },
+    ...(canCompile ? [{ label: item.type === "FUNCTION" ? t("contextMenu.compileFunction") : t("contextMenu.compileProcedure"), action: () => compileRoutine(item), icon: RefreshCw }] : []),
     { label: t("contextMenu.viewSource"), action: () => openSource(item), icon: Code2 },
     ...(canRename(item) ? [{ label: t("contextMenu.renameObject"), action: () => requestRename(item), icon: Pencil }] : []),
     { label: "", separator: true },
@@ -2327,8 +2412,72 @@ function getProcFuncMenuItems(item: ObjectBrowserRow): ContextMenuItem[] {
 }
 
 function getPackageMenuItems(item: ObjectBrowserRow): ContextMenuItem[] {
+  const canCompile = !!buildXuguPackageCompileSql({
+    databaseType: effectiveDatabaseType.value,
+    schema: item.schema || selectedSchema.value,
+    packageName: item.name,
+  });
+  return [
+    ...(canCompile ? [{ label: t("contextMenu.compilePackage"), action: () => compileRoutine(item), icon: RefreshCw }] : []),
+    { label: t("contextMenu.viewSource"), action: () => openSource(item), icon: Code2 },
+    { label: "", separator: true },
+    { label: t("contextMenu.copyName"), action: () => copyName(item), icon: Copy },
+  ];
+}
+
+function getTypeMenuItems(item: ObjectBrowserRow): ContextMenuItem[] {
+  const canCompile = !!buildXuguTypeCompileSql({
+    databaseType: effectiveDatabaseType.value,
+    schema: item.schema || selectedSchema.value,
+    typeName: item.name,
+  });
+  return [
+    ...(canCompile ? [{ label: t("contextMenu.compileType"), action: () => compileRoutine(item), icon: RefreshCw }] : []),
+    { label: t("contextMenu.viewSource"), action: () => openSource(item), icon: Code2 },
+    ...(item.type === "TYPE"
+      ? [
+          { label: "", separator: true } as ContextMenuItem,
+          { label: t("contextMenu.dropType"), action: () => requestDrop(item), icon: Trash2, variant: "destructive" as const },
+        ]
+      : []),
+    { label: "", separator: true },
+    { label: t("contextMenu.copyName"), action: () => copyName(item), icon: Copy },
+  ];
+}
+
+function getTriggerMenuItems(item: ObjectBrowserRow): ContextMenuItem[] {
+  const supportsActions = !!buildTriggerActionSql({
+    databaseType: effectiveDatabaseType.value,
+    schema: item.schema || selectedSchema.value,
+    triggerName: item.name,
+    action: "ENABLE",
+  });
+  return [
+    ...(supportsActions
+      ? [
+          { label: t("contextMenu.enableTrigger"), action: () => alterTrigger(item, "ENABLE"), icon: Play },
+          { label: t("contextMenu.disableTrigger"), action: () => alterTrigger(item, "DISABLE"), icon: Square },
+          { label: t("contextMenu.recompileTrigger"), action: () => alterTrigger(item, "RECOMPILE"), icon: RefreshCw },
+          { label: "", separator: true } as ContextMenuItem,
+        ]
+      : []),
+    { label: t("contextMenu.viewSource"), action: () => openSource(item), icon: Code2 },
+    { label: "", separator: true },
+    { label: t("contextMenu.copyName"), action: () => copyName(item), icon: Copy },
+  ];
+}
+
+function getSynonymMenuItems(item: ObjectBrowserRow): ContextMenuItem[] {
   return [
     { label: t("contextMenu.viewSource"), action: () => openSource(item), icon: Code2 },
+    ...(canRename(item) ? [{ label: t("contextMenu.renameObject"), action: () => requestRename(item), icon: Pencil }] : []),
+    { label: "", separator: true },
+    {
+      label: t("contextMenu.confirmDropObjectTitle"),
+      action: () => requestDrop(item),
+      icon: Trash2,
+      variant: "destructive" as const,
+    },
     { label: "", separator: true },
     { label: t("contextMenu.copyName"), action: () => copyName(item), icon: Copy },
   ];
@@ -2337,8 +2486,11 @@ function getPackageMenuItems(item: ObjectBrowserRow): ContextMenuItem[] {
 function getObjectBrowserMenuItems(item: ObjectBrowserRow): ContextMenuItem[] {
   if (item.type === "TABLE") return getTableMenuItems(item);
   if (item.type === "VIEW" || item.type === "MATERIALIZED_VIEW") return getViewMenuItems(item);
+  if (item.type === "TRIGGER") return getTriggerMenuItems(item);
+  if (item.type === "SYNONYM") return getSynonymMenuItems(item);
   if (item.type === "SEQUENCE") return getPackageMenuItems(item);
   if (item.type === "PACKAGE" || item.type === "PACKAGE_BODY") return getPackageMenuItems(item);
+  if (item.type === "TYPE" || item.type === "TYPE_BODY") return getTypeMenuItems(item);
   return getProcFuncMenuItems(item);
 }
 </script>
@@ -2805,7 +2957,8 @@ function getObjectBrowserMenuItems(item: ObjectBrowserRow): ContextMenuItem[] {
             <div v-else class="divide-y">
               <div v-for="trigger in filteredTableTriggers" :key="trigger.name" class="p-3 text-xs">
                 <div class="font-medium truncate">{{ trigger.name }}</div>
-                <div class="mt-1 text-[11px] text-muted-foreground">{{ trigger.timing }} {{ trigger.event }}</div>
+                <div class="mt-1 text-[11px] text-muted-foreground">{{ trigger.timing }} {{ trigger.event }}<template v-if="trigger.trigger_type"> · {{ trigger.trigger_type }}</template><template v-if="trigger.enabled === false"> · DISABLED</template><template v-else-if="trigger.valid === false"> · INVALID</template></div>
+                <div v-if="trigger.condition" class="mt-1 truncate text-[11px] text-muted-foreground">{{ trigger.condition }}</div>
               </div>
             </div>
           </div>
@@ -2988,6 +3141,7 @@ function getObjectBrowserMenuItems(item: ObjectBrowserRow): ContextMenuItem[] {
     :database-type="props.connection.db_type"
     :schema="procedureExecutionTarget.schema || selectedSchema"
     :routine-name="procedureExecutionTarget.name"
+    :routine-kind="procedureExecutionTarget.type === 'FUNCTION' ? 'FUNCTION' : 'PROCEDURE'"
     @open-sql="openProcedureExecutionSql"
     @execute="executeProcedureSql"
   />

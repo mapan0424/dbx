@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { appendTableTreeLoadMoreNode, buildSimpleObjectTreeNodes, buildTableTreeNodes, mergeTableTreePageChildren, tablePartitionGroups, withoutTableTreeLoadMoreNodes } from "@/lib/table/tableTree";
+import { appendTableTreeLoadMoreNode, buildGroupedObjectTreeNodes, buildObjectGroupPlaceholderNodes, buildSimpleObjectTreeNodes, buildTableTreeNodes, mergeTableTreePageChildren, tablePartitionGroups, withoutTableTreeLoadMoreNodes } from "@/lib/table/tableTree";
 import type { ObjectInfo, TableInfo, TreeNode } from "@/types/database";
 
 const context = {
@@ -26,6 +26,78 @@ describe("PostgreSQL overloaded routines", () => {
       ]),
     );
     expect(new Set(nodes.map((node) => node.id)).size).toBe(3);
+  });
+});
+
+describe("stored program object tree", () => {
+  it("keeps invalid Xugu routine labels executable while retaining their status", () => {
+    const nodes = buildSimpleObjectTreeNodes({
+      ...context,
+      schema: "TIBMS_SX_MASTER",
+      objects: [{ name: "sp_OrganizationInitMany", object_type: "PROCEDURE", schema: "TIBMS_SX_MASTER", valid: false }],
+    });
+
+    expect(nodes[0]).toMatchObject({
+      label: "sp_OrganizationInitMany",
+      objectName: "sp_OrganizationInitMany",
+      valid: false,
+    });
+  });
+
+  it("retains invalid status for the grouped sidebar tree icon", () => {
+    const groups = buildGroupedObjectTreeNodes({
+      ...context,
+      schema: "TIBMS_SX_GANTRYLIST",
+      objects: [{ name: "sp_table_createSubAndPar", object_type: "PROCEDURE", schema: "TIBMS_SX_GANTRYLIST", valid: false }],
+    });
+
+    expect(groups[0].children?.[0]).toMatchObject({
+      label: "sp_table_createSubAndPar",
+      objectName: "sp_table_createSubAndPar",
+      valid: false,
+    });
+  });
+
+  it("creates a trigger group and trigger source node", () => {
+    const groups = buildObjectGroupPlaceholderNodes({ ...context, objectTypes: ["TRIGGER"] });
+    expect(groups).toHaveLength(1);
+    expect(groups[0]).toMatchObject({ type: "group-triggers", label: "tree.triggers" });
+    expect(groups[0].objectCount).toBeUndefined();
+
+    const nodes = buildSimpleObjectTreeNodes({ ...context, schema: "SYSTEM", objects: [{ name: "audit_orders", object_type: "TRIGGER", schema: "SYSTEM" }] });
+    expect(nodes).toHaveLength(1);
+    expect(nodes[0]).toMatchObject({ type: "trigger", label: "audit_orders" });
+  });
+
+  it("creates a synonym group and preserves public visibility metadata", () => {
+    const groups = buildObjectGroupPlaceholderNodes({ ...context, objectTypes: ["SYNONYM"] });
+    expect(groups).toHaveLength(1);
+    expect(groups[0]).toMatchObject({ type: "group-synonyms", label: "tree.synonyms" });
+
+    const [group] = buildGroupedObjectTreeNodes({
+      ...context,
+      schema: "APP",
+      objects: [{ name: "orders_alias", object_type: "SYNONYM", schema: "APP", is_public: true }],
+    });
+    expect(group.children?.[0]).toMatchObject({ type: "synonym", label: "orders_alias", objectName: "orders_alias", isPublic: true });
+  });
+});
+
+describe("Xugu user-defined type object tree", () => {
+  it("creates a type group and keeps type specifications and bodies distinct", () => {
+    const groups = buildObjectGroupPlaceholderNodes({ ...context, objectTypes: ["TYPE", "TYPE_BODY"] });
+    expect(groups).toHaveLength(1);
+    expect(groups[0]).toMatchObject({ type: "group-types", label: "tree.types" });
+
+    const nodes = buildSimpleObjectTreeNodes({
+      ...context,
+      schema: "APP",
+      objects: [
+        { name: "address_t", object_type: "TYPE", schema: "APP" },
+        { name: "address_t", object_type: "TYPE_BODY", schema: "APP" },
+      ],
+    });
+    expect(nodes.map((node) => node.type)).toEqual(["type", "type-body"]);
   });
 });
 

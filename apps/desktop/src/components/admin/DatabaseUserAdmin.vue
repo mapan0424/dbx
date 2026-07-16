@@ -45,6 +45,7 @@ const pendingAfterApply = ref<(() => Promise<void>) | undefined>();
 const createUser = ref("app_user");
 const createHost = ref("%");
 const createPassword = ref("");
+const createIsRole = ref(false);
 const newPassword = ref("");
 const privilegeDatabase = ref(props.connection.database || "*");
 const privilegeTable = ref("*");
@@ -57,7 +58,10 @@ const createCanLogin = ref(true);
 const supported = computed(() => supportsDatabaseUserAdmin(props.connection.db_type));
 const provider = computed(() => getDatabaseUserAdminProvider(props.connection.db_type));
 const isPostgres = computed(() => provider.value?.dialect === "postgres");
+const isXugu = computed(() => provider.value?.dialect === "xugu");
+const hasScopedPrivileges = computed(() => isPostgres.value || isXugu.value);
 const selectedUser = computed(() => users.value.find((user) => userKey(user) === selectedUserKey.value));
+const isSelectedRole = computed(() => !!selectedUser.value?.isRole);
 const filteredUsers = computed(() => {
   const query = search.value.trim().toLowerCase();
   if (!query) return users.value;
@@ -68,7 +72,7 @@ const availablePrivileges = computed(() => provider.value?.privilegesForScope(pr
 const hasPrivilegePicker = computed(() => privilegeScope.value !== "role");
 const loginDisableLabel = computed(() => (isPostgres.value ? t("userAdmin.disableLogin") : t("userAdmin.lock")));
 const loginEnableLabel = computed(() => (isPostgres.value ? t("userAdmin.enableLogin") : t("userAdmin.unlock")));
-const createNameLabel = computed(() => (isPostgres.value ? t("userAdmin.roleName") : t("userAdmin.username")));
+const createNameLabel = computed(() => (isXugu.value ? t("userAdmin.principalName") : (isPostgres.value ? t("userAdmin.roleName") : t("userAdmin.username"))));
 const selectedDetail = computed(() => {
   const user = selectedUser.value;
   return user ? provider.value?.detail(user) || "" : "";
@@ -189,18 +193,20 @@ async function applyPendingSql() {
 function previewCreateUser() {
   const userProvider = provider.value;
   if (!userProvider) return;
-  if (!createUser.value.trim() || !createPassword.value) return;
+  if (!createUser.value.trim() || (!createIsRole.value && !createPassword.value)) return;
   previewSql(
     userProvider.createUserSql({
       user: createUser.value.trim(),
       host: createHost.value.trim() || "%",
       password: createPassword.value,
       canLogin: createCanLogin.value,
+      isRole: isXugu.value && createIsRole.value,
     }),
     {
       afterApply: async () => {
         createDialogOpen.value = false;
         createPassword.value = "";
+        createIsRole.value = false;
       },
     },
   );
@@ -229,7 +235,7 @@ function previewDropUser() {
 function previewLoginChange(enabled: boolean) {
   const user = selectedUser.value;
   const userProvider = provider.value;
-  if (!user || !userProvider) return;
+  if (!user || user.isRole || !userProvider) return;
   previewSql(userProvider.alterLoginSql(user, enabled), { danger: true });
 }
 
@@ -237,6 +243,7 @@ function previewGrant() {
   const user = selectedUser.value;
   const userProvider = provider.value;
   if (!user || !userProvider || (privilegeScope.value === "role" && !privilegeRole.value.trim())) return;
+  if (isXugu.value && privilegeScope.value === "table" && (!privilegeDatabase.value.trim() || !privilegeTable.value.trim())) return;
   previewSql(
     userProvider.grantPrivilegesSql({
       user,
@@ -254,6 +261,7 @@ function previewRevoke() {
   const user = selectedUser.value;
   const userProvider = provider.value;
   if (!user || !userProvider || (privilegeScope.value === "role" && !privilegeRole.value.trim())) return;
+  if (isXugu.value && privilegeScope.value === "table" && (!privilegeDatabase.value.trim() || !privilegeTable.value.trim())) return;
   previewSql(
     userProvider.revokePrivilegesSql({
       user,
@@ -276,11 +284,18 @@ function resetPrivilegeDefaults(scope: PrivilegeScope) {
     if (scope === "schema" || scope === "table") privilegeDatabase.value = "public";
     if (scope === "table") privilegeTable.value = "*";
   }
+  if (userProvider.dialect === "xugu") {
+    if (scope === "schema" || scope === "table") privilegeDatabase.value = "SYSDBA";
+    if (scope === "table") privilegeTable.value = "";
+  }
 }
 
 watch(
   () => selectedUserKey.value,
-  () => void loadGrants(),
+  () => {
+    if (isSelectedRole.value && privilegeScope.value === "role") privilegeScope.value = "database";
+    void loadGrants();
+  },
 );
 
 watch(
@@ -328,7 +343,7 @@ onMounted(loadUsers);
         </Button>
         <Button size="sm" class="h-7 gap-1.5 px-2 text-xs" :disabled="!supported" @click="createDialogOpen = true">
           <Plus class="h-3.5 w-3.5" />
-          {{ t("userAdmin.newUser") }}
+          {{ isXugu ? t("userAdmin.newPrincipal") : t("userAdmin.newUser") }}
         </Button>
       </div>
     </div>
@@ -385,21 +400,21 @@ onMounted(loadUsers);
             </Badge>
           </div>
           <div class="ml-auto flex items-center gap-1.5">
-            <Button variant="outline" size="sm" class="h-7 gap-1.5 px-2 text-xs" @click="passwordDialogOpen = true">
+            <Button v-if="!isSelectedRole" variant="outline" size="sm" class="h-7 gap-1.5 px-2 text-xs" @click="passwordDialogOpen = true">
               <KeyRound class="h-3.5 w-3.5" />
               {{ t("userAdmin.changePassword") }}
             </Button>
-            <Button variant="outline" size="sm" class="h-7 gap-1.5 px-2 text-xs" @click="previewLoginChange(false)">
+            <Button v-if="!isSelectedRole" variant="outline" size="sm" class="h-7 gap-1.5 px-2 text-xs" @click="previewLoginChange(false)">
               <Lock class="h-3.5 w-3.5" />
               {{ loginDisableLabel }}
             </Button>
-            <Button variant="outline" size="sm" class="h-7 gap-1.5 px-2 text-xs" @click="previewLoginChange(true)">
+            <Button v-if="!isSelectedRole" variant="outline" size="sm" class="h-7 gap-1.5 px-2 text-xs" @click="previewLoginChange(true)">
               <Unlock class="h-3.5 w-3.5" />
               {{ loginEnableLabel }}
             </Button>
             <Button variant="destructive" size="sm" class="h-7 gap-1.5 px-2 text-xs" @click="previewDropUser">
               <Trash2 class="h-3.5 w-3.5" />
-              {{ t("userAdmin.dropUser") }}
+              {{ isSelectedRole ? t("userAdmin.dropRole") : t("userAdmin.dropUser") }}
             </Button>
           </div>
         </div>
@@ -426,7 +441,7 @@ onMounted(loadUsers);
               <div class="mt-1 text-[11px] leading-4 text-muted-foreground">{{ t("userAdmin.privilegeHint") }}</div>
             </div>
             <div class="min-h-0 flex-1 overflow-auto p-3">
-              <template v-if="isPostgres">
+              <template v-if="hasScopedPrivileges">
                 <label class="mb-2 block text-xs font-medium">{{ t("userAdmin.scope") }}</label>
                 <Select v-model="privilegeScope">
                   <SelectTrigger class="mb-3 h-8 w-full text-xs">
@@ -436,7 +451,7 @@ onMounted(loadUsers);
                     <SelectItem value="database">{{ t("userAdmin.scopeDatabase") }}</SelectItem>
                     <SelectItem value="schema">{{ t("userAdmin.scopeSchema") }}</SelectItem>
                     <SelectItem value="table">{{ t("userAdmin.scopeTable") }}</SelectItem>
-                    <SelectItem value="role">{{ t("userAdmin.scopeRole") }}</SelectItem>
+                    <SelectItem v-if="!isSelectedRole" value="role">{{ t("userAdmin.scopeRole") }}</SelectItem>
                   </SelectContent>
                 </Select>
               </template>
@@ -445,12 +460,12 @@ onMounted(loadUsers);
                 <label class="mb-2 block text-xs font-medium">{{ t("userAdmin.memberRole") }}</label>
                 <Input v-model="privilegeRole" class="mb-3 h-8 text-xs" :placeholder="t('userAdmin.memberRole')" />
               </template>
-              <template v-else>
+              <template v-else-if="!isXugu || privilegeScope !== 'database'">
                 <label class="mb-2 block text-xs font-medium">
-                  {{ isPostgres && privilegeScope !== "database" ? t("userAdmin.schema") : t("userAdmin.database") }}
+                  {{ (isPostgres || isXugu) && privilegeScope !== "database" ? t("userAdmin.schema") : t("userAdmin.database") }}
                 </label>
-                <Input v-model="privilegeDatabase" class="mb-3 h-8 text-xs" :placeholder="isPostgres ? 'public' : '*'" />
-                <template v-if="!isPostgres || privilegeScope === 'table'">
+                <Input v-model="privilegeDatabase" class="mb-3 h-8 text-xs" :placeholder="isPostgres ? 'public' : (isXugu ? 'SYSDBA' : '*')" />
+                <template v-if="(!isPostgres && !isXugu) || privilegeScope === 'table'">
                   <label class="mb-2 block text-xs font-medium">{{ t("userAdmin.table") }}</label>
                   <Input v-model="privilegeTable" class="mb-3 h-8 text-xs" placeholder="*" />
                 </template>
@@ -502,7 +517,11 @@ onMounted(loadUsers);
         <div class="space-y-3">
           <label class="block text-xs font-medium">{{ createNameLabel }}</label>
           <Input v-model="createUser" />
-          <template v-if="!isPostgres">
+          <label v-if="isXugu" class="flex items-center gap-2 text-xs">
+            <input v-model="createIsRole" type="checkbox" class="h-3.5 w-3.5 accent-primary" />
+            {{ t("userAdmin.createRole") }}
+          </label>
+          <template v-if="!isPostgres && !isXugu">
             <label class="block text-xs font-medium">{{ t("userAdmin.host") }}</label>
             <Input v-model="createHost" />
           </template>
@@ -510,12 +529,14 @@ onMounted(loadUsers);
             <input v-model="createCanLogin" type="checkbox" class="h-3.5 w-3.5 accent-primary" />
             {{ t("userAdmin.allowLogin") }}
           </label>
-          <label class="block text-xs font-medium">{{ t("connection.password") }}</label>
-          <PasswordInput v-model="createPassword" />
+          <template v-if="!createIsRole">
+            <label class="block text-xs font-medium">{{ t("connection.password") }}</label>
+            <PasswordInput v-model="createPassword" />
+          </template>
         </div>
         <DialogFooter>
           <Button variant="outline" @click="createDialogOpen = false">{{ t("dangerDialog.cancel") }}</Button>
-          <Button :disabled="!createUser.trim() || !createPassword" @click="previewCreateUser">
+          <Button :disabled="!createUser.trim() || (!createIsRole && !createPassword)" @click="previewCreateUser">
             {{ t("userAdmin.previewSql") }}
           </Button>
         </DialogFooter>

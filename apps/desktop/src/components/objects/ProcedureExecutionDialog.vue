@@ -7,8 +7,8 @@ import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import LightTooltip from "@/components/ui/LightTooltip.vue";
-import { loadRoutineParameters } from "@/lib/table/routineParameters";
-import { acceptsRoutineInput, buildProcedureExecutionSql, buildProcedureExecutionSqlFromValues, type RoutineParameterValue } from "@/lib/table/routineExecutionSql";
+import { loadRoutineParameters, type RoutineKind } from "@/lib/table/routineParameters";
+import { acceptsRoutineInput, buildRoutineExecutionSql, buildRoutineExecutionSqlFromValues, type RoutineParameter, type RoutineParameterValue } from "@/lib/table/routineExecutionSql";
 import type { DatabaseType } from "@/types/database";
 
 const { t } = useI18n();
@@ -20,7 +20,11 @@ const props = defineProps<{
   database: string;
   databaseType?: DatabaseType;
   schema?: string;
+  packageName?: string;
   routineName: string;
+  routineKind?: RoutineKind;
+  /** Parameters parsed from a package specification, when dictionary lookup is unavailable. */
+  initialParameters?: RoutineParameter[];
 }>();
 
 const emit = defineEmits<{
@@ -37,25 +41,33 @@ let loadToken = 0;
 
 const generatedSql = computed(() => {
   if (parameters.value.length) {
-    return buildProcedureExecutionSqlFromValues({
+    return buildRoutineExecutionSqlFromValues({
       databaseType: props.databaseType,
       schema: props.schema,
+      packageName: props.packageName,
       routineName: props.routineName,
+      routineKind: props.routineKind,
       parameters: parameters.value,
     });
   }
-  return buildProcedureExecutionSql({
+  return buildRoutineExecutionSql({
     databaseType: props.databaseType,
     schema: props.schema,
     routineName: props.routineName,
+    routineKind: props.routineKind,
   });
 });
+
+const isFunction = computed(() => props.routineKind === "FUNCTION");
+const executeLabel = computed(() => (isFunction.value ? t("contextMenu.executeFunction") : t("contextMenu.executeProcedure")));
+const executionTitle = computed(() => (isFunction.value ? t("contextMenu.confirmExecuteFunctionTitle") : t("contextMenu.confirmExecuteProcedureTitle")));
+const executionMessage = computed(() => (isFunction.value ? t("contextMenu.confirmExecuteFunctionMessage", { name: props.routineName }) : t("contextMenu.confirmExecuteProcedureMessage", { name: props.routineName })));
 
 const inputParameterCount = computed(() => parameters.value.filter(acceptsRoutineInput).length);
 const outputParameterCount = computed(() => parameters.value.filter((parameter) => parameter.mode === "OUT").length);
 
 watch(
-  () => [open.value, props.connectionId, props.database, props.databaseType, props.schema, props.routineName] as const,
+  () => [open.value, props.connectionId, props.database, props.databaseType, props.schema, props.packageName, props.routineName, props.initialParameters] as const,
   ([isOpen]) => {
     if (!isOpen || !props.connectionId || !props.database || !props.routineName) return;
     void refreshParameters();
@@ -78,6 +90,17 @@ async function refreshParameters() {
   parameters.value = [];
   manualSqlDirty.value = false;
   sqlDraft.value = generatedSql.value;
+  if (props.initialParameters) {
+    parameters.value = props.initialParameters.map((parameter) => ({
+      ...parameter,
+      value: "",
+      useNull: false,
+      useDefault: !!parameter.hasDefault,
+    }));
+    sqlDraft.value = generatedSql.value;
+    loading.value = false;
+    return;
+  }
   try {
     const loaded = await loadRoutineParameters({
       connectionId: props.connectionId,
@@ -85,6 +108,7 @@ async function refreshParameters() {
       databaseType: props.databaseType,
       schema: props.schema,
       routineName: props.routineName,
+      routineKind: props.routineKind,
     });
     if (token !== loadToken) return;
     parameters.value = loaded.map((parameter) => ({
@@ -140,17 +164,17 @@ function canEditParameter(parameter: RoutineParameterValue): boolean {
   <Dialog v-model:open="open">
     <DialogContent class="max-h-[86vh] border border-border !bg-background text-foreground shadow-2xl !backdrop-blur-none sm:max-w-[780px]">
       <DialogHeader>
-        <DialogTitle>{{ t("contextMenu.confirmExecuteProcedureTitle") }}</DialogTitle>
+        <DialogTitle>{{ executionTitle }}</DialogTitle>
       </DialogHeader>
 
       <div class="grid max-h-[calc(86vh-8rem)] gap-4 overflow-y-auto pr-1">
         <div class="flex min-w-0 items-start justify-between gap-3">
           <div class="min-w-0 space-y-1">
             <p class="truncate text-sm text-muted-foreground">
-              {{ t("contextMenu.confirmExecuteProcedureMessage", { name: props.routineName }) }}
+              {{ executionMessage }}
             </p>
             <p class="truncate font-mono text-xs text-muted-foreground">
-              {{ props.schema ? `${props.schema}.${props.routineName}` : props.routineName }}
+              {{ [props.schema, props.packageName, props.routineName].filter(Boolean).join(".") }}
             </p>
           </div>
           <div class="flex shrink-0 items-center gap-2">
@@ -221,7 +245,7 @@ function canEditParameter(parameter: RoutineParameterValue): boolean {
           {{ t("contextMenu.openInSqlEditor") }}
         </Button>
         <Button :disabled="!sqlDraft.trim()" @click="execute">
-          {{ t("contextMenu.executeProcedure") }}
+          {{ executeLabel }}
         </Button>
       </DialogFooter>
     </DialogContent>

@@ -4,7 +4,7 @@ import { useConnectionStore } from "@/stores/connectionStore";
 
 export interface QuickOpenItem {
   id: string;
-  type: "connection" | "database" | "schema" | "table" | "view" | "materialized_view" | "procedure" | "function" | "sequence" | "package" | "package-body";
+  type: "connection" | "database" | "schema" | "table" | "view" | "materialized_view" | "procedure" | "function" | "sequence" | "package" | "package-body" | "type" | "type-body";
   label: string;
   description?: string;
   connectionId: string;
@@ -268,6 +268,21 @@ export function useQuickOpen() {
         });
       }
 
+      if ((node.type === "type" || node.type === "type-body") && node.database && node.label) {
+        items.push({
+          id: `type-${node.type}-${conn.id}-${node.database}-${node.schema || ""}-${node.label}`,
+          type: node.type,
+          label: node.label,
+          description: `${conn.name} / ${node.database}${node.schema ? " / " + node.schema : ""}`,
+          connectionId: conn.id,
+          database: node.database,
+          schema: node.schema,
+          objectName: node.label,
+          connectionName: conn.name,
+          searchText: `${conn.name} ${node.database} ${node.schema || ""} ${node.label}`,
+        });
+      }
+
       // Process children recursively
       if (node.children) {
         processDatabaseTreeNodes(node.children, conn, items);
@@ -326,6 +341,8 @@ export function useQuickOpen() {
         sequence: 8,
         package: 9,
         "package-body": 10,
+        type: 10,
+        "type-body": 10,
       };
       return typeOrder[a.type] - typeOrder[b.type];
     });

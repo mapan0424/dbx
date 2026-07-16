@@ -2043,6 +2043,7 @@ fn row_to_object(row: &mysql_async::Row, database: &str) -> ObjectInfo {
         object_type: get_str_by_name(row, "object_type"),
         schema: Some(database.to_string()),
         signature: None,
+        valid: None,
         comment: get_opt_str(row, "object_comment")
             .map(|s| fix_potential_double_encoding(&s))
             .filter(|s| !s.is_empty()),
@@ -2178,6 +2179,7 @@ pub async fn list_table_objects_show(pool: &MySqlPool, database: &str) -> Result
                 object_type: if table.table_type.eq_ignore_ascii_case("VIEW") { "VIEW" } else { "TABLE" }.to_string(),
                 schema: Some(database.to_string()),
                 signature: None,
+                valid: None,
                 comment: table.comment,
                 created_at: meta.and_then(|meta| meta.created_at.clone()),
                 updated_at: meta.and_then(|meta| meta.updated_at.clone()),
@@ -3794,6 +3796,10 @@ pub async fn list_triggers(pool: &MySqlPool, database: &str, table: &str) -> Res
             event: get_str_by_name(row, "EVENT_MANIPULATION"),
             timing: get_str_by_name(row, "ACTION_TIMING"),
             statement: Some(get_str_by_name(row, "ACTION_STATEMENT")).filter(|value| !value.is_empty()),
+            enabled: None,
+            valid: None,
+            condition: None,
+            trigger_type: None,
         })
         .collect())
 }

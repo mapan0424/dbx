@@ -2052,6 +2052,7 @@ pub async fn list_objects(pool: &Pool, schema: &str) -> Result<Vec<ObjectInfo>, 
             parent_schema: row.try_get::<_, Option<String>>(5).ok().flatten().filter(|s| !s.is_empty()),
             parent_name: row.try_get::<_, Option<String>>(6).ok().flatten().filter(|s| !s.is_empty()),
             signature: row.try_get::<_, Option<String>>(7).ok().flatten(),
+            valid: None,
         })
         .collect())
 }
@@ -2995,6 +2996,10 @@ pub async fn list_triggers(pool: &Pool, schema: &str, table: &str) -> Result<Vec
             event: pg_row_try_string(row, 1),
             timing: pg_row_try_string(row, 2),
             statement: None,
+            enabled: None,
+            valid: None,
+            condition: None,
+            trigger_type: None,
         })
         .collect())
 }

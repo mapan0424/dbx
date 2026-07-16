@@ -15,6 +15,12 @@ import { connectionPasteTargetGroupId, selectedConnectionClipboardNodes, selecte
 import { isEditableSidebarTypeSearchTarget, sidebarTypeSearchNextQuery } from "@/lib/sidebar/sidebarTypeSearch";
 import { usesTreeSchemaMode } from "@/lib/database/databaseFeatureSupport";
 import { connectionUsesDatabaseObjectTreeMode, effectiveDatabaseTypeForConnection } from "@/lib/database/jdbcDialect";
+import { buildRoutineCompileSql, buildTriggerActionSql, buildXuguPackageCompileSql, buildXuguTypeCompileSql, type TriggerAction } from "@/lib/table/routineExecutionSql";
+import { xuguPartitionActionSql, type XuguPartitionAction } from "@/lib/database/xuguPartitions";
+import { xuguRoutineParametersFromSource } from "@/lib/table/routineParameters";
+import type { RoutineParameter } from "@/lib/table/routineExecutionSql";
+import type { XuguProgramMember } from "@/lib/database/xuguProgramMembers";
+import { executeWithProductionSqlGuard } from "@/lib/database/productionExecutionGuard";
 import { activeTabSidebarTarget, findSidebarNodeForActiveTab, findSidebarNodeForTarget, findNodePathForTarget, scrollTopForSidebarNode, shouldScrollActiveSidebarSelection, type ActiveTabSidebarTarget, type SidebarNodeScrollAlign } from "@/lib/sidebar/sidebarActiveTabTarget";
 import { findLoadedTableTargetForCandidate, queryContextTargetFromCandidate, queryCursorTableCandidate, type QueryCursorTableCandidate } from "@/lib/sql/queryCursorTableTarget";
 import { createFlatTreeIndex, SIDEBAR_TREE_ROW_HEIGHT, SIDEBAR_TREE_PRERENDER_COUNT, SIDEBAR_TREE_SCROLL_BUFFER, flattenTree, shouldVirtualizeFlatTree, type FlatTreeNode } from "@/composables/useFlatTree";
@@ -62,7 +68,11 @@ const sidebarDdlTarget = ref<TreeNode | null>(null);
 const sidebarDdlOpen = ref(false);
 const sidebarObjectSourceTarget = ref<{ node: TreeNode; initialEditing: boolean } | null>(null);
 const sidebarObjectSourceOpen = ref(false);
-const sidebarProcedureTarget = ref<TreeNode | null>(null);
+type SidebarRoutineTarget = TreeNode & {
+  packageName?: string;
+  initialParameters?: RoutineParameter[];
+};
+const sidebarProcedureTarget = ref<SidebarRoutineTarget | null>(null);
 const sidebarProcedureOpen = ref(false);
 const sidebarVisibleDatabasesTarget = ref<TreeNode | null>(null);
 const sidebarVisibleDatabasesOpen = ref(false);
@@ -149,9 +159,9 @@ watch(deferredSearchQuery, (newQuery, oldQuery) => {
     .catch(() => {});
 });
 
-const searchableObjectGroupTypes = new Set<TreeNodeType>(["group-tables", "group-views", "group-materialized-views", "group-procedures", "group-functions", "group-sequences", "group-packages"]);
+const searchableObjectGroupTypes = new Set<TreeNodeType>(["group-tables", "group-views", "group-materialized-views", "group-procedures", "group-functions", "group-triggers", "group-sequences", "group-packages", "group-types"]);
 const simpleObjectParentTypes = new Set<TreeNodeType>(["database", "schema", "linked-server-schema"]);
-const simpleObjectChildTypes = new Set<TreeNodeType>(["table", "view", "materialized_view", "procedure", "function", "sequence", "package", "package-body", "load-more"]);
+const simpleObjectChildTypes = new Set<TreeNodeType>(["table", "view", "materialized_view", "procedure", "function", "trigger", "sequence", "package", "package-body", "type", "type-body", "load-more"]);
 
 function isSimpleObjectSearchParent(node: TreeNode): boolean {
   return settingsStore.editorSettings.sidebarObjectDisplay === "simple" && simpleObjectParentTypes.has(node.type) && node.isExpanded === true && (!!node.children?.some((child) => simpleObjectChildTypes.has(child.type)) || !!store.sidebarTableSearchQueries[node.id]?.trim());
@@ -955,10 +965,91 @@ function openSidebarObjectSource(node: TreeNode, initialEditing: boolean) {
 }
 
 function openSidebarProcedure(node: TreeNode) {
-  if (node.type !== "procedure" || !node.connectionId || !node.database) return;
+  if ((node.type !== "procedure" && node.type !== "function") || !node.connectionId || !node.database) return;
   beginSidebarAction();
   sidebarProcedureTarget.value = createSidebarActionTarget(node);
   sidebarProcedureOpen.value = true;
+}
+
+function openSidebarProgramMember(node: TreeNode) {
+  const member = node.meta as XuguProgramMember | undefined;
+  if (node.type !== "program-member" || !node.connectionId || !node.database || !node.tableName || !member || (member.kind !== "PROCEDURE" && member.kind !== "FUNCTION")) return;
+  beginSidebarAction();
+  sidebarProcedureTarget.value = {
+    ...createSidebarActionTarget(node),
+    type: member.kind === "FUNCTION" ? "function" : "procedure",
+    label: member.name,
+    objectName: member.name,
+    packageName: node.tableName,
+    initialParameters: xuguRoutineParametersFromSource(member.declaration),
+  };
+  sidebarProcedureOpen.value = true;
+}
+
+async function compileSidebarRoutine(node: TreeNode) {
+  if ((node.type !== "procedure" && node.type !== "function" && node.type !== "package" && node.type !== "package-body" && node.type !== "type" && node.type !== "type-body") || !node.connectionId || !node.database) return;
+  const connection = store.getConfig(node.connectionId);
+  const databaseType = effectiveDatabaseTypeForConnection(connection);
+  const objectName = node.objectName || node.label;
+  const sql = node.type === "package" || node.type === "package-body"
+    ? buildXuguPackageCompileSql({ databaseType, schema: node.schema, packageName: objectName })
+    : node.type === "type" || node.type === "type-body"
+      ? buildXuguTypeCompileSql({ databaseType, schema: node.schema, typeName: objectName })
+      : buildRoutineCompileSql({
+        databaseType,
+        schema: node.schema,
+        routineName: objectName,
+        routineKind: node.type === "function" ? "FUNCTION" : "PROCEDURE",
+      });
+  if (!sql) return;
+  const tabId = queryStore.createTab(node.connectionId, node.database, `Compile - ${objectName}`, "query", node.schema);
+  queryStore.updateSql(tabId, sql);
+  await executeWithProductionSqlGuard({
+    connection,
+    database: node.database,
+    sql,
+    source: t("production.sourceSidebar"),
+    execute: () => queryStore.executeTabSql(tabId, sql),
+  });
+  await store.refreshObjectListTreeNode(node.connectionId, node.database, node.schema);
+}
+
+async function alterSidebarTrigger(node: TreeNode, action: TriggerAction) {
+  if (node.type !== "trigger" || !node.connectionId || !node.database) return;
+  const connection = store.getConfig(node.connectionId);
+  const sql = buildTriggerActionSql({
+    databaseType: effectiveDatabaseTypeForConnection(connection),
+    schema: node.schema,
+    triggerName: node.objectName || node.label,
+    action,
+  });
+  if (!sql) return;
+  const triggerName = node.objectName || node.label;
+  const tabId = queryStore.createTab(node.connectionId, node.database, `${action === "RECOMPILE" ? "Compile" : action} trigger - ${triggerName}`, "query", node.schema);
+  queryStore.updateSql(tabId, sql);
+  await executeWithProductionSqlGuard({
+    connection,
+    database: node.database,
+    sql,
+    source: t("production.sourceSidebar"),
+    execute: () => queryStore.executeTabSql(tabId, sql),
+  });
+  if (node.tableName) {
+    await store.loadTriggers(node.connectionId, node.database, node.tableName, node.schema, undefined, node.catalog);
+  }
+  await store.refreshObjectListTreeNode(node.connectionId, node.database, node.schema);
+}
+
+async function alterSidebarXuguPartition(node: TreeNode, action: XuguPartitionAction) {
+  if ((node.type !== "partition" && node.type !== "subpartition") || !node.connectionId || !node.database || !node.schema || !node.tableName) return;
+  const connection = store.getConfig(node.connectionId);
+  const sql = xuguPartitionActionSql({ schema: node.schema, table: node.tableName, partition: node.objectName || node.label, action, subpartition: node.type === "subpartition" });
+  const title = `${action === "DROP" ? "Drop" : `Set ${action.toLowerCase()}`} ${node.type} - ${node.label}`;
+  const tabId = queryStore.createTab(node.connectionId, node.database, title, "query", node.schema);
+  queryStore.updateSql(tabId, sql);
+  await executeWithProductionSqlGuard({ connection, database: node.database, sql, source: t("production.sourceSidebar"), execute: () => queryStore.executeTabSql(tabId, sql) });
+  const partitionGroupId = node.id.replace(/:(?:partition|subpartition):.*$/, "");
+  await store.loadXuguPartitions(node.connectionId, node.database, node.tableName, node.schema, partitionGroupId);
 }
 
 function openSidebarData(node: TreeNode, requireSelection: boolean, runner: (node: TreeNode, request: SidebarDataOpenRequest) => Promise<void>) {
@@ -1334,6 +1425,10 @@ defineExpose({ focusSearch, createNewGroup, collapseAllTreeNodes });
               @open-ddl="openSidebarDdl"
               @open-object-source="openSidebarObjectSource"
               @open-procedure="openSidebarProcedure"
+              @open-program-member="openSidebarProgramMember"
+              @compile-routine="compileSidebarRoutine"
+              @alter-trigger="alterSidebarTrigger"
+              @alter-xugu-partition="alterSidebarXuguPartition"
               @open-data="openSidebarData"
               @open-visible-databases="openSidebarVisibleDatabases"
               @open-visible-schemas="openSidebarVisibleSchemas"
@@ -1355,6 +1450,10 @@ defineExpose({ focusSearch, createNewGroup, collapseAllTreeNodes });
             @open-ddl="openSidebarDdl"
             @open-object-source="openSidebarObjectSource"
             @open-procedure="openSidebarProcedure"
+            @open-program-member="openSidebarProgramMember"
+            @compile-routine="compileSidebarRoutine"
+              @alter-trigger="alterSidebarTrigger"
+              @alter-xugu-partition="alterSidebarXuguPartition"
             @open-data="openSidebarData"
             @open-visible-databases="openSidebarVisibleDatabases"
             @open-visible-schemas="openSidebarVisibleSchemas"
@@ -1382,6 +1481,10 @@ defineExpose({ focusSearch, createNewGroup, collapseAllTreeNodes });
             @open-ddl="openSidebarDdl"
             @open-object-source="openSidebarObjectSource"
             @open-procedure="openSidebarProcedure"
+            @open-program-member="openSidebarProgramMember"
+            @compile-routine="compileSidebarRoutine"
+              @alter-trigger="alterSidebarTrigger"
+              @alter-xugu-partition="alterSidebarXuguPartition"
             @open-data="openSidebarData"
             @open-visible-databases="openSidebarVisibleDatabases"
             @open-visible-schemas="openSidebarVisibleSchemas"
@@ -1433,7 +1536,10 @@ defineExpose({ focusSearch, createNewGroup, collapseAllTreeNodes });
       :database="sidebarProcedureTarget.database"
       :database-type="effectiveDatabaseTypeForConnection(store.getConfig(sidebarProcedureTarget.connectionId))"
       :schema="sidebarProcedureTarget.schema"
-      :routine-name="sidebarProcedureTarget.label"
+      :package-name="sidebarProcedureTarget.packageName"
+      :routine-name="sidebarProcedureTarget.objectName || sidebarProcedureTarget.label"
+      :routine-kind="sidebarProcedureTarget.type === 'function' ? 'FUNCTION' : 'PROCEDURE'"
+      :initial-parameters="sidebarProcedureTarget.initialParameters"
       @open-sql="openSidebarProcedureSql"
       @execute="executeSidebarProcedureSql"
     />

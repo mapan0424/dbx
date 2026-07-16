@@ -2220,6 +2220,7 @@ async fn external_driver_presto_like_objects(
             object_type: table.table_type,
             schema: Some(schema.to_string()),
             signature: None,
+            valid: None,
             comment: table.comment,
             created_at: None,
             updated_at: None,
@@ -2601,6 +2602,7 @@ mod tests {
             object_type: object_type.to_string(),
             schema: Some("app".to_string()),
             signature: None,
+            valid: None,
             comment: None,
             created_at: None,
             updated_at: None,
@@ -3318,6 +3320,7 @@ mod tests {
                 object_type: "TABLE".to_string(),
                 schema: Some("DBX_TEST".to_string()),
                 signature: None,
+                valid: None,
                 comment: None,
                 created_at: None,
                 updated_at: None,
@@ -3329,6 +3332,7 @@ mod tests {
                 object_type: "VIEW".to_string(),
                 schema: Some("DBX_TEST".to_string()),
                 signature: None,
+                valid: None,
                 comment: None,
                 created_at: None,
                 updated_at: None,
@@ -3340,6 +3344,7 @@ mod tests {
                 object_type: "PROCEDURE".to_string(),
                 schema: Some("DBX_TEST".to_string()),
                 signature: None,
+                valid: None,
                 comment: None,
                 created_at: None,
                 updated_at: None,
@@ -3763,6 +3768,7 @@ async fn list_objects_once(
                         object_type: table.table_type,
                         schema: None,
                         signature: None,
+                        valid: None,
                         comment: table.comment,
                         created_at: None,
                         updated_at: None,
@@ -3940,6 +3946,7 @@ async fn list_objects_once(
                         object_type: table.table_type,
                         schema: if schema.is_empty() { None } else { Some(schema.to_string()) },
                         signature: None,
+                        valid: None,
                         comment: table.comment,
                         created_at: None,
                         updated_at: None,
@@ -4914,11 +4921,17 @@ fn mysql_qualified_name(database: &str, name: &str) -> String {
 fn sqlite_object_type(kind: &db::ObjectSourceKind) -> &'static str {
     match kind {
         db::ObjectSourceKind::View | db::ObjectSourceKind::MaterializedView => "view",
+        db::ObjectSourceKind::Trigger => "trigger",
         db::ObjectSourceKind::Procedure
         | db::ObjectSourceKind::Function
         | db::ObjectSourceKind::Sequence
+        | db::ObjectSourceKind::Synonym
         | db::ObjectSourceKind::Package
         | db::ObjectSourceKind::PackageBody => "routine",
+        // SQLite does not expose user-defined SQL types in sqlite_master. Keep
+        // this distinct from routines so a same-named routine is never shown
+        // as a type definition.
+        db::ObjectSourceKind::Type | db::ObjectSourceKind::TypeBody => "type",
     }
 }
 
@@ -4927,9 +4940,13 @@ fn sqlserver_object_type_filter(kind: &db::ObjectSourceKind) -> &'static str {
         db::ObjectSourceKind::View => "'V'",
         db::ObjectSourceKind::Procedure => "'P'",
         db::ObjectSourceKind::Function => "'FN','IF','TF','FS','FT'",
+        db::ObjectSourceKind::Trigger => "'TR'",
         db::ObjectSourceKind::Sequence
+        | db::ObjectSourceKind::Synonym
         | db::ObjectSourceKind::Package
         | db::ObjectSourceKind::PackageBody
+        | db::ObjectSourceKind::Type
+        | db::ObjectSourceKind::TypeBody
         | db::ObjectSourceKind::MaterializedView => "''",
     }
 }
@@ -5051,7 +5068,12 @@ fn postgres_object_source_sql_inner(
                 sql_string(name)
             )
         }
-        db::ObjectSourceKind::Package | db::ObjectSourceKind::PackageBody => "SELECT NULL WHERE FALSE".to_string(),
+        db::ObjectSourceKind::Trigger
+        | db::ObjectSourceKind::Synonym
+        | db::ObjectSourceKind::Package
+        | db::ObjectSourceKind::PackageBody
+        | db::ObjectSourceKind::Type
+        | db::ObjectSourceKind::TypeBody => "SELECT NULL WHERE FALSE".to_string(),
     }
 }
 
@@ -5061,9 +5083,13 @@ pub fn oracle_object_source_sql(schema: &str, name: &str, kind: &db::ObjectSourc
         db::ObjectSourceKind::MaterializedView => "MATERIALIZED_VIEW",
         db::ObjectSourceKind::Procedure => "PROCEDURE",
         db::ObjectSourceKind::Function => "FUNCTION",
+        db::ObjectSourceKind::Trigger => "TRIGGER",
         db::ObjectSourceKind::Sequence => "SEQUENCE",
+        db::ObjectSourceKind::Synonym => "SYNONYM",
         db::ObjectSourceKind::Package => "PACKAGE",
         db::ObjectSourceKind::PackageBody => "PACKAGE_BODY",
+        db::ObjectSourceKind::Type => "TYPE",
+        db::ObjectSourceKind::TypeBody => "TYPE_BODY",
     };
     if schema.trim().is_empty() {
         format!("SELECT DBMS_METADATA.GET_DDL({}, {}) FROM DUAL", sql_string(object_type), sql_string(name))
@@ -5091,9 +5117,13 @@ pub fn mysql_object_source_sql(database: &str, name: &str, kind: &db::ObjectSour
         db::ObjectSourceKind::View => format!("SHOW CREATE VIEW {qualified_name}"),
         db::ObjectSourceKind::Procedure => format!("SHOW CREATE PROCEDURE {qualified_name}"),
         db::ObjectSourceKind::Function => format!("SHOW CREATE FUNCTION {qualified_name}"),
+        db::ObjectSourceKind::Trigger => format!("SHOW CREATE TRIGGER {qualified_name}"),
         db::ObjectSourceKind::Sequence
+        | db::ObjectSourceKind::Synonym
         | db::ObjectSourceKind::Package
         | db::ObjectSourceKind::PackageBody
+        | db::ObjectSourceKind::Type
+        | db::ObjectSourceKind::TypeBody
         | db::ObjectSourceKind::MaterializedView => String::new(),
     }
 }
@@ -5310,6 +5340,7 @@ async fn oracle_agent_list_objects(
                 object_type,
                 schema,
                 signature: None,
+                valid: None,
                 comment: None,
                 created_at: None,
                 updated_at: None,
@@ -5731,6 +5762,14 @@ mod object_source_tests {
         assert_eq!(
             oracle_object_source_sql("", "PAYROLL", &ObjectSourceKind::Package),
             "SELECT DBMS_METADATA.GET_DDL('PACKAGE', 'PAYROLL') FROM DUAL"
+        );
+        assert_eq!(
+            oracle_object_source_sql("HR", "ADDRESS_T", &ObjectSourceKind::Type),
+            "SELECT DBMS_METADATA.GET_DDL('TYPE', 'ADDRESS_T', 'HR') FROM DUAL"
+        );
+        assert_eq!(
+            oracle_object_source_sql("HR", "ADDRESS_T", &ObjectSourceKind::TypeBody),
+            "SELECT DBMS_METADATA.GET_DDL('TYPE_BODY', 'ADDRESS_T', 'HR') FROM DUAL"
         );
     }
 

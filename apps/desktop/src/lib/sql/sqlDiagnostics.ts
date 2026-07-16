@@ -11,6 +11,14 @@ function toZeroBased(value: string | undefined): number | null {
 }
 
 export function parseSqlErrorLocation(message: string): SqlErrorLocation | null {
+  // XuguDB reports nested diagnostics as `[E19182 L3 C33] ...`.
+  const xuguLineColumn = /\[E\d+\s+L(\d+)\s+C(\d+)\]/i.exec(message);
+  if (xuguLineColumn) {
+    const line = toZeroBased(xuguLineColumn[1]);
+    const column = toZeroBased(xuguLineColumn[2]);
+    if (line != null && column != null) return { line, column };
+  }
+
   const lineColumn = /\bline\s+(\d+)\s*[,:\s]\s*column\s+(\d+)\b/i.exec(message) ?? /\bline\s+(\d+)\b[\s\S]{0,80}?\bcol(?:umn)?\s+(\d+)\b/i.exec(message);
   if (lineColumn) {
     const line = toZeroBased(lineColumn[1]);

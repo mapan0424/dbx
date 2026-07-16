@@ -2052,6 +2052,10 @@ pub async fn list_triggers(pool: &SqliteHandle, _schema: &str, table: &str) -> R
                         event: event.to_string(),
                         timing: timing.to_string(),
                         statement: sql_text,
+                        enabled: None,
+                        valid: None,
+                        condition: None,
+                        trigger_type: None,
                     })
                 })
                 .map_err(|e| e.to_string())?;

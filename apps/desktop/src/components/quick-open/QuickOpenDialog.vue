@@ -107,6 +107,9 @@ function getTypeLabel(type: string): string {
       return t("common.package");
     case "package-body":
       return t("common.packageBody");
+    case "type":
+    case "type-body":
+      return t("tree.types");
     default:
       return type;
   }

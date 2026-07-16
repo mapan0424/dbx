@@ -2,6 +2,8 @@
 import { ref, computed, nextTick, watch, onBeforeUnmount, inject, reactive } from "vue";
 import { useSqlHighlighter } from "@/composables/useSqlHighlighter";
 import { useI18n } from "vue-i18n";
+import type { TriggerAction } from "@/lib/table/routineExecutionSql";
+import type { XuguProgramMember } from "@/lib/database/xuguProgramMembers";
 import { translateBackendError } from "@/i18n/backend-errors";
 import {
   Database,
@@ -21,6 +23,7 @@ import {
   TableProperties,
   Key,
   Link,
+  Link2,
   Zap,
   ListTree,
   Pencil,
@@ -62,6 +65,7 @@ import {
   Archive,
   Square,
   X,
+  CircleX,
 } from "@lucide/vue";
 import type { ContextMenuItem } from "@/components/ui/CustomContextMenu.vue";
 import { CONNECTION_ATTEMPT_CANCELLED_MESSAGE, useConnectionStore } from "@/stores/connectionStore";
@@ -83,6 +87,9 @@ import { revealPathInFileManager } from "@/lib/backend/tauri";
 import { clearActiveTableReferencePayload, createTableReferencePayload, createTableReferenceDropEvent, setActiveTableReferencePayload, type QueryEditorTableReferencePayload } from "@/lib/editor/queryEditorTableDrop";
 import { usesSyntheticRowIdKey } from "@/lib/table/tableEditing";
 import { tableOpenPageLimit } from "@/lib/table/tableOpenPageLimit";
+import { xuguObjectDependenciesSql, type XuguDependencyObjectType } from "@/lib/database/xuguDependencies";
+import type { XuguPartitionAction } from "@/lib/database/xuguPartitions";
+import { xuguTablespaceInventorySql } from "@/lib/database/xuguTablespaces";
 import { getCachedTableMetadata, loadTableMetadata, TABLE_METADATA_CACHE_TTL_MS, tableMetadataToDataTabMeta } from "@/lib/metadata/tableMetadataCache";
 import {
   canConfigureVisibleSchemasForTreeNode,
@@ -353,6 +360,10 @@ const emit = defineEmits<{
   "open-ddl": [node: TreeNode];
   "open-object-source": [node: TreeNode, initialEditing: boolean];
   "open-procedure": [node: TreeNode];
+  "open-program-member": [node: TreeNode];
+  "compile-routine": [node: TreeNode];
+  "alter-trigger": [node: TreeNode, action: TriggerAction];
+  "alter-xugu-partition": [node: TreeNode, action: XuguPartitionAction];
   "open-data": [node: TreeNode, requireSelection: boolean, runner: (node: TreeNode, request: SidebarDataOpenRequest) => Promise<void>];
   "open-visible-databases": [node: TreeNode];
   "open-visible-schemas": [node: TreeNode];
@@ -454,7 +465,10 @@ function getIconInfo(node: TreeNode): { icon: any; colorClass: string } | null {
     case "user-admin":
       return { icon: UsersRound, colorClass: "text-primary" };
     case "dameng-job-admin":
+    case "xugu-scheduler":
       return { icon: CalendarClock, colorClass: "text-primary" };
+    case "xugu-monitor":
+      return { icon: Server, colorClass: "text-primary" };
     case "index":
       return { icon: Key, colorClass: "text-amber-400" };
     case "fkey":
@@ -490,10 +504,16 @@ function getIconInfo(node: TreeNode): { icon: any; colorClass: string } | null {
       return { icon: Braces, colorClass: "text-amber-500" };
     case "sequence":
       return { icon: ListTree, colorClass: "text-emerald-500" };
+    case "synonym":
+      return { icon: Link2, colorClass: "text-sky-500" };
     case "package":
       return { icon: Package, colorClass: "text-cyan-500" };
     case "package-body":
       return { icon: FileCode, colorClass: "text-cyan-400" };
+    case "type":
+      return { icon: Braces, colorClass: "text-violet-500" };
+    case "type-body":
+      return { icon: FileCode, colorClass: "text-violet-400" };
     case "group-tables":
       return { icon: Table, colorClass: "text-green-500" };
     case "group-views":
@@ -506,10 +526,25 @@ function getIconInfo(node: TreeNode): { icon: any; colorClass: string } | null {
       return { icon: Braces, colorClass: "text-amber-500" };
     case "group-sequences":
       return { icon: ListTree, colorClass: "text-emerald-500" };
+    case "group-synonyms":
+      return { icon: Link2, colorClass: "text-sky-500" };
     case "group-packages":
       return { icon: Package, colorClass: "text-cyan-500" };
+    case "group-types":
+      return { icon: Braces, colorClass: "text-violet-500" };
     case "group-partitions":
+    case "group-subpartitions":
+    case "group-program-members":
+    case "group-program-member-parameters":
       return { icon: node.isExpanded ? FolderOpen : FolderClosed, colorClass: "text-green-400" };
+    case "partition":
+      return { icon: ListTree, colorClass: "text-green-400" };
+    case "subpartition":
+      return { icon: ListTree, colorClass: "text-emerald-300" };
+    case "program-member":
+      return { icon: Code2, colorClass: "text-cyan-300" };
+    case "program-member-parameter":
+      return { icon: ListFilter, colorClass: "text-sky-300" };
     case "group-extensions":
       return { icon: Package, colorClass: "text-violet-500" };
     case "extension":
@@ -521,7 +556,7 @@ function getIconInfo(node: TreeNode): { icon: any; colorClass: string } | null {
   }
 }
 
-const groupTypes: Set<TreeNodeType> = new Set(["group-columns", "group-indexes", "group-fkeys", "group-triggers", "group-tables", "group-views", "group-materialized-views", "group-procedures", "group-functions", "group-sequences", "group-packages", "group-partitions", "group-extensions"]);
+const groupTypes: Set<TreeNodeType> = new Set(["group-columns", "group-indexes", "group-fkeys", "group-triggers", "group-tables", "group-views", "group-materialized-views", "group-procedures", "group-functions", "group-sequences", "group-synonyms", "group-packages", "group-types", "group-partitions", "group-subpartitions", "group-program-members", "group-program-member-parameters", "group-extensions"]);
 function isGroupLabel(node: TreeNode): boolean {
   return groupTypes.has(node.type);
 }
@@ -529,7 +564,7 @@ function isGroupLabel(node: TreeNode): boolean {
 function displayLabel(node: TreeNode): string {
   if (node.type === "load-more") return t(node.label);
   if (node.type === "object-browser") return t(node.label, { count: node.objectCount ?? 0 });
-  if (node.type === "user-admin" || node.type === "dameng-job-admin") return t(node.label);
+  if (node.type === "user-admin" || node.type === "dameng-job-admin" || node.type === "xugu-scheduler" || node.type === "xugu-monitor") return t(node.label);
   if (node.type === "linked-server-root") return t(node.label);
   if (node.label === "tree.defaultDatabase") return t(node.label);
   return isGroupLabel(node) ? t(node.label) : node.label;
@@ -540,6 +575,10 @@ function visibleLabel(node: TreeNode): string {
     return sidebarDisplayTableName(node.label, settingsStore.editorSettings.sidebarHiddenTablePrefixes);
   }
   return displayLabel(node);
+}
+
+function treeNodeTooltipLabel(node: TreeNode): string {
+  return node.valid === false ? `${displayLabel(node)} · INVALID` : displayLabel(node);
 }
 
 type DetailTooltipRow = {
@@ -641,7 +680,7 @@ const connectionInfoTooltip = computed(() => {
 const objectCommentTooltip = computed(() => {
   const node = props.node;
   const comment = node.type === "column" && node.meta && "comment" in node.meta ? (node.meta as ColumnInfo).comment : node.comment;
-  if (!comment || (node.type !== "schema" && node.type !== "table" && node.type !== "view" && node.type !== "column")) return null;
+  if (!comment || (node.type !== "schema" && node.type !== "table" && node.type !== "view" && node.type !== "column" && node.type !== "trigger" && node.type !== "program-member")) return null;
   const rows: DetailTooltipRow[] = [
     { label: t("connection.name"), value: visibleLabel(node) },
     { label: t("structureEditor.comment"), value: cleanTooltipValue(comment), multiline: true },
@@ -653,7 +692,7 @@ const detailTooltip = computed(() => connectionInfoTooltip.value ?? objectCommen
 
 function isTooltipDisabled(): boolean {
   if (detailTooltip.value?.rows.length) return isRenamingGroup.value;
-  return isRenamingGroup.value || !labelOverflowing.value;
+  return isRenamingGroup.value || (props.node.valid !== false && !labelOverflowing.value);
 }
 
 async function toggle() {
@@ -671,13 +710,7 @@ async function toggle() {
     return;
   }
 
-  if (node.type === "group-partitions") {
-    node.isExpanded = !node.isExpanded;
-    emit("node-toggled", node, wasExpanded);
-    return;
-  }
-
-  const databaseObjectGroup = node.type === "group-tables" || node.type === "group-views" || node.type === "group-materialized-views" || node.type === "group-procedures" || node.type === "group-functions" || node.type === "group-sequences" || node.type === "group-packages";
+  const databaseObjectGroup = node.type === "group-tables" || node.type === "group-views" || node.type === "group-materialized-views" || node.type === "group-procedures" || node.type === "group-functions" || node.type === "group-triggers" || node.type === "group-sequences" || node.type === "group-synonyms" || node.type === "group-packages" || node.type === "group-types";
   if (databaseObjectGroup && connectionStore.isTreeNodeChildrenLoaded(node.id)) {
     node.isExpanded = !node.isExpanded;
     if (wasExpanded) connectionStore.releaseCollapsedTreeNodeChildren(node.id);
@@ -742,6 +775,12 @@ async function toggle() {
     } else if (node.type === "dameng-job-admin" && node.connectionId) {
       await connectionStore.ensureConnected(node.connectionId);
       queryStore.openDamengJobAdmin(node.connectionId);
+    } else if (node.type === "xugu-scheduler" && node.connectionId) {
+      await connectionStore.ensureConnected(node.connectionId);
+      queryStore.openXuguScheduler(node.connectionId);
+    } else if (node.type === "xugu-monitor" && node.connectionId) {
+      await connectionStore.ensureConnected(node.connectionId);
+      queryStore.openXuguMonitor(node.connectionId);
     } else if (node.type === "mongo-db" && node.connectionId && node.database) {
       await connectionStore.loadMongoCollections(node.connectionId, node.database);
     } else if (node.type === "vector-database" && node.connectionId && node.database) {
@@ -805,6 +844,12 @@ async function toggle() {
       await connectionStore.loadForeignKeys(node.connectionId, node.database, node.tableName, node.schema, node.id, node.catalog);
     } else if (node.type === "group-triggers" && node.connectionId && hasTreeNodeDatabaseContext(node) && node.tableName) {
       await connectionStore.loadTriggers(node.connectionId, node.database, node.tableName, node.schema, node.id, node.catalog);
+    } else if (node.type === "group-partitions" && node.connectionId && hasTreeNodeDatabaseContext(node) && node.tableName) {
+      await connectionStore.loadXuguPartitions(node.connectionId, node.database, node.tableName, node.schema, node.id);
+    } else if ((node.type === "package" || node.type === "type") && currentDatabaseType() === "xugu") {
+      await connectionStore.loadXuguProgramMembers(node);
+    } else if (node.type === "group-subpartitions") {
+      node.isExpanded = true;
     } else if (databaseObjectGroup) {
       await connectionStore.loadObjectGroupChildren(node);
     }
@@ -840,7 +885,7 @@ function runRowClickAction(clickDetail: number) {
     scheduleOpenData(node);
   } else if (isDocumentBrowserTreeNode(node.type)) {
     openMongoTreeData(node);
-  } else if (node.type === "procedure" || node.type === "function" || node.type === "sequence" || node.type === "package" || node.type === "package-body") {
+  } else if (node.type === "procedure" || node.type === "function" || node.type === "sequence" || node.type === "synonym" || node.type === "package" || node.type === "package-body" || node.type === "type" || node.type === "type-body") {
     openObjectSourceDialog(false);
   } else if (action === "toggle") {
     toggle();
@@ -1122,7 +1167,7 @@ function canRefreshTreeNodeShortcut(): boolean {
   if (type === "connection" || type === "database" || type === "schema" || type === "table" || type === "view") {
     return true;
   }
-  return isGroupLabel(props.node) && type !== "group-partitions";
+  return isGroupLabel(props.node) && type !== "group-subpartitions";
 }
 
 function requestRenameSelectedNode(): boolean {
@@ -1299,6 +1344,30 @@ async function openDamengJobAdmin() {
     await connectionStore.ensureConnected(node.connectionId);
     connectionStore.activeConnectionId = node.connectionId;
     queryStore.openDamengJobAdmin(node.connectionId);
+  } catch (e: any) {
+    toast(t("connection.connectFailed", { message: translateBackendError(t, e?.message || String(e)) }), 5000);
+  }
+}
+
+async function openXuguScheduler() {
+  const node = props.node;
+  if (!node.connectionId) return;
+  try {
+    await connectionStore.ensureConnected(node.connectionId);
+    connectionStore.activeConnectionId = node.connectionId;
+    queryStore.openXuguScheduler(node.connectionId);
+  } catch (e: any) {
+    toast(t("connection.connectFailed", { message: translateBackendError(t, e?.message || String(e)) }), 5000);
+  }
+}
+
+async function openXuguMonitor() {
+  const node = props.node;
+  if (!node.connectionId) return;
+  try {
+    await connectionStore.ensureConnected(node.connectionId);
+    connectionStore.activeConnectionId = node.connectionId;
+    queryStore.openXuguMonitor(node.connectionId);
   } catch (e: any) {
     toast(t("connection.connectFailed", { message: translateBackendError(t, e?.message || String(e)) }), 5000);
   }
@@ -1928,13 +1997,15 @@ function dropObjectSqlOptions(): DropObjectSqlOptions | null {
 }
 
 function dropObjectSqlOptionsForNode(node: TreeNode): DropObjectSqlOptions | null {
-  if (node.type !== "view" && node.type !== "materialized_view" && node.type !== "procedure" && node.type !== "function") return null;
+  const isStandaloneTrigger = node.type === "trigger" && !node.tableName;
+  if (node.type !== "view" && node.type !== "materialized_view" && node.type !== "procedure" && node.type !== "function" && node.type !== "type" && node.type !== "synonym" && node.type !== "package" && !isStandaloneTrigger) return null;
   return {
     databaseType: tableStructureDatabaseTypeForNode(node),
-    objectType: node.type === "view" ? "VIEW" : node.type === "materialized_view" ? "MATERIALIZED_VIEW" : node.type === "procedure" ? "PROCEDURE" : "FUNCTION",
+    objectType: node.type === "view" ? "VIEW" : node.type === "materialized_view" ? "MATERIALIZED_VIEW" : node.type === "procedure" ? "PROCEDURE" : node.type === "function" ? "FUNCTION" : node.type === "synonym" ? "SYNONYM" : node.type === "trigger" ? "TRIGGER" : node.type === "package" ? "PACKAGE" : "TYPE",
     schema: node.schema,
     name: node.objectName || node.label,
     signature: node.signature,
+    isPublic: node.isPublic,
   };
 }
 
@@ -1990,6 +2061,7 @@ function dropObjectMenuLabel(): string {
   if (props.node.type === "materialized_view") return t("contextMenu.dropView");
   if (props.node.type === "procedure") return t("contextMenu.dropProcedure");
   if (props.node.type === "function") return t("contextMenu.dropFunction");
+  if (props.node.type === "type") return t("contextMenu.dropType");
   return t("contextMenu.dropObject");
 }
 
@@ -1998,6 +2070,7 @@ function dropObjectConfirmTitle(): string {
   if (props.node.type === "materialized_view") return t("contextMenu.confirmDropViewTitle");
   if (props.node.type === "procedure") return t("contextMenu.confirmDropProcedureTitle");
   if (props.node.type === "function") return t("contextMenu.confirmDropFunctionTitle");
+  if (props.node.type === "type") return t("contextMenu.confirmDropTypeTitle");
   return t("contextMenu.confirmDropObjectTitle");
 }
 
@@ -2006,6 +2079,7 @@ function dropObjectConfirmMessage(): string {
   if (props.node.type === "materialized_view") return t("contextMenu.confirmDropViewMessage", { name: props.node.label });
   if (props.node.type === "procedure") return t("contextMenu.confirmDropProcedureMessage", { name: props.node.label });
   if (props.node.type === "function") return t("contextMenu.confirmDropFunctionMessage", { name: props.node.label });
+  if (props.node.type === "type") return t("contextMenu.confirmDropTypeMessage", { name: props.node.label });
   return t("contextMenu.confirmDropObjectMessage", { name: props.node.label });
 }
 
@@ -2062,8 +2136,64 @@ function openObjectSourceDialog(initialEditing: boolean) {
 
 function openProcedureExecution() {
   const node = props.node;
-  if (node.type !== "procedure" || !node.connectionId || !node.database) return;
+  if ((node.type !== "procedure" && node.type !== "function") || !node.connectionId || !node.database) return;
   emit("open-procedure", node);
+}
+
+function openProgramMemberExecution() {
+  const node = props.node;
+  const member = node.meta as XuguProgramMember | undefined;
+  if (node.type !== "program-member" || !node.connectionId || !node.database || !node.tableName || !member || (member.kind !== "PROCEDURE" && member.kind !== "FUNCTION")) return;
+  emit("open-program-member", node);
+}
+
+function compileRoutine() {
+  const node = props.node;
+  if ((node.type !== "procedure" && node.type !== "function" && node.type !== "package" && node.type !== "package-body" && node.type !== "type" && node.type !== "type-body") || !node.connectionId || !node.database) return;
+  emit("compile-routine", node);
+}
+
+function openXuguDependencies() {
+  const node = props.node;
+  if (!node.connectionId || !node.database || currentDatabaseType() !== "xugu" || !node.schema) return;
+  const typeByNode: Partial<Record<TreeNodeType, XuguDependencyObjectType>> = {
+    table: "table",
+    view: "view",
+    procedure: "procedure",
+    function: "function",
+    trigger: "trigger",
+    package: "package",
+  };
+  const objectType = typeByNode[node.type];
+  const objectName = node.objectName || node.label;
+  if (!objectType || !objectName) return;
+  const sql = xuguObjectDependenciesSql({ schema: node.schema, objectName, objectType });
+  const tabId = queryStore.createTab(node.connectionId, node.database, `${t("contextMenu.viewDependencies")} - ${objectName}`, "query", node.schema);
+  queryStore.updateSql(tabId, sql);
+  void queryStore.executeTabSql(tabId, sql);
+}
+
+function openXuguTablespaces() {
+  const node = props.node;
+  if (node.type !== "connection" || !node.connectionId || currentDatabaseType() !== "xugu") return;
+  const config = connectionStore.getConfig(node.connectionId);
+  const database = config?.database || "SYSTEM";
+  const sql = xuguTablespaceInventorySql();
+  const tabId = queryStore.createTab(node.connectionId, database, t("contextMenu.viewTablespaces"), "query");
+  queryStore.updateSql(tabId, sql);
+  void queryStore.executeTabSql(tabId, sql);
+}
+
+function alterXuguTrigger(action: TriggerAction) {
+  const node = props.node;
+  if (node.type !== "trigger" || !node.connectionId || !node.database || currentDatabaseType() !== "xugu") return;
+  emit("alter-trigger", node, action);
+}
+
+function alterXuguPartition(action: XuguPartitionAction) {
+  const node = props.node;
+  if ((node.type !== "partition" && node.type !== "subpartition") || !node.connectionId || !node.database || !node.schema || !node.tableName || currentDatabaseType() !== "xugu") return;
+  emit("alter-xugu-partition", node, action);
 }
 
 function requestDropObject() {
@@ -2080,7 +2210,7 @@ function requestDropTableChildObject() {
 function canDropTreeNode(node: TreeNode): boolean {
   if (isSqlServerLinkedNode(node)) return false;
   if (node.type === "table") return !!node.connectionId && !!node.database;
-  if (node.type === "view" || node.type === "materialized_view" || node.type === "procedure" || node.type === "function") {
+  if (node.type === "view" || node.type === "materialized_view" || node.type === "procedure" || node.type === "function" || node.type === "type" || node.type === "synonym" || node.type === "package" || (node.type === "trigger" && !node.tableName)) {
     return !!node.connectionId && !!node.database && !!dropObjectSqlOptionsForNode(node);
   }
   if (canDropMongoIndexNode(node)) return true;
@@ -2347,7 +2477,7 @@ function requestDropSelectedNode(): boolean {
     dropTable();
     return true;
   }
-  if (props.node.type === "view" || props.node.type === "procedure" || props.node.type === "function") {
+  if (props.node.type === "view" || props.node.type === "procedure" || props.node.type === "function" || props.node.type === "synonym" || props.node.type === "package" || (props.node.type === "trigger" && !props.node.tableName)) {
     requestDropObject();
     return true;
   }
@@ -2368,6 +2498,7 @@ function nodeRenameObjectType(): RenameableObjectType | null {
   if (props.node.type === "materialized_view") return "MATERIALIZED_VIEW";
   if (props.node.type === "procedure") return "PROCEDURE";
   if (props.node.type === "function") return "FUNCTION";
+  if (props.node.type === "synonym") return "SYNONYM";
   return null;
 }
 
@@ -2431,7 +2562,7 @@ watch([showRenameObjectDialog, renameObjectName, () => props.node.label, () => p
 
 async function confirmRenameObject() {
   const node = sidebarFormTarget.value ?? props.node;
-  const objectType = node.type === "table" ? "TABLE" : node.type === "view" ? "VIEW" : node.type === "materialized_view" ? "MATERIALIZED_VIEW" : node.type === "procedure" ? "PROCEDURE" : node.type === "function" ? "FUNCTION" : null;
+  const objectType = node.type === "table" ? "TABLE" : node.type === "view" ? "VIEW" : node.type === "materialized_view" ? "MATERIALIZED_VIEW" : node.type === "procedure" ? "PROCEDURE" : node.type === "function" ? "FUNCTION" : node.type === "synonym" ? "SYNONYM" : null;
   const newName = renameObjectName.value.trim();
   if (!objectType || !newName || newName === node.label || !node.connectionId || !node.database) return;
   renameObjectError.value = "";
@@ -2479,7 +2610,7 @@ async function confirmDropObject() {
     await connectionStore.ensureConnected(node.connectionId);
     const sql = dropObjectPreviewSql.value || (await buildDropObjectSql(options));
     await executeTreeNodeSqlWithProductionGuard(node, sql, { database: node.database, schema: node.schema });
-    const msgKey = node.type === "view" ? "contextMenu.dropViewSuccess" : node.type === "materialized_view" ? "contextMenu.dropViewSuccess" : node.type === "procedure" ? "contextMenu.dropProcedureSuccess" : "contextMenu.dropFunctionSuccess";
+    const msgKey = node.type === "view" ? "contextMenu.dropViewSuccess" : node.type === "materialized_view" ? "contextMenu.dropViewSuccess" : node.type === "procedure" ? "contextMenu.dropProcedureSuccess" : node.type === "function" ? "contextMenu.dropFunctionSuccess" : node.type === "package" ? "contextMenu.dropPackageSuccess" : node.type === "synonym" || node.type === "trigger" ? "contextMenu.dropTableChildObjectSuccess" : "contextMenu.dropTypeSuccess";
     toast(t(msgKey, { name: node.label }), 3000);
     closeDroppedTableObjectTabsForNode(node);
     if (node.type === "view" || node.type === "materialized_view") {
@@ -3616,6 +3747,47 @@ function createView() {
   });
 }
 
+function createType() {
+  const node = props.node;
+  if (!node.connectionId || !node.database) return;
+  connectionStore.activeConnectionId = node.connectionId;
+  const typeName = "new_type";
+  const qualifiedName = node.schema ? `${node.schema}.${typeName}` : typeName;
+  const tabId = queryStore.createTab(node.connectionId, node.database, t("contextMenu.createType"), "query", node.schema);
+  // Xugu requires '/' to terminate CREATE TYPE blocks in script mode.
+  queryStore.updateSql(tabId, `CREATE OR REPLACE TYPE ${qualifiedName} AS OBJECT (\n  attribute_name VARCHAR(255)\n);\n/\n`);
+}
+
+function createSynonym() {
+  const node = props.node;
+  if (!node.connectionId || !node.database) return;
+  connectionStore.activeConnectionId = node.connectionId;
+  const synonymName = "new_synonym";
+  const qualifiedName = node.schema ? `${node.schema}.${synonymName}` : synonymName;
+  const tabId = queryStore.createTab(node.connectionId, node.database, t("contextMenu.createSynonym"), "query", node.schema);
+  queryStore.updateSql(tabId, `CREATE SYNONYM ${qualifiedName} FOR target_schema.target_object;\n`);
+  queryStore.setObjectSource(tabId, {
+    schema: node.schema,
+    name: synonymName,
+    objectType: "SYNONYM",
+  });
+}
+
+function createPackage() {
+  const node = props.node;
+  if (!node.connectionId || !node.database) return;
+  connectionStore.activeConnectionId = node.connectionId;
+  const packageName = "new_package";
+  const qualifiedName = node.schema ? `${node.schema}.${packageName}` : packageName;
+  const tabId = queryStore.createTab(node.connectionId, node.database, t("contextMenu.createPackage"), "query", node.schema);
+  queryStore.updateSql(tabId, `CREATE OR REPLACE PACKAGE ${qualifiedName} AS\n  -- Public declarations\nEND ${packageName};\n/\n\nCREATE OR REPLACE PACKAGE BODY ${qualifiedName} AS\n  -- Procedure and function implementations\nEND ${packageName};\n/\n`);
+  queryStore.setObjectSource(tabId, {
+    schema: node.schema,
+    name: packageName,
+    objectType: "PACKAGE",
+  });
+}
+
 async function saveFileContent(content: string, defaultFileName: string, filterName: string, filterExt: string) {
   if (isTauriRuntime()) {
     const { save } = await import("@tauri-apps/plugin-dialog");
@@ -4176,10 +4348,8 @@ function openFieldLineage() {
 }
 
 const canExpand = computed(() =>
-  canTreeNodeShowExpander({
-    type: props.node.type,
-    childCount: props.node.children?.length ?? 0,
-  }),
+  (currentDatabaseType() === "xugu" && (props.node.type === "package" || props.node.type === "type")) ||
+  canTreeNodeShowExpander({ type: props.node.type, childCount: props.node.children?.length ?? 0 }),
 );
 const canPin = computed(() => canTreeNodePin(props.node.type));
 const canOpenSqlFileExecution = computed(() => {
@@ -4215,12 +4385,12 @@ const isPinned = computed(() => props.node.pinned || connectionStore.isTreeNodeP
 const isNodeDefaultDatabase = computed(() => (props.node.type === "database" || props.node.type === "redis-db" || props.node.type === "mongo-db") && !!props.node.connectionId && !!props.node.database && connectionStore.isDefaultDatabase(props.node.connectionId, props.node.database));
 const hasTypeMenu = computed(() => {
   const t = props.node.type;
-  return t === "connection" || t === "database" || t === "schema" || t === "table" || t === "view" || t === "column" || t === "procedure" || t === "function" || t === "package" || t === "package-body" || isGroupLabel(props.node);
+  return t === "connection" || t === "database" || t === "schema" || t === "table" || t === "view" || t === "column" || t === "procedure" || t === "function" || t === "synonym" || t === "package" || t === "package-body" || t === "type" || t === "type-body" || isGroupLabel(props.node);
 });
 const columnComment = computed(() => (!settingsStore.editorSettings.sidebarHideTableComments && props.node.type === "column" && props.node.meta && "comment" in props.node.meta ? (props.node.meta as any).comment : null));
 const tableComment = computed(() =>
   !settingsStore.editorSettings.sidebarHideTableComments &&
-  (props.node.type === "schema" || props.node.type === "table" || props.node.type === "view" || props.node.type === "mongo-collection" || props.node.type === "vector-collection" || props.node.type === "elasticsearch-index") &&
+  (props.node.type === "schema" || props.node.type === "table" || props.node.type === "view" || props.node.type === "trigger" || props.node.type === "mongo-collection" || props.node.type === "vector-collection" || props.node.type === "elasticsearch-index") &&
   props.node.comment
     ? props.node.comment
     : null,
@@ -5064,6 +5234,9 @@ function treeItemMenuItems(): ContextMenuItem[] {
       items.push({ label: t("contextMenu.closeConnection"), action: disconnectConnection, icon: Unplug });
     }
     items.push({ label: t("contextMenu.newQuery"), action: newQuery, icon: TerminalSquare });
+    if (currentDatabaseType() === "xugu") {
+      items.push({ label: t("contextMenu.viewTablespaces"), action: openXuguTablespaces, icon: HardDriveDownload });
+    }
     if (currentDatabaseType() === "redis") {
       items.push({ label: t("contextMenu.instanceInfo"), action: openRedisInstanceInfo, icon: Info });
     }
@@ -5080,6 +5253,10 @@ function treeItemMenuItems(): ContextMenuItem[] {
     }
     if (currentDatabaseType() === "dameng") {
       items.push({ label: t("contextMenu.damengJobAdmin"), action: openDamengJobAdmin, icon: CalendarClock });
+    }
+    if (currentDatabaseType() === "xugu") {
+      items.push({ label: t("contextMenu.xuguScheduler"), action: openXuguScheduler, icon: CalendarClock });
+      items.push({ label: t("contextMenu.xuguMonitor"), action: openXuguMonitor, icon: Server });
     }
     if (canCopyFinalProxyPort.value) {
       items.push({ label: t("contextMenu.copyFinalProxyPort"), action: copyFinalProxyPort, icon: Network });
@@ -5306,6 +5483,14 @@ function treeItemMenuItems(): ContextMenuItem[] {
     items.push({ label: t("contextMenu.openDamengJobAdmin"), action: openDamengJobAdmin, icon: CalendarClock });
     return items;
   }
+  if (node.type === "xugu-scheduler") {
+    items.push({ label: t("contextMenu.openXuguScheduler"), action: openXuguScheduler, icon: CalendarClock });
+    return items;
+  }
+  if (node.type === "xugu-monitor") {
+    items.push({ label: t("contextMenu.openXuguMonitor"), action: openXuguMonitor, icon: Server });
+    return items;
+  }
 
   if (node.type === "redis-db" || node.type === "mongo-db") {
     items.push({ label: t("contextMenu.newQuery"), action: newQuery, icon: TerminalSquare });
@@ -5401,6 +5586,9 @@ function treeItemMenuItems(): ContextMenuItem[] {
         action: () => emit("open-ddl", node),
         icon: FileCode,
       });
+    }
+    if (currentDatabaseType() === "xugu" && (node.type === "table" || node.type === "view")) {
+      items.push({ label: t("contextMenu.viewDependencies"), action: openXuguDependencies, icon: Network });
     }
     if (canOpenStructureEditor.value) {
       items.push({ label: t("contextMenu.editStructure"), action: openStructureEditor, icon: PencilRuler });
@@ -5523,6 +5711,18 @@ function treeItemMenuItems(): ContextMenuItem[] {
 
   if (node.type === "index" || node.type === "fkey" || node.type === "trigger") {
     items.push({ label: t("contextMenu.copyName"), action: copyName, icon: Copy, shortcut: shortcutCopyName.value });
+    if (node.type === "trigger" && !node.tableName) {
+      items.push({ label: t("contextMenu.viewSource"), action: () => openObjectSourceDialog(false), icon: Code2 });
+    }
+    if (node.type === "trigger" && currentDatabaseType() === "xugu") {
+      items.push({ label: "", separator: true });
+      items.push(
+        { label: t("contextMenu.enableTrigger"), action: () => alterXuguTrigger("ENABLE"), icon: Play },
+        { label: t("contextMenu.disableTrigger"), action: () => alterXuguTrigger("DISABLE"), icon: Square },
+        { label: t("contextMenu.recompileTrigger"), action: () => alterXuguTrigger("RECOMPILE"), icon: RefreshCw },
+      );
+      items.push({ label: t("contextMenu.viewDependencies"), action: openXuguDependencies, icon: Network });
+    }
     if (node.type === "index" && canOpenStructureEditor.value) {
       items.push({ label: "", separator: true });
       items.push({ label: t("contextMenu.editIndex"), action: openStructureEditor, icon: PencilRuler });
@@ -5532,6 +5732,15 @@ function treeItemMenuItems(): ContextMenuItem[] {
       items.push({
         label: deleteMenuLabel(t("contextMenu.dropIndex")),
         action: deleteMenuAction(dropMongoIndex),
+        icon: Trash2,
+        shortcut: shortcutDelete,
+        variant: "destructive" as const,
+      });
+    } else if (node.type === "trigger" && !node.tableName) {
+      items.push({ label: "", separator: true });
+      items.push({
+        label: deleteMenuLabel(t("contextMenu.dropTrigger")),
+        action: deleteMenuAction(requestDropObject),
         icon: Trash2,
         shortcut: shortcutDelete,
         variant: "destructive" as const,
@@ -5549,12 +5758,35 @@ function treeItemMenuItems(): ContextMenuItem[] {
     return items;
   }
 
+  if (node.type === "program-member") {
+    items.push({ label: t("contextMenu.copyName"), action: copyName, icon: Copy, shortcut: shortcutCopyName.value });
+    const member = node.meta as XuguProgramMember | undefined;
+    if (currentDatabaseType() === "xugu" && (member?.kind === "PROCEDURE" || member?.kind === "FUNCTION")) {
+      items.push({ label: member.kind === "FUNCTION" ? t("contextMenu.executeFunction") : t("contextMenu.executeProcedure"), action: openProgramMemberExecution, icon: Play });
+    }
+    return items;
+  }
+
+  if (node.type === "partition" || node.type === "subpartition") {
+    items.push({ label: t("contextMenu.copyName"), action: copyName, icon: Copy, shortcut: shortcutCopyName.value });
+    items.push({ label: "Set online", action: () => alterXuguPartition("ONLINE"), icon: Play });
+    items.push({ label: "Set offline", action: () => alterXuguPartition("OFFLINE"), icon: Square });
+    if (node.type === "partition") {
+      items.push({ label: "", separator: true });
+      items.push({ label: t("contextMenu.dropPartition"), action: () => alterXuguPartition("DROP"), icon: Trash2, variant: "destructive" });
+    }
+    return items;
+  }
+
   // 8. Procedure / Function / Package
   if (node.type === "procedure" || node.type === "function") {
-    if (node.type === "procedure") {
-      items.push({ label: t("contextMenu.executeProcedure"), action: openProcedureExecution, icon: Play });
+    items.push({ label: node.type === "function" ? t("contextMenu.executeFunction") : t("contextMenu.executeProcedure"), action: openProcedureExecution, icon: Play });
+    const databaseType = currentDatabaseType();
+    if (databaseType === "xugu" || databaseType === "oracle" || databaseType === "dameng" || databaseType === "oceanbase-oracle") {
+      items.push({ label: node.type === "function" ? t("contextMenu.compileFunction") : t("contextMenu.compileProcedure"), action: compileRoutine, icon: RefreshCw });
     }
     items.push({ label: t("contextMenu.viewSource"), action: () => openObjectSourceDialog(false), icon: Code2 });
+    if (databaseType === "xugu") items.push({ label: t("contextMenu.viewDependencies"), action: openXuguDependencies, icon: Network });
     if (canRenameObject.value) {
       items.push({
         label: t("contextMenu.renameObject"),
@@ -5581,8 +5813,45 @@ function treeItemMenuItems(): ContextMenuItem[] {
     return items;
   }
 
+  if (node.type === "synonym") {
+    items.push({ label: t("contextMenu.viewSource"), action: () => openObjectSourceDialog(false), icon: Code2 });
+    if (canRenameObject.value) items.push({ label: t("contextMenu.renameObject"), action: openRenameObjectDialog, icon: Pencil, shortcut: shortcutRename });
+    items.push({ label: "", separator: true });
+    items.push({ label: deleteMenuLabel(t("contextMenu.confirmDropObjectTitle")), action: deleteMenuAction(requestDropObject), icon: Trash2, shortcut: shortcutDelete, variant: "destructive" as const });
+    items.push({ label: "", separator: true });
+    items.push({ label: t("contextMenu.copyName"), action: copyName, icon: Copy, shortcut: shortcutCopyName.value });
+    return items;
+  }
+
   if (node.type === "package" || node.type === "package-body") {
     items.push({ label: t("contextMenu.viewSource"), action: () => openObjectSourceDialog(false), icon: Code2 });
+    if (currentDatabaseType() === "xugu") {
+      items.push({ label: t("contextMenu.compilePackage"), action: compileRoutine, icon: RefreshCw });
+      if (node.type === "package") items.push({ label: t("contextMenu.viewDependencies"), action: openXuguDependencies, icon: Network });
+    }
+    if (node.type === "package" && currentDatabaseType() === "xugu") {
+      items.push({ label: "", separator: true });
+      items.push({ label: deleteMenuLabel(t("contextMenu.dropPackage")), action: deleteMenuAction(requestDropObject), icon: Trash2, shortcut: shortcutDelete, variant: "destructive" as const });
+    }
+    items.push({ label: "", separator: true });
+    items.push({ label: t("contextMenu.copyName"), action: copyName, icon: Copy, shortcut: shortcutCopyName.value });
+    return items;
+  }
+
+  if (node.type === "type" || node.type === "type-body") {
+    items.push({ label: t("contextMenu.viewSource"), action: () => openObjectSourceDialog(false), icon: Code2 });
+    if (currentDatabaseType() === "xugu") {
+      items.push({ label: t("contextMenu.compileType"), action: compileRoutine, icon: RefreshCw });
+    }
+    if (node.type === "type") {
+      items.push({
+        label: deleteMenuLabel(t("contextMenu.dropType")),
+        action: deleteMenuAction(requestDropObject),
+        icon: Trash2,
+        shortcut: shortcutDelete,
+        variant: "destructive" as const,
+      });
+    }
     items.push({ label: "", separator: true });
     items.push({ label: t("contextMenu.copyName"), action: copyName, icon: Copy, shortcut: shortcutCopyName.value });
     return items;
@@ -5596,7 +5865,7 @@ function treeItemMenuItems(): ContextMenuItem[] {
 
   // 9. Group Labels (group-columns, group-tables, etc.)
   if (isGroupLabel(node)) {
-    const hasGroupCreateAction = (node.type === "group-tables" && canCreateTable.value) || (node.type === "group-views" && !!node.connectionId && !!node.database);
+    const hasGroupCreateAction = (node.type === "group-tables" && canCreateTable.value) || (node.type === "group-views" && !!node.connectionId && !!node.database) || (node.type === "group-types" && !!node.connectionId && !!node.database && currentDatabaseType() === "xugu") || (node.type === "group-synonyms" && !!node.connectionId && !!node.database && currentDatabaseType() === "xugu") || (node.type === "group-packages" && !!node.connectionId && !!node.database && currentDatabaseType() === "xugu");
     const canLoadAllObjectGroup = node.type === "group-tables" || node.type === "group-views" || node.type === "group-materialized-views";
     if (node.type === "group-tables" && canCreateTable.value) {
       items.push({ label: t("contextMenu.createTable"), action: createTable, icon: Plus });
@@ -5609,6 +5878,15 @@ function treeItemMenuItems(): ContextMenuItem[] {
     }
     if (node.type === "group-views" && node.connectionId && node.database) {
       items.push({ label: t("contextMenu.createView"), action: createView, icon: Plus });
+    }
+    if (node.type === "group-types" && node.connectionId && node.database && currentDatabaseType() === "xugu") {
+      items.push({ label: t("contextMenu.createType"), action: createType, icon: Plus });
+    }
+    if (node.type === "group-synonyms" && node.connectionId && node.database && currentDatabaseType() === "xugu") {
+      items.push({ label: t("contextMenu.createSynonym"), action: createSynonym, icon: Plus });
+    }
+    if (node.type === "group-packages" && node.connectionId && node.database && currentDatabaseType() === "xugu") {
+      items.push({ label: t("contextMenu.createPackage"), action: createPackage, icon: Plus });
     }
     if (hasGroupCreateAction) {
       items.push({ label: "", separator: true });
@@ -5629,7 +5907,7 @@ function treeItemMenuItems(): ContextMenuItem[] {
         disabled: node.isLoading,
       });
     }
-    if (node.type !== "group-partitions") {
+    if (node.type !== "group-subpartitions") {
       items.push({
         label: t("contextMenu.refreshChildren"),
         action: refresh,
@@ -5673,7 +5951,7 @@ function treeItemMenuItems(): ContextMenuItem[] {
   </div>
 
   <div v-else @contextmenu="onTreeItemContextMenu">
-    <LightTooltip :text="displayLabel(node)" :disabled="isTooltipDisabled()" side="right" :side-offset="8" :delay="0" :close-delay="0" :surface="detailTooltip ? 'popover' : 'foreground'">
+    <LightTooltip :text="treeNodeTooltipLabel(node)" :disabled="isTooltipDisabled()" side="right" :side-offset="8" :delay="0" :close-delay="0" :surface="detailTooltip ? 'popover' : 'foreground'">
       <div
         ref="rowRef"
         class="group flex items-center gap-1.5 py-1 px-2 cursor-pointer relative outline-none"
@@ -5716,9 +5994,12 @@ function treeItemMenuItems(): ContextMenuItem[] {
           </button>
         </template>
         <span v-else class="w-3.5 h-3.5 shrink-0" />
-        <DatabaseIcon v-if="node.type === 'connection'" :db-type="connectionIconType(node.connectionId)" class="h-3.5 w-3.5 shrink-0" />
-        <Loader2 v-else-if="node.type === 'load-more' && node.isLoading" class="w-3.5 h-3.5 shrink-0 animate-spin text-primary" />
-        <component v-else :is="getIconInfo(node)?.icon || Database" class="w-3.5 h-3.5 shrink-0" :class="nodeIconClass" />
+        <span class="relative flex h-3.5 w-3.5 shrink-0" :class="{ 'overflow-visible': node.valid === false }">
+          <DatabaseIcon v-if="node.type === 'connection'" :db-type="connectionIconType(node.connectionId)" class="h-3.5 w-3.5 shrink-0" />
+          <Loader2 v-else-if="node.type === 'load-more' && node.isLoading" class="w-3.5 h-3.5 shrink-0 animate-spin text-primary" />
+          <component v-else :is="getIconInfo(node)?.icon || Database" class="w-3.5 h-3.5 shrink-0" :class="nodeIconClass" />
+          <CircleX v-if="node.valid === false" class="pointer-events-none absolute -right-1 -bottom-1 h-2.5 w-2.5 rounded-full bg-background text-destructive stroke-[3]" aria-hidden="true" />
+        </span>
         <input
           v-if="isRenamingGroup"
           ref="renameInputRef"
@@ -5733,8 +6014,8 @@ function treeItemMenuItems(): ContextMenuItem[] {
         <ProductionContextBadge v-if="showProductionBadge" compact />
         <span
           v-if="
-            (node.type === 'group-tables' || node.type === 'group-views' || node.type === 'group-materialized-views' || node.type === 'group-procedures' || node.type === 'group-functions' || node.type === 'group-sequences' || node.type === 'group-packages' || node.type === 'group-partitions') &&
-            node.objectCount != null
+            (node.type === 'group-tables' || node.type === 'group-views' || node.type === 'group-materialized-views' || node.type === 'group-procedures' || node.type === 'group-functions' || node.type === 'group-triggers' || node.type === 'group-sequences' || node.type === 'group-synonyms' || node.type === 'group-packages' || node.type === 'group-types' || node.type === 'group-partitions' || node.type === 'group-subpartitions' || node.type === 'group-program-members' || node.type === 'group-program-member-parameters') &&
+            node.objectCount != null && connectionStore.isTreeNodeChildrenLoaded(node.id)
           "
           class="text-muted-foreground text-[10px] shrink-0"
           >{{ node.objectCount }}</span

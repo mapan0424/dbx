@@ -249,6 +249,10 @@ pub async fn list_triggers(
                 event: metadata.event.to_string(),
                 timing: metadata.timing.to_string(),
                 statement,
+                enabled: None,
+                valid: None,
+                condition: None,
+                trigger_type: None,
             }
         })
         .collect())

@@ -23,8 +23,16 @@ describe("singleClickRowAction", () => {
     expect(singleClickRowAction(row("FUNCTION", "fn_test"))).toBe("open-source");
   });
 
+  it("returns open-source for TRIGGER", () => {
+    expect(singleClickRowAction(row("TRIGGER", "tr_audit"))).toBe("open-source");
+  });
+
   it("returns open-source for SEQUENCE", () => {
     expect(singleClickRowAction(row("SEQUENCE", "seq_test"))).toBe("open-source");
+  });
+
+  it("returns open-source for SYNONYM", () => {
+    expect(singleClickRowAction(row("SYNONYM", "customers"))).toBe("open-source");
   });
 
   it("returns open-source for MATERIALIZED_VIEW", () => {

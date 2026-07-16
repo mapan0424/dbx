@@ -1627,7 +1627,7 @@
         "queryExecution": true,
         "metadataBrowse": true,
         "objectBrowser": true,
-        "objectSource": false,
+        "objectSource": true,
         "schemaSearch": true,
         "diagram": false,
         "tableDataEdit": false,
@@ -1637,8 +1637,8 @@
         "sqlFileExecution": true,
         "databaseCreate": false,
         "fieldLineage": false,
-        "sqlExplain": false,
-        "userAdmin": false,
+        "sqlExplain": true,
+        "userAdmin": true,
         "driverManagement": true
       }
     },

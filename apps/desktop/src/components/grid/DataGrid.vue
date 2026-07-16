@@ -10787,7 +10787,8 @@ const gridContextMenuItems = computed<ContextMenuItem[]>(() => {
               <div v-else class="divide-y">
                 <div v-for="trigger in filteredTriggers" :key="trigger.name" class="p-3 text-xs">
                   <div class="font-medium truncate">{{ trigger.name }}</div>
-                  <div class="mt-1 text-[11px] text-muted-foreground">{{ trigger.timing }} {{ trigger.event }}</div>
+                  <div class="mt-1 text-[11px] text-muted-foreground">{{ trigger.timing }} {{ trigger.event }}<template v-if="trigger.trigger_type"> · {{ trigger.trigger_type }}</template><template v-if="trigger.enabled === false"> · DISABLED</template><template v-else-if="trigger.valid === false"> · INVALID</template></div>
+                  <div v-if="trigger.condition" class="mt-1 truncate text-[11px] text-muted-foreground">{{ trigger.condition }}</div>
                 </div>
               </div>
             </div>

@@ -1,13 +1,14 @@
 import type { DatabaseType, QueryResult } from "@/types/database";
 import { supportsDatabaseFeature } from "@/lib/database/databaseDriverManifest";
 
-export type UserAdminDialect = "mysql" | "postgres";
+export type UserAdminDialect = "mysql" | "postgres" | "xugu";
 export type PrivilegeScope = "mysql" | "database" | "schema" | "table" | "role";
 
 export interface DatabaseUserIdentity {
   user: string;
   host: string;
   plugin?: string;
+  isRole?: boolean;
 }
 
 export interface CreatePrincipalInput extends DatabaseUserIdentity {
@@ -48,12 +49,35 @@ export interface DatabaseUserAdminProvider {
 export const MYSQL_USER_ADMIN_TYPES = new Set<DatabaseType>(["mysql", "goldendb"]);
 export const KINGBASE_USER_ADMIN_TYPES = new Set<DatabaseType>(["kingbase"]);
 export const POSTGRES_USER_ADMIN_TYPES = new Set<DatabaseType>(["postgres", "gaussdb", "highgo", "kwdb", "opengauss", "questdb", "vastbase"]);
+export const XUGU_USER_ADMIN_TYPES = new Set<DatabaseType>(["xugu"]);
 
 export const MYSQL_COMMON_PRIVILEGES = ["SELECT", "INSERT", "UPDATE", "DELETE", "CREATE", "DROP", "ALTER", "INDEX", "REFERENCES", "EXECUTE", "SHOW VIEW", "TRIGGER", "EVENT", "CREATE TEMPORARY TABLES"] as const;
 
 export const POSTGRES_DATABASE_PRIVILEGES = ["CONNECT", "CREATE", "TEMPORARY"] as const;
 export const POSTGRES_SCHEMA_PRIVILEGES = ["USAGE", "CREATE"] as const;
 export const POSTGRES_TABLE_PRIVILEGES = ["SELECT", "INSERT", "UPDATE", "DELETE", "TRUNCATE", "REFERENCES", "TRIGGER"] as const;
+export const XUGU_DATABASE_PRIVILEGES = [
+  "CREATE ANY TABLE",
+  "ALTER ANY TABLE",
+  "DROP ANY TABLE",
+  "SELECT ANY TABLE",
+  "INSERT ANY TABLE",
+  "UPDATE ANY TABLE",
+  "DELETE ANY TABLE",
+  "CREATE ANY PROCEDURE",
+  "EXECUTE ANY PROCEDURE",
+  "CREATE ANY PACKAGE",
+  "EXECUTE ANY PACKAGE",
+  "CREATE ANY JOB",
+  "CREATE ANY USER",
+  "ALTER ANY USER",
+  "DROP ANY USER",
+  "CREATE ANY ROLE",
+  "ALTER ANY ROLE",
+  "DROP ANY ROLE",
+] as const;
+export const XUGU_SCHEMA_PRIVILEGES = ["CREATE TABLE", "CREATE VIEW", "CREATE PROCEDURE", "CREATE PACKAGE", "CREATE SEQUENCE", "CREATE SYNONYM"] as const;
+export const XUGU_OBJECT_PRIVILEGES = ["SELECT", "INSERT", "UPDATE", "DELETE", "REFERENCES", "ALTER", "DROP", "INDEX", "TRIGGER", "EXECUTE"] as const;
 
 export function supportsDatabaseUserAdmin(dbType: DatabaseType | undefined): boolean {
   return !!dbType && supportsDatabaseFeature(dbType, "userAdmin") && !!getDatabaseUserAdminProvider(dbType);
@@ -64,6 +88,7 @@ export function getDatabaseUserAdminProvider(dbType: DatabaseType | undefined): 
   if (MYSQL_USER_ADMIN_TYPES.has(dbType)) return mysqlUserAdminProvider;
   if (KINGBASE_USER_ADMIN_TYPES.has(dbType)) return kingbaseUserAdminProvider;
   if (POSTGRES_USER_ADMIN_TYPES.has(dbType)) return postgresUserAdminProvider;
+  if (XUGU_USER_ADMIN_TYPES.has(dbType)) return xuguUserAdminProvider;
   return null;
 }
 
@@ -150,15 +175,17 @@ export function normalizePrivileges(privileges: string[], fallback = "SELECT"): 
 export const normalizeMySqlPrivileges = normalizePrivileges;
 
 export function usersFromMySqlUserResult(result: QueryResult): DatabaseUserIdentity[] {
-  const userIndex = columnIndex(result, "user", "User");
+  const userIndex = columnIndex(result, "user", "User", "user_name", "USER_NAME");
   const hostIndex = columnIndex(result, "host", "Host");
   const pluginIndex = columnIndex(result, "plugin", "Plugin");
+  const roleIndex = columnIndex(result, "is_role", "IS_ROLE");
   if (userIndex < 0 || hostIndex < 0) return [];
   return result.rows
     .map((row) => ({
       user: String(row[userIndex] ?? ""),
       host: String(row[hostIndex] ?? ""),
       plugin: pluginIndex >= 0 && row[pluginIndex] != null ? String(row[pluginIndex]) : undefined,
+      isRole: roleIndex >= 0 ? databaseBoolean(row[roleIndex]) : undefined,
     }))
     .filter((user) => user.user || user.host);
 }
@@ -388,6 +415,116 @@ export function postgresRevokePrivilegesSql(input: PrivilegeChangeInput): string
   return `REVOKE ${privileges} ON ${postgresPrivilegeTargetSql(input)} FROM ${quotePostgresIdentifier(input.user.user)};`;
 }
 
+export function xuguListUsersSql(): string {
+  return `
+SELECT
+  USER_NAME,
+  '' AS host,
+  FALSE AS is_role,
+  CASE WHEN LOCKED THEN 'LOCKED' ELSE 'ACTIVE' END ||
+    CASE WHEN EXPIRED THEN ' · EXPIRED' ELSE '' END ||
+    CASE WHEN IS_SYS THEN ' · SYSTEM' ELSE '' END AS plugin
+FROM DBA_USERS
+WHERE IS_ROLE = FALSE
+UNION ALL
+SELECT
+  USER_NAME,
+  '' AS host,
+  TRUE AS is_role,
+  CASE WHEN IS_SYS THEN 'SYSTEM ROLE' ELSE 'ROLE' END AS plugin
+FROM DBA_ROLES
+ORDER BY USER_NAME;`.trim();
+}
+
+export function xuguListUsersFallbackSql(): string {
+  return `
+SELECT
+  USER_NAME,
+  '' AS host,
+  FALSE AS is_role,
+  CASE WHEN LOCKED THEN 'LOCKED' ELSE 'ACTIVE' END ||
+    CASE WHEN EXPIRED THEN ' · EXPIRED' ELSE '' END ||
+    CASE WHEN IS_SYS THEN ' · SYSTEM' ELSE '' END AS plugin
+FROM ALL_USERS
+WHERE IS_ROLE = FALSE
+ORDER BY USER_NAME;`.trim();
+}
+
+export function xuguShowGrantsSql(user: DatabaseUserIdentity): string {
+  const username = quoteSqlString(user.user);
+  return `
+SELECT line
+FROM (
+  SELECT 1 AS sort, CASE WHEN u.IS_ROLE THEN 'Role: ' ELSE 'User: ' END || u.USER_NAME AS line
+  FROM DBA_USERS u
+  WHERE u.USER_NAME = ${username}
+  UNION ALL
+  SELECT 10, 'Role: ' || r.USER_NAME
+  FROM DBA_ROLE_MEMBERS m
+  JOIN DBA_USERS u ON u.DB_ID = m.DB_ID AND u.USER_ID = m.USER_ID
+  JOIN DBA_ROLES r ON r.DB_ID = m.DB_ID AND r.USER_ID = m.ROLE_ID
+  WHERE u.USER_NAME = ${username}
+  UNION ALL
+  SELECT 20, 'ACL: object_type=' || TO_CHAR(a.OBJECT_TYPE) ||
+    ', object_id=' || TO_CHAR(a.OBJECT_ID) ||
+    ', authority=' || TO_CHAR(a.AUTHORITY) ||
+    CASE WHEN a.REGRANT <> 0 THEN ' WITH GRANT OPTION' ELSE '' END
+  FROM DBA_ACLS a
+  JOIN DBA_USERS u ON u.DB_ID = a.DB_ID AND u.USER_ID = a.GRANTEE_ID
+  WHERE u.USER_NAME = ${username}
+) grants
+ORDER BY sort, line;`.trim();
+}
+
+export function xuguCreateUserSql(input: CreatePrincipalInput): string {
+  if (input.isRole) return `CREATE ROLE ${quotePostgresIdentifier(input.user)};`;
+  return `CREATE USER ${quotePostgresIdentifier(input.user)} IDENTIFIED BY ${quoteSqlString(input.password)};`;
+}
+
+export function xuguAlterUserPasswordSql(user: DatabaseUserIdentity, password: string): string {
+  return `ALTER USER ${quotePostgresIdentifier(user.user)} IDENTIFIED BY ${quoteSqlString(password)};`;
+}
+
+export function xuguAlterUserAccountLockSql(user: DatabaseUserIdentity, locked: boolean): string {
+  return `ALTER USER ${quotePostgresIdentifier(user.user)} ACCOUNT ${locked ? "LOCK" : "UNLOCK"};`;
+}
+
+export function xuguDropUserSql(user: DatabaseUserIdentity): string {
+  if (user.isRole) return `DROP ROLE ${quotePostgresIdentifier(user.user)};`;
+  return `DROP USER ${quotePostgresIdentifier(user.user)};`;
+}
+
+export function xuguPrivilegeTargetSql(input: Pick<PrivilegeChangeInput, "scope" | "database" | "table">): string {
+  const scope = input.scope || "database";
+  if (scope === "schema") return ` IN SCHEMA ${quotePostgresIdentifier(input.database.trim() || "SYSDBA")}`;
+  if (scope === "table") {
+    const schema = input.database.trim() || "SYSDBA";
+    const table = input.table?.trim() || "";
+    return ` ON TABLE ${quotePostgresIdentifier(schema)}.${quotePostgresIdentifier(table)}`;
+  }
+  return "";
+}
+
+export function xuguGrantPrivilegesSql(input: PrivilegeChangeInput): string {
+  if (input.scope === "role") {
+    return `GRANT ROLE ${quotePostgresIdentifier(input.role?.trim() || "")} TO ${quotePostgresIdentifier(input.user.user)};`;
+  }
+  const privileges = normalizePrivileges(input.privileges, xuguDefaultPrivilege(input.scope)).join(", ");
+  const target = xuguPrivilegeTargetSql(input);
+  const grantOption = input.scope === "table" && input.grantOption ? " WITH GRANT OPTION" : "";
+  return `GRANT ${privileges}${target} TO ${quotePostgresIdentifier(input.user.user)}${grantOption};`;
+}
+
+export function xuguRevokePrivilegesSql(input: PrivilegeChangeInput): string {
+  if (input.scope === "role") {
+    return `REVOKE ROLE ${quotePostgresIdentifier(input.role?.trim() || "")} FROM ${quotePostgresIdentifier(input.user.user)};`;
+  }
+  const privileges = normalizePrivileges(input.privileges, xuguDefaultPrivilege(input.scope)).join(", ");
+  const target = xuguPrivilegeTargetSql(input);
+  const grantOption = input.scope === "table" && input.grantOption ? " GRANT OPTION FOR" : "";
+  return `REVOKE${grantOption} ${privileges}${target} FROM ${quotePostgresIdentifier(input.user.user)};`;
+}
+
 export function grantsFromQueryResult(result: QueryResult): string[] {
   return result.rows.map((row) => String(row[0] ?? "")).filter(Boolean);
 }
@@ -395,6 +532,11 @@ export function grantsFromQueryResult(result: QueryResult): string[] {
 function columnIndex(result: QueryResult, ...names: string[]): number {
   const wanted = new Set(names.map((name) => name.toLowerCase()));
   return result.columns.findIndex((column) => wanted.has(column.toLowerCase()));
+}
+
+function databaseBoolean(value: unknown): boolean {
+  if (typeof value === "boolean") return value;
+  return ["1", "t", "true", "y", "yes"].includes(String(value ?? "").trim().toLowerCase());
 }
 
 function parseMySqlGrantee(value: string): DatabaseUserIdentity | null {
@@ -416,6 +558,19 @@ function postgresPrivilegesForScope(scope: PrivilegeScope): readonly string[] {
   if (scope === "database") return POSTGRES_DATABASE_PRIVILEGES;
   if (scope === "schema") return POSTGRES_SCHEMA_PRIVILEGES;
   if (scope === "table") return POSTGRES_TABLE_PRIVILEGES;
+  return [];
+}
+
+function xuguDefaultPrivilege(scope: PrivilegeScope | undefined): string {
+  if (scope === "schema") return "CREATE TABLE";
+  if (scope === "table") return "SELECT";
+  return "SELECT ANY TABLE";
+}
+
+function xuguPrivilegesForScope(scope: PrivilegeScope): readonly string[] {
+  if (scope === "database") return XUGU_DATABASE_PRIVILEGES;
+  if (scope === "schema") return XUGU_SCHEMA_PRIVILEGES;
+  if (scope === "table") return XUGU_OBJECT_PRIVILEGES;
   return [];
 }
 
@@ -465,4 +620,24 @@ export const kingbaseUserAdminProvider: DatabaseUserAdminProvider = {
   ...postgresUserAdminProvider,
   listUsersSql: kingbaseListRolesSql,
   showGrantsSql: kingbaseShowGrantsSql,
+};
+
+export const xuguUserAdminProvider: DatabaseUserAdminProvider = {
+  dialect: "xugu",
+  defaultScope: "database",
+  listUsersSql: xuguListUsersSql,
+  fallbackListUsersSql: xuguListUsersFallbackSql,
+  parseUsers: usersFromMySqlUserResult,
+  parseFallbackUsers: usersFromMySqlUserResult,
+  showGrantsSql: xuguShowGrantsSql,
+  createUserSql: xuguCreateUserSql,
+  alterPasswordSql: xuguAlterUserPasswordSql,
+  alterLoginSql: (user, enabled) => xuguAlterUserAccountLockSql(user, !enabled),
+  dropUserSql: xuguDropUserSql,
+  grantPrivilegesSql: xuguGrantPrivilegesSql,
+  revokePrivilegesSql: xuguRevokePrivilegesSql,
+  label: postgresRoleLabel,
+  detail: (user) => user.plugin,
+  privilegesForScope: xuguPrivilegesForScope,
+  defaultPrivilegesForScope: (scope) => (scope === "role" ? [] : [xuguDefaultPrivilege(scope)]),
 };

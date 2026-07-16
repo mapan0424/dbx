@@ -63,6 +63,8 @@ pub struct ObjectInfo {
     pub schema: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signature: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub valid: Option<bool>,
     pub comment: Option<String>,
     pub created_at: Option<String>,
     pub updated_at: Option<String>,
@@ -93,9 +95,13 @@ pub enum ObjectSourceKind {
     MaterializedView,
     Procedure,
     Function,
+    Trigger,
     Sequence,
+    Synonym,
     Package,
     PackageBody,
+    Type,
+    TypeBody,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -269,6 +275,14 @@ pub struct TriggerInfo {
     pub timing: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub statement: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub valid: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub condition: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trigger_type: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

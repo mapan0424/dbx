@@ -26,6 +26,15 @@ cp agent ~/.dbx/agents/drivers/xugu/agent
 chmod +x ~/.dbx/agents/drivers/xugu/agent
 ```
 
+On macOS, locally built native executables must be ad-hoc signed before DBX
+can launch them as a child process. Otherwise macOS may terminate the agent
+with `SIGKILL (Code Signature Invalid)` before its startup handshake:
+
+```bash
+codesign --force --sign - ~/.dbx/agents/drivers/xugu/agent
+codesign --verify --verbose ~/.dbx/agents/drivers/xugu/agent
+```
+
 DBX prefers `agent` over `agent.jar`, so XuguDB connections will use this Go
 agent until the file is removed.
 

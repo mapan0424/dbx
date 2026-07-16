@@ -183,6 +183,27 @@ describe("splitSqlStatementRanges", () => {
     expect(ranges[0].sql).not.toMatch(/END;$/);
   });
 
+  it("keeps Xugu PL/SQL procedure bodies together", () => {
+    const sql = `CREATE OR REPLACE PROCEDURE sp_drop_defaultVal (p_tableName IN VARCHAR, p_colName IN VARCHAR) AS v_sql VARCHAR(2000);
+
+BEGIN
+  v_sql := 'ALTER TABLE "' || p_tableName || '" ALTER COLUMN "' || p_colName || '" DROP DEFAULT';
+  EXECUTE IMMEDIATE v_sql;
+END;
+
+SELECT 1;`;
+
+    expect(rangeSqlTexts(splitSqlStatementRanges(sql, "xugu"))).toEqual([
+      `CREATE OR REPLACE PROCEDURE sp_drop_defaultVal (p_tableName IN VARCHAR, p_colName IN VARCHAR) AS v_sql VARCHAR(2000);
+
+BEGIN
+  v_sql := 'ALTER TABLE "' || p_tableName || '" ALTER COLUMN "' || p_colName || '" DROP DEFAULT';
+  EXECUTE IMMEDIATE v_sql;
+END;`,
+      "SELECT 1",
+    ]);
+  });
+
   it("does not merge regular MySQL transaction statements as routine blocks", () => {
     const sql = "BEGIN; INSERT INTO t VALUES (1); COMMIT;";
     expect(rangeSqlTexts(splitSqlStatementRanges(sql, "mysql"))).toEqual(["BEGIN", "INSERT INTO t VALUES (1)", "COMMIT"]);

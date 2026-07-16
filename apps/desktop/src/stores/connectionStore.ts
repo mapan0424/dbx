@@ -58,6 +58,9 @@ import { sortSidebarTreeChildrenForParent } from "@/lib/sidebar/sidebarNodeOrder
 import { prunePinnedTreeNodeIdsForConnection } from "@/lib/app/pinnedTreeNodeIds";
 import { supportsDatabaseUserAdmin } from "@/lib/database/databaseUserAdmin";
 import { getTableMetadataCapabilities } from "@/lib/table/tableMetadataCapabilities";
+import { parseXuguTablePartitions, xuguTablePartitionsSql } from "@/lib/database/xuguPartitions";
+import { parseXuguProgramSpecMembers } from "@/lib/database/xuguProgramMembers";
+import { parseXuguProgramStatus, xuguProgramStatusLabel, xuguProgramStatusSql } from "@/lib/database/xuguProgramStatus";
 import { useSettingsStore } from "@/stores/settingsStore";
 import { encodeSqlServerLinkedSchema, parseSqlServerLinkedSchema } from "@/lib/database/sqlServerLinkedServers";
 import { inferMongoCompletionFields, type MongoCompletionField } from "@/lib/mongo/mongoCompletion";
@@ -918,7 +921,7 @@ export const useConnectionStore = defineStore("connection", () => {
   }
 
   function isConnectionUtilityNode(node: TreeNode): boolean {
-    return node.type === "user-admin" || node.type === "dameng-job-admin";
+    return node.type === "user-admin" || node.type === "dameng-job-admin" || node.type === "xugu-scheduler" || node.type === "xugu-monitor";
   }
 
   function connectionMetadataChildren(children: TreeNode[] | undefined): TreeNode[] {
@@ -948,7 +951,7 @@ export const useConnectionStore = defineStore("connection", () => {
   // recurse into raw objects, its `meta` too), mirroring the markRaw() treatment
   // queryStore already applies to result rows. Containers stay reactive so their
   // children / isExpanded / isLoading mutations still drive the UI.
-  const LEAF_TREE_NODE_TYPES = new Set<TreeNode["type"]>(["column", "index", "fkey", "trigger"]);
+  const LEAF_TREE_NODE_TYPES = new Set<TreeNode["type"]>(["column", "index", "fkey", "trigger", "partition", "subpartition", "program-member", "program-member-parameter"]);
 
   function markRawLeafTreeNodes(nodes: TreeNode[]): TreeNode[] {
     for (const node of nodes) {
@@ -1020,11 +1023,41 @@ export const useConnectionStore = defineStore("connection", () => {
     };
   }
 
+  function buildXuguSchedulerNode(connectionId: string, existingConnectionNode?: TreeNode): TreeNode | undefined {
+    const config = getConfig(connectionId);
+    if (effectiveDatabaseTypeForConnection(config) !== "xugu") return undefined;
+    const existing = existingConnectionNode?.children?.find((child) => child.type === "xugu-scheduler");
+    return {
+      id: `${connectionId}:__xugu_scheduler`,
+      label: "tree.xuguScheduler",
+      type: "xugu-scheduler",
+      connectionId,
+      database: "",
+      isExpanded: existing?.isExpanded ?? false,
+    };
+  }
+
+  function buildXuguMonitorNode(connectionId: string, existingConnectionNode?: TreeNode): TreeNode | undefined {
+    const config = getConfig(connectionId);
+    if (effectiveDatabaseTypeForConnection(config) !== "xugu") return undefined;
+    const existing = existingConnectionNode?.children?.find((child) => child.type === "xugu-monitor");
+    return {
+      id: `${connectionId}:__xugu_monitor`,
+      label: "tree.xuguMonitor",
+      type: "xugu-monitor",
+      connectionId,
+      database: "",
+      isExpanded: existing?.isExpanded ?? false,
+    };
+  }
+
   function withConnectionUtilityNodes(connectionId: string, children: TreeNode[], existingConnectionNode?: TreeNode): TreeNode[] {
     const nonUtilityChildren = connectionMetadataChildren(children);
     const userAdminNode = buildUserAdminNode(connectionId, existingConnectionNode);
     const damengJobAdminNode = buildDamengJobAdminNode(connectionId, existingConnectionNode);
-    return [...nonUtilityChildren, userAdminNode, damengJobAdminNode].filter(Boolean) as TreeNode[];
+    const xuguSchedulerNode = buildXuguSchedulerNode(connectionId, existingConnectionNode);
+    const xuguMonitorNode = buildXuguMonitorNode(connectionId, existingConnectionNode);
+    return [...nonUtilityChildren, userAdminNode, damengJobAdminNode, xuguSchedulerNode, xuguMonitorNode].filter(Boolean) as TreeNode[];
   }
 
   function withSavedSqlRoot(connectionId: string, children: TreeNode[], existingConnectionNode?: TreeNode): TreeNode[] {
@@ -3076,7 +3109,10 @@ export const useConnectionStore = defineStore("connection", () => {
           await ensureConnected(connectionId);
           if (useCachedChildren(node, options)) return;
           const simpleObjectDisplay = useSettingsStore().editorSettings.sidebarObjectDisplay === "simple";
-          const cacheKey = schemaCacheKey(connectionId, database, schema || "", simpleObjectDisplay ? "objects-simple-v4" : "objects-grouped-v4");
+          // v5 drops grouped-object placeholders persisted before programmable
+          // objects were loaded on demand. Those old placeholders carried a
+          // misleading objectCount of zero for routines and triggers.
+          const cacheKey = schemaCacheKey(connectionId, database, schema || "", simpleObjectDisplay ? "objects-simple-v4" : "objects-grouped-v5");
           const searchFilter = activeTreeLoadSearchFilter(options);
           const isSidebarTableSearch = !!options?.sidebarTableSearchParentId;
           if (!options?.force && !searchFilter) {
@@ -3550,8 +3586,25 @@ export const useConnectionStore = defineStore("connection", () => {
     const node = findNode(treeNodes.value, parentId);
     if (!node) return;
 
+    const config = getConfig(connectionId);
+    const existingPartitionGroups = tablePartitionGroups(node);
+    const xuguPartitionGroup: TreeNode[] = effectiveDatabaseTypeForConnection(config) === "xugu" && existingPartitionGroups.length === 0
+      ? [{
+          id: `${parentId}:__partitions`,
+          label: "tree.partitions",
+          type: "group-partitions",
+          connectionId,
+          database,
+          schema,
+          catalog,
+          tableName: table,
+          isExpanded: false,
+          children: [],
+        }]
+      : [];
     const children: TreeNode[] = [
-      ...tablePartitionGroups(node),
+      ...existingPartitionGroups,
+      ...xuguPartitionGroup,
       {
         id: `${parentId}:__columns`,
         label: "tree.columns",
@@ -3566,7 +3619,6 @@ export const useConnectionStore = defineStore("connection", () => {
       },
     ];
 
-    const config = getConfig(connectionId);
     const metadataCapabilities = getTableMetadataCapabilities(effectiveDatabaseTypeForConnection(config));
     if ((node.type === "table" || node.type === "mongo-collection") && !parseSqlServerLinkedSchema(schema)) {
       if (metadataCapabilities.indexes) {
@@ -3772,20 +3824,169 @@ export const useConnectionStore = defineStore("connection", () => {
       const triggers = await api.listTriggers(connectionId, database, querySchema, table, catalog);
       setChildren(
         node,
-        triggers.map((tr) => ({
-          id: `${parentId}:${tr.name}`,
-          label: `${tr.name} (${tr.timing} ${tr.event})`,
-          type: "trigger" as const,
-          connectionId,
-          database,
-          schema,
-          tableName: table,
-          meta: tr,
-        })),
+        triggers.map((tr) => {
+          const state = tr.enabled === false ? " · DISABLED" : tr.valid === false ? " · INVALID" : "";
+          const scope = tr.trigger_type ? ` · ${tr.trigger_type}` : "";
+          return {
+            id: `${parentId}:${tr.name}`,
+            label: `${tr.name} (${tr.timing} ${tr.event}${scope}${state})`,
+            type: "trigger" as const,
+            connectionId,
+            database,
+            schema,
+            tableName: table,
+            objectName: tr.name,
+            comment: tr.condition || null,
+            meta: tr,
+          };
+        }),
       );
       node.isExpanded = true;
     } catch (e) {
       recordMetadataLoadError(connectionId, e);
+      throw e;
+    } finally {
+      node.isLoading = false;
+    }
+  }
+
+  async function loadXuguPartitions(connectionId: string, database: string, table: string, schema?: string, nodeId?: string) {
+    const parentId = nodeId ?? `${connectionId}:${database}:${schema || ""}:${table}:__partitions`;
+    const node = findNode(treeNodes.value, parentId);
+    if (!node) return;
+    if (effectiveDatabaseTypeForConnection(getConfig(connectionId)) !== "xugu") {
+      setChildren(node, []);
+      node.isExpanded = true;
+      return;
+    }
+
+    node.isLoading = true;
+    try {
+      const result = await api.executeQuery(connectionId, database, xuguTablePartitionsSql(schema || "", table), schema);
+      const { partitions, subpartitions } = parseXuguTablePartitions(result);
+      const children: TreeNode[] = partitions.map((partition) => ({
+        id: `${parentId}:partition:${nodeIdPart(partition.name || partition.number)}`,
+        label: partition.value ? `${partition.name} (${partition.value})` : partition.name || `#${partition.number}`,
+        type: "partition",
+        connectionId,
+        database,
+        schema,
+        tableName: table,
+        meta: partition,
+      }));
+      if (subpartitions.length > 0) {
+        children.push({
+          id: `${parentId}:__subpartitions`,
+          label: "tree.subpartitions",
+          type: "group-subpartitions",
+          connectionId,
+          database,
+          schema,
+          tableName: table,
+          objectCount: subpartitions.length,
+          isExpanded: false,
+          children: subpartitions.map((subpartition) => ({
+            id: `${parentId}:subpartition:${nodeIdPart(subpartition.name || subpartition.number)}`,
+            label: subpartition.value ? `${subpartition.name} (${subpartition.value})` : subpartition.name || `#${subpartition.number}`,
+            type: "subpartition",
+            connectionId,
+            database,
+            schema,
+            tableName: table,
+            meta: subpartition,
+          })),
+        });
+      }
+      setChildren(node, children);
+      node.objectCount = partitions.length + subpartitions.length;
+      node.isExpanded = true;
+    } catch (e) {
+      recordMetadataLoadError(connectionId, e);
+      throw e;
+    } finally {
+      node.isLoading = false;
+    }
+  }
+
+  async function loadXuguProgramMembers(node: TreeNode) {
+    if ((node.type !== "package" && node.type !== "type") || !node.connectionId || !node.database || effectiveDatabaseTypeForConnection(getConfig(node.connectionId)) !== "xugu") return;
+    node.isLoading = true;
+    try {
+      const objectName = node.objectName || node.label;
+      const objectType = node.type === "package" ? "PACKAGE" : "TYPE";
+      const source = await api.getObjectSource(node.connectionId, node.database, node.schema || "", objectName, objectType);
+      let status = null;
+      try {
+        status = parseXuguProgramStatus(await api.executeQuery(node.connectionId, node.database, xuguProgramStatusSql(node.schema || "", objectName, objectType), node.schema));
+      } catch {
+        // Source browsing remains available when this optional status view is not accessible.
+      }
+      node.label = xuguProgramStatusLabel(objectName, status);
+      const members = parseXuguProgramSpecMembers(source.source);
+      const parentId = `${node.id}:__members`;
+      const memberNode = (member: typeof members[number], index: number, groupId: string): TreeNode => {
+        const parameterGroupId = `${groupId}:${index}:${nodeIdPart(member.name)}:parameters`;
+        return {
+          id: `${groupId}:${index}:${nodeIdPart(member.name)}`,
+          label: member.returnType ? `${member.name} → ${member.returnType}` : member.name,
+          type: "program-member",
+          connectionId: node.connectionId,
+          database: node.database,
+          schema: node.schema,
+          tableName: objectName,
+          objectName: member.name,
+          comment: member.declaration,
+          meta: member,
+          children: member.parameters?.length ? [{
+            id: parameterGroupId,
+            label: "tree.arguments",
+            type: "group-program-member-parameters",
+            connectionId: node.connectionId,
+            database: node.database,
+            schema: node.schema,
+            tableName: objectName,
+            objectCount: member.parameters.length,
+            isExpanded: true,
+            children: member.parameters.map((parameter, parameterIndex) => ({
+              id: `${parameterGroupId}:${parameterIndex}:${nodeIdPart(parameter.name)}`,
+              label: parameter.mode ? `${parameter.name} ${parameter.mode} ${parameter.dataType || ""}`.trim() : parameter.declaration,
+              type: "program-member-parameter",
+              connectionId: node.connectionId,
+              database: node.database,
+              schema: node.schema,
+              tableName: objectName,
+              objectName: parameter.name,
+              comment: parameter.declaration,
+              meta: parameter,
+            })),
+          }] : undefined,
+        };
+      };
+      const groups = node.type === "type"
+        ? [
+            { label: "tree.attributes", members: members.filter((member) => member.kind === "ATTRIBUTE") },
+            { label: "tree.methods", members: members.filter((member) => member.kind === "METHOD") },
+          ].filter((group) => group.members.length > 0)
+        : [{ label: "tree.programMembers", members }];
+      setChildren(node, groups.map((group, groupIndex) => {
+        const groupId = `${parentId}:${groupIndex}`;
+        return {
+          id: groupId,
+          label: group.label,
+          type: "group-program-members" as const,
+          connectionId: node.connectionId,
+          database: node.database,
+          schema: node.schema,
+          tableName: objectName,
+          objectCount: group.members.length,
+          isExpanded: true,
+          children: group.members.map((member, index) => memberNode(member, index, groupId)),
+        };
+      }));
+      node.objectCount = members.length;
+      node.isExpanded = true;
+    } catch (e) {
+      recordMetadataLoadError(node.connectionId, e);
       throw e;
     } finally {
       node.isLoading = false;
@@ -3868,7 +4069,11 @@ export const useConnectionStore = defineStore("connection", () => {
       await loadForeignKeys(node.connectionId, node.database, node.tableName, node.schema, node.id, node.catalog);
     } else if (node.type === "group-triggers" && node.connectionId && hasTreeNodeDatabaseContext(node) && node.tableName) {
       await loadTriggers(node.connectionId, node.database, node.tableName, node.schema, node.id, node.catalog);
-    } else if (node.type === "group-tables" || node.type === "group-views" || node.type === "group-materialized-views" || node.type === "group-procedures" || node.type === "group-functions" || node.type === "group-sequences" || node.type === "group-packages") {
+    } else if (node.type === "group-partitions" && node.connectionId && hasTreeNodeDatabaseContext(node) && node.tableName) {
+      await loadXuguPartitions(node.connectionId, node.database, node.tableName, node.schema, node.id);
+    } else if (node.type === "package" || node.type === "type") {
+      await loadXuguProgramMembers(node);
+    } else if (node.type === "group-tables" || node.type === "group-views" || node.type === "group-materialized-views" || node.type === "group-procedures" || node.type === "group-functions" || node.type === "group-triggers" || node.type === "group-sequences" || node.type === "group-synonyms" || node.type === "group-packages" || node.type === "group-types") {
       await loadObjectGroupChildren(node, options);
     } else if (node.type === "group-partitions") {
       node.isExpanded = true;
@@ -4820,7 +5025,7 @@ export const useConnectionStore = defineStore("connection", () => {
     const isDirectObjectParent = (node: TreeNode) => {
       if (!node.children || node.children.length === 0) return false;
       return node.children.some(
-        (child) => child.type === "table" || child.type === "view" || child.type === "materialized_view" || child.type === "procedure" || child.type === "function" || child.type === "sequence" || child.type === "package" || child.type === "package-body" || child.type === "load-more",
+        (child) => child.type === "table" || child.type === "view" || child.type === "materialized_view" || child.type === "procedure" || child.type === "function" || child.type === "sequence" || child.type === "synonym" || child.type === "package" || child.type === "package-body" || child.type === "type" || child.type === "type-body" || child.type === "load-more",
       );
     };
     const refreshNodes = async (nodes: TreeNode[]) => {
@@ -5333,6 +5538,8 @@ export const useConnectionStore = defineStore("connection", () => {
     loadIndexes,
     loadForeignKeys,
     loadTriggers,
+    loadXuguPartitions,
+    loadXuguProgramMembers,
     listCompletionTables,
     listCompletionObjects,
     listCompletionColumns,

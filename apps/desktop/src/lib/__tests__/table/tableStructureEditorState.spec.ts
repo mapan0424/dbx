@@ -224,6 +224,10 @@ describe("tableStructureEditorState", () => {
     expect(defaultNewColumnDataType("mysql")).toBe("varchar(255)");
   });
 
+  it("exposes Xugu native temporal, document, binary, and spatial data types", () => {
+    expect(DATA_TYPE_OPTIONS.xugu).toEqual(expect.arrayContaining(["TIME WITH TIME ZONE", "TIMESTAMP WITH TIME ZONE", "INTERVAL DAY TO SECOND", "BFILE", "VARBIT", "JSON", "XMLTYPE", "GEOMETRY"]));
+  });
+
   it("requires a SQLite rebuild only for a retained existing column type change", () => {
     const [column] = createColumnDrafts(
       [

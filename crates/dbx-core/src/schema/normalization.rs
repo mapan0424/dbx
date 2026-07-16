@@ -80,6 +80,12 @@ fn normalize_object_info_type(object_type: &str) -> String {
         "PROCEDURE".to_string()
     } else if value.contains("FUNC") {
         "FUNCTION".to_string()
+    } else if value.contains("TRIG") {
+        "TRIGGER".to_string()
+    } else if value.contains("SEQ") {
+        "SEQUENCE".to_string()
+    } else if value.contains("SYNONYM") {
+        "SYNONYM".to_string()
     } else {
         "TABLE".to_string()
     }
@@ -235,6 +241,7 @@ mod tests {
                 object_type: "BASE TABLE".to_string(),
                 schema: None,
                 signature: None,
+                valid: None,
                 comment: None,
                 created_at: None,
                 updated_at: None,
@@ -246,6 +253,7 @@ mod tests {
                 object_type: "MATERIALIZED_VIEW".to_string(),
                 schema: None,
                 signature: None,
+                valid: None,
                 comment: None,
                 created_at: None,
                 updated_at: None,
@@ -257,6 +265,31 @@ mod tests {
                 object_type: "PACKAGE BODY".to_string(),
                 schema: None,
                 signature: None,
+                valid: None,
+                comment: None,
+                created_at: None,
+                updated_at: None,
+                parent_schema: None,
+                parent_name: None,
+            },
+            db::ObjectInfo {
+                name: "audit_orders".to_string(),
+                object_type: "TRIGGER".to_string(),
+                schema: None,
+                signature: None,
+                valid: None,
+                comment: None,
+                created_at: None,
+                updated_at: None,
+                parent_schema: None,
+                parent_name: None,
+            },
+            db::ObjectInfo {
+                name: "orders_seq".to_string(),
+                object_type: "SEQUENCE".to_string(),
+                schema: None,
+                signature: None,
+                valid: None,
                 comment: None,
                 created_at: None,
                 updated_at: None,
@@ -265,11 +298,20 @@ mod tests {
             },
         ];
 
-        let filtered = filter_objects_by_types(objects, Some(&["VIEW".to_string(), "PACKAGE_BODY".to_string()]));
+
+        let filtered = filter_objects_by_types(
+            objects,
+            Some(&[
+                "VIEW".to_string(),
+                "PACKAGE_BODY".to_string(),
+                "TRIGGER".to_string(),
+                "SEQUENCE".to_string(),
+            ]),
+        );
 
         assert_eq!(
             filtered.iter().map(|object| object.name.as_str()).collect::<Vec<_>>(),
-            ["active_orders", "payroll"]
+            ["active_orders", "payroll", "audit_orders", "orders_seq"]
         );
     }
 
@@ -308,6 +350,7 @@ mod tests {
                 object_type: "TABLE".to_string(),
                 schema: Some("HR".to_string()),
                 signature: None,
+                valid: None,
                 comment: None,
                 created_at: None,
                 updated_at: None,
@@ -319,6 +362,7 @@ mod tests {
                 object_type: "TABLE".to_string(),
                 schema: Some("HR".to_string()),
                 signature: None,
+                valid: None,
                 comment: None,
                 created_at: None,
                 updated_at: None,

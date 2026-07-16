@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -273,6 +274,438 @@ func TestBuildDSNUsesConnectionFields(t *testing.T) {
 	}
 }
 
+func TestXuguLiveMetadataIntegration(t *testing.T) {
+	username := strings.TrimSpace(os.Getenv("XUGU_INTEGRATION_USERNAME"))
+	password := os.Getenv("XUGU_INTEGRATION_PASSWORD")
+	if username == "" || password == "" {
+		t.Skip("set XUGU_INTEGRATION_USERNAME and XUGU_INTEGRATION_PASSWORD to run against a local XuguDB instance")
+	}
+	port := 5138
+	if rawPort := strings.TrimSpace(os.Getenv("XUGU_INTEGRATION_PORT")); rawPort != "" {
+		parsedPort, err := strconv.Atoi(rawPort)
+		if err != nil {
+			t.Fatalf("parse XUGU_INTEGRATION_PORT: %v", err)
+		}
+		port = parsedPort
+	}
+	host := strings.TrimSpace(os.Getenv("XUGU_INTEGRATION_HOST"))
+	if host == "" {
+		host = "127.0.0.1"
+	}
+	database := strings.TrimSpace(os.Getenv("XUGU_INTEGRATION_DATABASE"))
+	if database == "" {
+		database = "SYSTEM"
+	}
+
+	server := newServer()
+	if err := server.connect(connectParams{Host: host, Port: port, Database: database, Username: username, Password: password}); err != nil {
+		t.Fatalf("connect to XuguDB: %v", err)
+	}
+	t.Cleanup(func() { _ = server.disconnect() })
+
+	databases, err := server.listDatabases()
+	if err != nil {
+		t.Fatalf("list databases: %v", err)
+	}
+	if len(databases) == 0 {
+		t.Fatal("expected at least one database")
+	}
+
+	schemas, err := server.listSchemas()
+	if err != nil {
+		t.Fatalf("list schemas: %v", err)
+	}
+	if len(schemas) == 0 {
+		t.Fatal("expected at least one schema")
+	}
+
+	t.Logf("databases=%d schemas=%d", len(databases), len(schemas))
+	checkedSourceTypes := map[string]bool{}
+	skippedSourceTypes := map[string]int{}
+	var tableSchema, tableName string
+	for _, schema := range schemas {
+		objects, err := server.listObjects(schema, metadataListConstraints{})
+		if err != nil {
+			t.Fatalf("list objects for %s: %v", schema, err)
+		}
+		t.Logf("schema=%s objects=%d", schema, len(objects))
+		for _, object := range objects {
+			if object.ObjectType == "TABLE" && tableName == "" {
+				tableSchema = schema
+				tableName = object.Name
+			}
+			if object.ObjectType == "TABLE" || checkedSourceTypes[object.ObjectType] {
+				continue
+			}
+			source, err := server.getObjectSource(schema, object.Name, object.ObjectType)
+			if err != nil {
+				// Administrative schemas can list definitions whose source is not
+				// readable by this session. Continue so the integration check can
+				// still exercise accessible application schemas.
+				skippedSourceTypes[object.ObjectType]++
+				continue
+			}
+			if strings.TrimSpace(fmt.Sprint(source["source"])) == "" {
+				t.Fatalf("expected non-empty %s source for %s.%s", object.ObjectType, schema, object.Name)
+			}
+			t.Logf("source=%s %s.%s", object.ObjectType, schema, object.Name)
+			checkedSourceTypes[object.ObjectType] = true
+		}
+	}
+	t.Logf("source kinds read=%v skipped_for_permissions=%v", checkedSourceTypes, skippedSourceTypes)
+	if tableName == "" {
+		t.Fatal("expected at least one table for metadata validation")
+	}
+	columns, err := server.getColumns(tableSchema, tableName)
+	if err != nil {
+		t.Fatalf("get columns for %s.%s: %v", tableSchema, tableName, err)
+	}
+	if len(columns) == 0 {
+		t.Fatalf("expected columns for %s.%s", tableSchema, tableName)
+	}
+	ddl, err := server.getTableDDL(tableSchema, tableName)
+	if err != nil {
+		t.Fatalf("get DDL for %s.%s: %v", tableSchema, tableName, err)
+	}
+	if strings.TrimSpace(ddl) == "" {
+		t.Fatalf("expected DDL for %s.%s", tableSchema, tableName)
+	}
+	indexes, err := server.listIndexes(tableSchema, tableName)
+	if err != nil {
+		t.Fatalf("list indexes for %s.%s: %v", tableSchema, tableName, err)
+	}
+	foreignKeys, err := server.listForeignKeys(tableSchema, tableName)
+	if err != nil {
+		t.Fatalf("list foreign keys for %s.%s: %v", tableSchema, tableName, err)
+	}
+	triggers, err := server.listTriggers(tableSchema, tableName)
+	if err != nil {
+		t.Fatalf("list triggers for %s.%s: %v", tableSchema, tableName, err)
+	}
+	t.Logf("table=%s.%s columns=%d indexes=%d foreign_keys=%d triggers=%d", tableSchema, tableName, len(columns), len(indexes), len(foreignKeys), len(triggers))
+
+	rows, err := server.queryRows(`
+SELECT SYNO_NAME, TARG_SCHE_ID, TARG_NAME, IS_PUBLIC
+FROM SYS_SYNONYMS
+WHERE ROWNUM <= 1`, nil)
+	if err != nil {
+		t.Fatalf("query SYS_SYNONYMS dictionary: %v", err)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("read SYS_SYNONYMS dictionary: %v", err)
+	}
+	if err := server.closeRows(rows); err != nil {
+		t.Fatalf("close SYS_SYNONYMS dictionary rows: %v", err)
+	}
+
+	jobRows, err := server.queryRows(`
+SELECT j.JOB_ID, j.USER_ID, u.USER_NAME AS OWNER, j.JOB_NAME, j.JOB_TYPE,
+       TO_CHAR(j.JOB_ACTION) AS JOB_ACTION, j.JOB_PARAM_NUM, j.BEGIN_T, j.END_T,
+       j.REPET_INTERVAL, j.TRIG_EVENTS, j.LAST_RUN_T, j.STATE, j.ENABLE,
+       j.AUTO_DROP, j.IS_SYS, j.COMMENTS
+FROM ALL_JOBS j
+LEFT JOIN ALL_USERS u ON u.DB_ID = j.DB_ID AND u.USER_ID = j.USER_ID
+WHERE j.DB_ID = (SELECT d.DB_ID FROM ALL_DATABASES d WHERE UPPER(d.DB_NAME) = UPPER(?))
+ORDER BY j.JOB_NAME`, []any{database})
+	if err != nil {
+		t.Fatalf("query ALL_JOBS dictionary: %v", err)
+	}
+	if err := jobRows.Err(); err != nil {
+		t.Fatalf("read ALL_JOBS dictionary: %v", err)
+	}
+	if err := server.closeRows(jobRows); err != nil {
+		t.Fatalf("close ALL_JOBS dictionary rows: %v", err)
+	}
+
+	userRows, err := server.queryRows(`
+SELECT
+  USER_NAME AS username,
+  '' AS host,
+  FALSE AS is_role,
+  CASE WHEN LOCKED THEN 'LOCKED' ELSE 'ACTIVE' END ||
+    CASE WHEN EXPIRED THEN ' · EXPIRED' ELSE '' END ||
+    CASE WHEN IS_SYS THEN ' · SYSTEM' ELSE '' END AS plugin
+FROM DBA_USERS
+WHERE IS_ROLE = FALSE
+UNION ALL
+SELECT
+  USER_NAME AS username,
+  '' AS host,
+  TRUE AS is_role,
+  CASE WHEN IS_SYS THEN 'SYSTEM ROLE' ELSE 'ROLE' END AS plugin
+FROM DBA_ROLES
+ORDER BY USER_NAME`, nil)
+	if err != nil {
+		t.Fatalf("query DBA_USERS dictionary: %v", err)
+	}
+	if err := userRows.Err(); err != nil {
+		t.Fatalf("read DBA_USERS dictionary: %v", err)
+	}
+	if err := server.closeRows(userRows); err != nil {
+		t.Fatalf("close DBA_USERS dictionary rows: %v", err)
+	}
+
+	grantRows, err := server.queryRows(`
+SELECT line
+FROM (
+  SELECT 1 AS sort, 'User: ' || u.USER_NAME AS line
+  FROM DBA_USERS u
+  WHERE UPPER(u.USER_NAME) = UPPER(?)
+  UNION ALL
+  SELECT 10, 'Role: ' || r.USER_NAME
+  FROM DBA_ROLE_MEMBERS m
+  JOIN DBA_USERS u ON u.DB_ID = m.DB_ID AND u.USER_ID = m.USER_ID
+  JOIN DBA_ROLES r ON r.DB_ID = m.DB_ID AND r.USER_ID = m.ROLE_ID
+  WHERE UPPER(u.USER_NAME) = UPPER(?)
+  UNION ALL
+  SELECT 20, 'ACL: object_type=' || TO_CHAR(a.OBJECT_TYPE) ||
+    ', object_id=' || TO_CHAR(a.OBJECT_ID) ||
+    ', authority=' || TO_CHAR(a.AUTHORITY) ||
+    CASE WHEN a.REGRANT <> 0 THEN ' WITH GRANT OPTION' ELSE '' END
+  FROM DBA_ACLS a
+  JOIN DBA_USERS u ON u.DB_ID = a.DB_ID AND u.USER_ID = a.GRANTEE_ID
+  WHERE UPPER(u.USER_NAME) = UPPER(?)
+) grants
+ORDER BY sort, line`, []any{username, username, username})
+	if err != nil {
+		t.Fatalf("query Xugu user grants dictionary: %v", err)
+	}
+	if err := grantRows.Err(); err != nil {
+		t.Fatalf("read Xugu user grants dictionary: %v", err)
+	}
+	if err := server.closeRows(grantRows); err != nil {
+		t.Fatalf("close Xugu user grants dictionary rows: %v", err)
+	}
+
+	versionRows, err := server.queryRows("SELECT VERSION() AS VERSION FROM DUAL", nil)
+	if err != nil {
+		t.Fatalf("query Xugu VERSION(): %v", err)
+	}
+	if err := versionRows.Err(); err != nil {
+		t.Fatalf("read Xugu VERSION(): %v", err)
+	}
+	if err := server.closeRows(versionRows); err != nil {
+		t.Fatalf("close Xugu VERSION() rows: %v", err)
+	}
+
+	clusterRows, err := server.queryRows(`
+SELECT NODE_ID, RACK_NO, NODE_IP, NODE_PORT, NODE_TYPE, NODE_STATE,
+       CPU_LOAD, BOOT_TIME, STORE_NUM, MAJOR_NUM
+FROM SYS_CLUSTERS
+ORDER BY NODE_ID`, nil)
+	if err != nil {
+		t.Fatalf("query SYS_CLUSTERS dictionary: %v", err)
+	}
+	if err := clusterRows.Err(); err != nil {
+		t.Fatalf("read SYS_CLUSTERS dictionary: %v", err)
+	}
+	if err := server.closeRows(clusterRows); err != nil {
+		t.Fatalf("close SYS_CLUSTERS dictionary rows: %v", err)
+	}
+
+	runInfoRows, err := server.queryRows(`
+SELECT NODEID, CURR_T, REQ_N, ACT_TRANS_NUM, LOCK_WAIT_N,
+       DISK_R_BYTES, DISK_W_BYTES, NET_R_BYTES, NET_W_BYTES,
+       S_LOCK_N, X_LOCK_N, DELAY_STO_N, DROPED_STO_N, FREE_STO_N
+FROM SYS_ALL_RUN_INFO
+ORDER BY NODEID`, nil)
+	if err != nil {
+		t.Fatalf("query SYS_ALL_RUN_INFO dictionary: %v", err)
+	}
+	if err := runInfoRows.Err(); err != nil {
+		t.Fatalf("read SYS_ALL_RUN_INFO dictionary: %v", err)
+	}
+	if err := server.closeRows(runInfoRows); err != nil {
+		t.Fatalf("close SYS_ALL_RUN_INFO dictionary rows: %v", err)
+	}
+
+	argumentRows, err := server.queryRows(`
+SELECT PROC_NAME, TO_CHAR(DEFINE)
+FROM ALL_PROCEDURES
+WHERE RET_TYPE IS NULL AND ROWNUM <= 1`, nil)
+	if err != nil {
+		t.Fatalf("query ALL_PROCEDURES definition dictionary: %v", err)
+	}
+	defer server.closeRows(argumentRows)
+	if err := argumentRows.Err(); err != nil {
+		t.Fatalf("read ALL_PROCEDURES definition dictionary: %v", err)
+	}
+}
+
+func TestXuguLiveTypeSourceIntegration(t *testing.T) {
+	username := strings.TrimSpace(os.Getenv("XUGU_INTEGRATION_USERNAME"))
+	password := os.Getenv("XUGU_INTEGRATION_PASSWORD")
+	if username == "" || password == "" {
+		t.Skip("set XUGU_INTEGRATION_USERNAME and XUGU_INTEGRATION_PASSWORD to run against a local XuguDB instance")
+	}
+	port := 5138
+	if rawPort := strings.TrimSpace(os.Getenv("XUGU_INTEGRATION_PORT")); rawPort != "" {
+		parsedPort, err := strconv.Atoi(rawPort)
+		if err != nil {
+			t.Fatalf("parse XUGU_INTEGRATION_PORT: %v", err)
+		}
+		port = parsedPort
+	}
+	host := strings.TrimSpace(os.Getenv("XUGU_INTEGRATION_HOST"))
+	if host == "" {
+		host = "127.0.0.1"
+	}
+	database := strings.TrimSpace(os.Getenv("XUGU_INTEGRATION_DATABASE"))
+	if database == "" {
+		database = "SYSTEM"
+	}
+	schema := strings.TrimSpace(os.Getenv("XUGU_INTEGRATION_TYPE_SCHEMA"))
+	if schema == "" {
+		schema = "tibms_sx_agent"
+	}
+
+	server := newServer()
+	if err := server.connect(connectParams{Host: host, Port: port, Database: database, Username: username, Password: password}); err != nil {
+		t.Fatalf("connect to XuguDB: %v", err)
+	}
+	t.Cleanup(func() { _ = server.disconnect() })
+
+	objects, err := server.listObjects(schema, metadataListConstraints{ObjectTypes: []string{"TYPE"}, Limit: 1})
+	if err != nil {
+		t.Fatalf("list TYPE objects for %s: %v", schema, err)
+	}
+	if len(objects) == 0 {
+		t.Fatalf("expected at least one TYPE object in %s", schema)
+	}
+	object := objects[0]
+	if object.ObjectType != "TYPE" {
+		t.Fatalf("expected TYPE object, got %#v", object)
+	}
+	source, err := server.getObjectSource(schema, object.Name, "TYPE")
+	if err != nil {
+		t.Fatalf("get TYPE source for %s.%s: %v", schema, object.Name, err)
+	}
+	if !strings.Contains(fmt.Sprint(source["source"]), "XuguDB did not expose the definition") {
+		t.Fatalf("expected unavailable TYPE source notice for %s.%s, got: %#v", schema, object.Name, source)
+	}
+	if editable, ok := source["editable"].(bool); !ok || editable {
+		t.Fatalf("unavailable TYPE source must be read-only, got: %#v", source)
+	}
+	t.Logf("type source=%s.%s", schema, object.Name)
+}
+
+func TestXuguLiveRoutineSourceIntegration(t *testing.T) {
+	username := strings.TrimSpace(os.Getenv("XUGU_INTEGRATION_USERNAME"))
+	password := os.Getenv("XUGU_INTEGRATION_PASSWORD")
+	if username == "" || password == "" {
+		t.Skip("set XUGU_INTEGRATION_USERNAME and XUGU_INTEGRATION_PASSWORD to run against a local XuguDB instance")
+	}
+	port := 5138
+	if rawPort := strings.TrimSpace(os.Getenv("XUGU_INTEGRATION_PORT")); rawPort != "" {
+		parsedPort, err := strconv.Atoi(rawPort)
+		if err != nil {
+			t.Fatalf("parse XUGU_INTEGRATION_PORT: %v", err)
+		}
+		port = parsedPort
+	}
+	host := strings.TrimSpace(os.Getenv("XUGU_INTEGRATION_HOST"))
+	if host == "" {
+		host = "127.0.0.1"
+	}
+	database := strings.TrimSpace(os.Getenv("XUGU_INTEGRATION_DATABASE"))
+	if database == "" {
+		database = "SYSTEM"
+	}
+	schema := strings.TrimSpace(os.Getenv("XUGU_INTEGRATION_ROUTINE_SCHEMA"))
+	if schema == "" {
+		schema = "tibms_sx_agent"
+	}
+
+	server := newServer()
+	if err := server.connect(connectParams{Host: host, Port: port, Database: database, Username: username, Password: password}); err != nil {
+		t.Fatalf("connect to XuguDB: %v", err)
+	}
+	t.Cleanup(func() { _ = server.disconnect() })
+
+	for _, objectType := range []string{"FUNCTION", "PROCEDURE"} {
+		objects, err := server.listObjects(schema, metadataListConstraints{ObjectTypes: []string{objectType}, Limit: 1})
+		if err != nil {
+			t.Fatalf("list %s objects for %s: %v", objectType, schema, err)
+		}
+		if len(objects) == 0 {
+			continue
+		}
+		object := objects[0]
+		source, err := server.getObjectSource(schema, object.Name, objectType)
+		if err != nil {
+			t.Fatalf("get %s source for %s.%s: %v", objectType, schema, object.Name, err)
+		}
+		definition := strings.TrimSpace(fmt.Sprint(source["source"]))
+		if definition == "" || !strings.Contains(strings.ToUpper(definition), "CREATE") {
+			t.Fatalf("expected %s definition for %s.%s, got: %#v", objectType, schema, object.Name, source)
+		}
+		t.Logf("%s source=%s.%s", strings.ToLower(objectType), schema, object.Name)
+		return
+	}
+	t.Fatalf("expected at least one function or procedure in %s", schema)
+}
+
+func TestXuguLiveViewMetadataIntegration(t *testing.T) {
+	username := strings.TrimSpace(os.Getenv("XUGU_INTEGRATION_USERNAME"))
+	password := os.Getenv("XUGU_INTEGRATION_PASSWORD")
+	if username == "" || password == "" {
+		t.Skip("set XUGU_INTEGRATION_USERNAME and XUGU_INTEGRATION_PASSWORD to run against a local XuguDB instance")
+	}
+	port := 5138
+	if rawPort := strings.TrimSpace(os.Getenv("XUGU_INTEGRATION_PORT")); rawPort != "" {
+		parsedPort, err := strconv.Atoi(rawPort)
+		if err != nil {
+			t.Fatalf("parse XUGU_INTEGRATION_PORT: %v", err)
+		}
+		port = parsedPort
+	}
+	host := strings.TrimSpace(os.Getenv("XUGU_INTEGRATION_HOST"))
+	if host == "" {
+		host = "127.0.0.1"
+	}
+	database := strings.TrimSpace(os.Getenv("XUGU_INTEGRATION_DATABASE"))
+	if database == "" {
+		database = "SYSTEM"
+	}
+	schema := strings.TrimSpace(os.Getenv("XUGU_INTEGRATION_VIEW_SCHEMA"))
+	if schema == "" {
+		schema = "tibms_sx_business"
+	}
+	view := strings.TrimSpace(os.Getenv("XUGU_INTEGRATION_VIEW_NAME"))
+	if view == "" {
+		view = "V_CardUnit"
+	}
+
+	server := newServer()
+	if err := server.connect(connectParams{Host: host, Port: port, Database: database, Username: username, Password: password}); err != nil {
+		t.Fatalf("connect to XuguDB: %v", err)
+	}
+	t.Cleanup(func() { _ = server.disconnect() })
+
+	columns, err := server.getColumns(schema, view)
+	if err != nil {
+		t.Fatalf("get view columns for %s.%s: %v", schema, view, err)
+	}
+	if len(columns) == 0 {
+		t.Fatalf("expected view columns for %s.%s", schema, view)
+	}
+	source, err := server.getObjectSource(schema, view, "VIEW")
+	if err != nil {
+		t.Fatalf("get view source for %s.%s: %v", schema, view, err)
+	}
+	if !strings.Contains(strings.ToUpper(fmt.Sprint(source["source"])), "CREATE") {
+		t.Fatalf("expected view DDL source for %s.%s, got: %#v", schema, view, source)
+	}
+	ddl, err := server.getTableDDL(schema, view)
+	if err != nil {
+		t.Fatalf("get view DDL for %s.%s: %v", schema, view, err)
+	}
+	if !strings.Contains(strings.ToUpper(ddl), "CREATE") {
+		t.Fatalf("expected view DDL for %s.%s, got: %s", schema, view, ddl)
+	}
+	t.Logf("view=%s.%s columns=%d", schema, view, len(columns))
+}
+
 func TestBuildDSNUsesDefaultPort(t *testing.T) {
 	dsn := buildDSN(connectParams{
 		Host:     "db.example.com",
@@ -474,6 +907,21 @@ func TestColumnSQLUsesLowPrivilegeDictionary(t *testing.T) {
 	}
 }
 
+func TestViewColumnSQLUsesLowPrivilegeDictionary(t *testing.T) {
+	sqlText := strings.ToUpper(xuguListViewColumnsSQL)
+
+	for _, want := range []string{"ALL_VIEW_COLUMNS", "ALL_VIEWS", "ALL_SCHEMAS", "COMMENTS", `"VARYING"`} {
+		if !strings.Contains(sqlText, want) {
+			t.Fatalf("view column listing should query %s, got: %s", want, xuguListViewColumnsSQL)
+		}
+	}
+	for _, forbidden := range []string{"SYS_VIEW_COLUMNS", "SYS_VIEWS", "SYS_SCHEMAS"} {
+		if strings.Contains(sqlText, forbidden) {
+			t.Fatalf("view column listing should not query %s, got: %s", forbidden, xuguListViewColumnsSQL)
+		}
+	}
+}
+
 func TestIndexSQLUsesLowPrivilegeDictionary(t *testing.T) {
 	sqlText := strings.ToUpper(xuguListIndexesSQL)
 
@@ -532,8 +980,108 @@ func TestXuguListObjectsQueryRejectsUnsupportedObjectTypes(t *testing.T) {
 		t.Fatalf("unsupported object type should produce empty-result predicate:\n%s", query.SQL)
 	}
 
-	wantArgs := []any{"APP", "APP", 10, 0}
+	wantArgs := []any{"APP", "APP", "APP", "APP", "APP", "APP", "APP", "APP", "APP", "APP", 10, 0}
 	assertArgs(t, query.Args, wantArgs)
+}
+
+func TestXuguListObjectsQueryIncludesProgrammableObjects(t *testing.T) {
+	query := xuguListObjectsQuery("APP", metadataListConstraints{
+		ObjectTypes: []string{"procedure", "function", "package", "package-body", "trigger", "sequence", "type", "type-body", "synonym"},
+	})
+
+	for _, want := range []string{"ALL_PROCEDURES", "p.VALID", "ALL_PACKAGES", "p.BODY IS NOT NULL", "ALL_TRIGGERS", "ALL_SEQUENCES", "ALL_TYPES", "u.BODY IS NOT NULL", "SYS_SYNONYMS", "y.IS_PUBLIC", "OBJECT_NAME, OBJECT_TYPE, COMMENTS, IS_PUBLIC, VALID", "OBJECT_TYPE IN (?,?,?,?,?,?,?,?,?)"} {
+		if !strings.Contains(query.SQL, want) {
+			t.Fatalf("expected SQL to contain %q:\n%s", want, query.SQL)
+		}
+	}
+
+	wantArgs := []any{"APP", "APP", "APP", "APP", "APP", "APP", "APP", "APP", "APP", "APP", "FUNCTION", "PACKAGE", "PACKAGE_BODY", "PROCEDURE", "SEQUENCE", "SYNONYM", "TRIGGER", "TYPE", "TYPE_BODY"}
+	assertArgs(t, query.Args, wantArgs)
+}
+
+func TestXuguTypeObjectSourceQueriesUseAccessibleTypeDictionary(t *testing.T) {
+	for objectType, column := range map[string]string{"TYPE": "t.SPEC", "TYPE_BODY": "t.BODY"} {
+		query, args, err := objectSourceQuery("APP", "ADDRESS_T", objectType)
+		if err != nil {
+			t.Fatalf("objectSourceQuery(%s): %v", objectType, err)
+		}
+		if !strings.Contains(query, "ALL_TYPES") || !strings.Contains(query, "ALL_SCHEMAS") || !strings.Contains(query, column) || !strings.Contains(query, "TYPE_NAME") {
+			t.Fatalf("unexpected %s source query:\n%s", objectType, query)
+		}
+		assertArgs(t, args, []any{"APP", "ADDRESS_T"})
+	}
+}
+
+func TestXuguObjectSourceQuerySeparatesPackagePartsAndSupportsSequences(t *testing.T) {
+	procedureSQL, procedureArgs, err := objectSourceQuery("APP", "SYNC_ORDERS", "PROCEDURE")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(procedureSQL, "ALL_PROCEDURES") || !strings.Contains(procedureSQL, "p.RET_TYPE IS NULL") || strings.Contains(procedureSQL, "SYS_PROCEDURES") {
+		t.Fatalf("procedure source should use the accessible ALL_PROCEDURES definition: %s", procedureSQL)
+	}
+	assertArgs(t, procedureArgs, []any{"APP", "SYNC_ORDERS"})
+
+	functionSQL, functionArgs, err := objectSourceQuery("APP", "SYNC_STATUS", "FUNCTION")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(functionSQL, "ALL_PROCEDURES") || !strings.Contains(functionSQL, "p.RET_TYPE IS NOT NULL") {
+		t.Fatalf("function source should select only functions from ALL_PROCEDURES: %s", functionSQL)
+	}
+	assertArgs(t, functionArgs, []any{"APP", "SYNC_STATUS"})
+
+	packageSQL, packageArgs, err := objectSourceQuery("APP", "PAYROLL", "PACKAGE")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(packageSQL, "TO_CHAR(k.SPEC)") || !strings.Contains(packageSQL, "ALL_PACKAGES") || !strings.Contains(packageSQL, "ALL_SCHEMAS") || strings.Contains(packageSQL, "TO_CHAR(k.BODY)") || strings.Contains(packageSQL, "SYS_PACKAGES") {
+		t.Fatalf("package source should only return the specification: %s", packageSQL)
+	}
+	assertArgs(t, packageArgs, []any{"APP", "PAYROLL"})
+
+	bodySQL, bodyArgs, err := objectSourceQuery("APP", "PAYROLL", "PACKAGE_BODY")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(bodySQL, "TO_CHAR(k.BODY)") || !strings.Contains(bodySQL, "ALL_PACKAGES") || strings.Contains(bodySQL, "TO_CHAR(k.SPEC)") || strings.Contains(bodySQL, "SYS_PACKAGES") {
+		t.Fatalf("package body source should only return the body: %s", bodySQL)
+	}
+	assertArgs(t, bodyArgs, []any{"APP", "PAYROLL"})
+
+	triggerSQL, triggerArgs, err := objectSourceQuery("APP", "TR_AUDIT", "TRIGGER")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(triggerSQL, "ALL_TRIGGERS") || !strings.Contains(triggerSQL, "ALL_SCHEMAS") || !strings.Contains(triggerSQL, "TO_CHAR(t.DEFINE)") || strings.Contains(triggerSQL, "SYS_TRIGGERS") {
+		t.Fatalf("trigger source should use public dictionary views: %s", triggerSQL)
+	}
+	assertArgs(t, triggerArgs, []any{"APP", "TR_AUDIT"})
+
+	sequenceSQL, sequenceArgs, err := objectSourceQuery("APP", "ORDER_SEQ", "SEQUENCE")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(sequenceSQL, "DBMS_METADATA.GET_DDL('SEQUENCE'") {
+		t.Fatalf("sequence source should use DBMS_METADATA: %s", sequenceSQL)
+	}
+	assertArgs(t, sequenceArgs, []any{"ORDER_SEQ", "APP"})
+
+	synonymSQL, synonymArgs, err := objectSourceQuery("APP", "CUSTOMERS", "SYNONYM")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(synonymSQL, "SYS_SYNONYMS") || !strings.Contains(synonymSQL, "TARG_SCHE_ID") {
+		t.Fatalf("synonym source should resolve target schema from SYS_SYNONYMS: %s", synonymSQL)
+	}
+	assertArgs(t, synonymArgs, []any{"APP", "CUSTOMERS"})
+}
+
+func TestBuildSequenceDDLUsesXuguDictionaryValues(t *testing.T) {
+	ddl := formatSequenceDDL("APP", "ORDER_SEQ", "10", "5", "1", "999", true)
+	if ddl != `CREATE SEQUENCE "APP"."ORDER_SEQ" MINVALUE 1 MAXVALUE 999 START WITH 10 INCREMENT BY 5 CYCLE;` {
+		t.Fatalf("unexpected sequence DDL: %s", ddl)
+	}
 }
 
 func TestMetadataListConstraintsFromParams(t *testing.T) {
@@ -610,6 +1158,27 @@ func TestNormalizeXuguColumnTypeUsesVaryingFlag(t *testing.T) {
 	}
 }
 
+func TestXuguDataTypesIncludeContentAndSpecialTypes(t *testing.T) {
+	available := map[string]bool{}
+	for _, dataType := range xuguDataTypes {
+		available[dataType] = true
+	}
+	for _, want := range []string{"JSON", "XMLTYPE", "BFILE", "GUID", "ROWID", "VARBIT", "GEOMETRY", "INTERVAL DAY TO SECOND"} {
+		if !available[want] {
+			t.Fatalf("missing Xugu data type %q", want)
+		}
+	}
+}
+
+func TestNormalizeXuguBinaryValuesAsHex(t *testing.T) {
+	if got := normalizeValue([]byte{0x00, 0xff, 0x7f}, "BLOB"); got != "0x00ff7f" {
+		t.Fatalf("BLOB bytes = %#v, want hex", got)
+	}
+	if got := normalizeValue([]byte("virtual-valley"), "VARCHAR"); got != "virtual-valley" {
+		t.Fatalf("VARCHAR bytes = %#v, want text", got)
+	}
+}
+
 func TestAppendDDLStatement(t *testing.T) {
 	got := appendDDLStatement("CREATE TABLE \"T\" (\"ID\" INT)\n", "CREATE INDEX \"IDX\" ON \"T\"(\"ID\");")
 	want := "CREATE TABLE \"T\" (\"ID\" INT);\n\nCREATE INDEX \"IDX\" ON \"T\"(\"ID\");"
@@ -622,6 +1191,24 @@ func TestAppendDDLStatement(t *testing.T) {
 func TestQuoteStringLiteralEscapesSingleQuotes(t *testing.T) {
 	if got := quoteStringLiteral("owner's note"); got != "'owner''s note'" {
 		t.Fatalf("unexpected quoted string: %s", got)
+	}
+}
+
+func TestXuguTriggerMetadataValues(t *testing.T) {
+	if got := triggerTypeName(1); got != "FOR EACH ROW" {
+		t.Fatalf("trigger type 1 = %q, want FOR EACH ROW", got)
+	}
+	if got := triggerTypeName("2"); got != "FOR STATEMENT" {
+		t.Fatalf("trigger type 2 = %q, want FOR STATEMENT", got)
+	}
+	if got := xuguBoolPtr("TRUE"); got == nil || !*got {
+		t.Fatalf("TRUE should decode as enabled")
+	}
+	if got := xuguBoolPtr("F"); got == nil || *got {
+		t.Fatalf("F should decode as disabled")
+	}
+	if got := xuguBoolPtr("unknown"); got != nil {
+		t.Fatalf("unknown boolean should remain unset, got %v", *got)
 	}
 }
 

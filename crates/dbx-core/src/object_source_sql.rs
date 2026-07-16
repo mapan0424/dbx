@@ -57,6 +57,9 @@ pub fn supports_source_backed_routine_rename(
     database_type: Option<DatabaseType>,
     object_type: ObjectSourceKind,
 ) -> bool {
+    if object_type == ObjectSourceKind::Synonym {
+        return database_type == Some(DatabaseType::Xugu);
+    }
     if !matches!(object_type, ObjectSourceKind::Function | ObjectSourceKind::Procedure) {
         return false;
     }
@@ -75,6 +78,10 @@ pub fn build_routine_rename_object_source_statements(
             "Renaming {:?} from source is not supported for {:?}.",
             input.object_type, input.database_type
         ));
+    }
+
+    if input.object_type == ObjectSourceKind::Synonym {
+        return build_xugu_synonym_rename_statements(&input);
     }
 
     let source = input.source.trim();
@@ -117,6 +124,53 @@ pub fn build_routine_rename_object_source_statements(
         name: input.name,
         source: renamed_source,
     })
+}
+
+fn build_xugu_synonym_rename_statements(input: &RoutineRenameObjectSourceInput) -> Result<Vec<String>, String> {
+    let source = input.source.trim();
+    let Some(renamed_source) = replace_xugu_synonym_declaration_name(source, &input.new_name) else {
+        return Err("Cannot find a CREATE SYNONYM declaration in the object source.".to_string());
+    };
+    let drop_sql = if Regex::new(r"(?i)^\s*CREATE\s+PUBLIC\s+SYNONYM\b").unwrap().is_match(source) {
+        format!("DROP PUBLIC SYNONYM {};", quote_postgres_identifier(&input.name))
+    } else {
+        format!("DROP SYNONYM {};", postgres_qualified_name(input.schema.as_deref(), &input.name))
+    };
+    Ok(vec![ensure_semicolon(&renamed_source), drop_sql])
+}
+
+fn replace_xugu_synonym_declaration_name(source: &str, new_name: &str) -> Option<String> {
+    let declaration = Regex::new(
+        r#"(?is)^(?P<prefix>\s*CREATE\s+(?:PUBLIC\s+)?SYNONYM\s+)(?P<name>(?:\"(?:[^\"]|\"\")*\"|[A-Za-z0-9_$#]+)(?:\s*\.\s*(?:\"(?:[^\"]|\"\")*\"|[A-Za-z0-9_$#]+))?)(?P<suffix>\s+FOR\b.*)$"#,
+    )
+    .unwrap();
+    let captures = declaration.captures(source)?;
+    let existing_name = captures.name("name")?.as_str();
+    let replacement = match last_unquoted_dot(existing_name) {
+        Some(position) => format!("{}{}", &existing_name[..=position], quote_postgres_identifier(new_name)),
+        None => quote_postgres_identifier(new_name),
+    };
+    Some(format!("{}{}{}", captures.name("prefix")?.as_str(), replacement, captures.name("suffix")?.as_str()))
+}
+
+fn last_unquoted_dot(value: &str) -> Option<usize> {
+    let mut in_quotes = false;
+    let mut last_dot = None;
+    let bytes = value.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'\"' {
+            if in_quotes && bytes.get(index + 1) == Some(&b'\"') {
+                index += 2;
+                continue;
+            }
+            in_quotes = !in_quotes;
+        } else if bytes[index] == b'.' && !in_quotes {
+            last_dot = Some(index);
+        }
+        index += 1;
+    }
+    last_dot
 }
 
 pub fn build_executable_object_source_statements(input: EditableObjectSourceSqlInput) -> Result<Vec<String>, String> {
@@ -311,7 +365,7 @@ fn is_mysql_like(database_type: DatabaseType) -> bool {
 }
 
 fn is_oracle_like(database_type: DatabaseType) -> bool {
-    matches!(database_type, DatabaseType::Oracle | DatabaseType::Dameng)
+    matches!(database_type, DatabaseType::Oracle | DatabaseType::Dameng | DatabaseType::Xugu)
 }
 
 fn object_type_keyword(object_type: &ObjectSourceKind) -> &'static str {
@@ -320,9 +374,13 @@ fn object_type_keyword(object_type: &ObjectSourceKind) -> &'static str {
         ObjectSourceKind::MaterializedView => "MATERIALIZED_VIEW",
         ObjectSourceKind::Procedure => "PROCEDURE",
         ObjectSourceKind::Function => "FUNCTION",
+        ObjectSourceKind::Trigger => "TRIGGER",
         ObjectSourceKind::Sequence => "SEQUENCE",
+        ObjectSourceKind::Synonym => "SYNONYM",
         ObjectSourceKind::Package => "PACKAGE",
         ObjectSourceKind::PackageBody => "PACKAGE BODY",
+        ObjectSourceKind::Type => "TYPE",
+        ObjectSourceKind::TypeBody => "TYPE BODY",
     }
 }
 
@@ -821,10 +879,16 @@ fn parse_object_source_kind(value: &str) -> Option<ObjectSourceKind> {
         Some(ObjectSourceKind::Function)
     } else if value.eq_ignore_ascii_case("SEQUENCE") {
         Some(ObjectSourceKind::Sequence)
+    } else if value.eq_ignore_ascii_case("SYNONYM") {
+        Some(ObjectSourceKind::Synonym)
     } else if value.eq_ignore_ascii_case("PACKAGE") {
         Some(ObjectSourceKind::Package)
     } else if value.eq_ignore_ascii_case("PACKAGE BODY") || value.eq_ignore_ascii_case("PACKAGE_BODY") {
         Some(ObjectSourceKind::PackageBody)
+    } else if value.eq_ignore_ascii_case("TYPE") || value.eq_ignore_ascii_case("UDT") {
+        Some(ObjectSourceKind::Type)
+    } else if value.eq_ignore_ascii_case("TYPE BODY") || value.eq_ignore_ascii_case("TYPE_BODY") {
+        Some(ObjectSourceKind::TypeBody)
     } else {
         None
     }
@@ -1252,6 +1316,37 @@ mod tests {
     }
 
     #[test]
+    fn xugu_view_body_saves_as_create_or_replace_view() {
+        let sql = build_executable_object_source_sql(EditableObjectSourceSqlInput {
+            database_type: DatabaseType::Xugu,
+            object_type: ObjectSourceKind::View,
+            schema: Some("DBX_TEST".to_string()),
+            name: "ACTIVE_USERS".to_string(),
+            source: "SELECT ID, NAME FROM USERS WHERE ACTIVE = TRUE".to_string(),
+        })
+        .unwrap();
+
+        assert_eq!(
+            sql,
+            "CREATE OR REPLACE VIEW \"DBX_TEST\".\"ACTIVE_USERS\" AS\nSELECT ID, NAME FROM USERS WHERE ACTIVE = TRUE;"
+        );
+    }
+
+    #[test]
+    fn xugu_package_body_source_remains_a_single_statement() {
+        let sql = build_executable_object_source_sql(EditableObjectSourceSqlInput {
+            database_type: DatabaseType::Xugu,
+            object_type: ObjectSourceKind::PackageBody,
+            schema: Some("DBX_TEST".to_string()),
+            name: "PAYROLL".to_string(),
+            source: "CREATE OR REPLACE PACKAGE BODY PAYROLL AS\nEND PAYROLL;".to_string(),
+        })
+        .unwrap();
+
+        assert_eq!(sql, "CREATE OR REPLACE PACKAGE BODY PAYROLL AS\nEND PAYROLL;");
+    }
+
+    #[test]
     fn postgres_procedure_rename_adds_drop_cleanup() {
         let statements = build_executable_object_source_statements(input(
             DatabaseType::Postgres,
@@ -1445,6 +1540,45 @@ mod tests {
             vec![
                 "CREATE OR REPLACE PROCEDURE \"SYSDBA\".\"SP_TAB_BAKSET_REMOVE_BATCH_2\" AS\nBEGIN\n  SELECT 1;\nEND;",
                 "DROP PROCEDURE \"SYSDBA\".\"SP_TAB_BAKSET_REMOVE_BATCH\";",
+            ]
+        );
+    }
+
+    #[test]
+    fn xugu_synonym_rename_recreates_regular_synonym_before_dropping_original() {
+        let statements = build_routine_rename_object_source_statements(RoutineRenameObjectSourceInput {
+            database_type: DatabaseType::Xugu,
+            object_type: ObjectSourceKind::Synonym,
+            schema: Some("APP".to_string()),
+            name: "CUSTOMERS".to_string(),
+            new_name: "CUSTOMERS_ALIAS".to_string(),
+            source: "CREATE SYNONYM APP.CUSTOMERS FOR CRM.CUSTOMERS".to_string(),
+        })
+        .unwrap();
+
+        assert_eq!(
+            statements,
+            vec!["CREATE SYNONYM APP.\"CUSTOMERS_ALIAS\" FOR CRM.CUSTOMERS;", "DROP SYNONYM \"APP\".\"CUSTOMERS\";",]
+        );
+    }
+
+    #[test]
+    fn xugu_public_synonym_rename_uses_public_drop_syntax() {
+        let statements = build_routine_rename_object_source_statements(RoutineRenameObjectSourceInput {
+            database_type: DatabaseType::Xugu,
+            object_type: ObjectSourceKind::Synonym,
+            schema: Some("APP".to_string()),
+            name: "CUSTOMERS".to_string(),
+            new_name: "CUSTOMERS_ALIAS".to_string(),
+            source: "CREATE PUBLIC SYNONYM APP.CUSTOMERS FOR CRM.CUSTOMERS".to_string(),
+        })
+        .unwrap();
+
+        assert_eq!(
+            statements,
+            vec![
+                "CREATE PUBLIC SYNONYM APP.\"CUSTOMERS_ALIAS\" FOR CRM.CUSTOMERS;",
+                "DROP PUBLIC SYNONYM \"CUSTOMERS\";",
             ]
         );
     }

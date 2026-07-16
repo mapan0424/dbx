@@ -7,9 +7,10 @@ export type ObjectBrowserRow = {
   name: string;
   displayName: string;
   schema?: string;
-  type: "TABLE" | "VIEW" | "MATERIALIZED_VIEW" | "PROCEDURE" | "FUNCTION" | "SEQUENCE" | "PACKAGE" | "PACKAGE_BODY";
+  type: "TABLE" | "VIEW" | "MATERIALIZED_VIEW" | "PROCEDURE" | "FUNCTION" | "TRIGGER" | "SEQUENCE" | "SYNONYM" | "PACKAGE" | "PACKAGE_BODY" | "TYPE" | "TYPE_BODY";
   signature?: string | null;
   comment?: string | null;
+  isPublic?: boolean;
   created_at?: string | null;
   updated_at?: string | null;
   partitionParentId?: string;
@@ -27,12 +28,16 @@ export function normalizeObjectBrowserType(type: string): ObjectBrowserRow["type
   const value = type.toUpperCase();
   const normalized = value.replace(/[\s-]+/g, "_");
   if (normalized.includes("PACKAGE_BODY")) return "PACKAGE_BODY";
+  if (normalized.includes("TYPE_BODY")) return "TYPE_BODY";
   if (normalized.includes("PACKAGE")) return "PACKAGE";
+  if (normalized === "TYPE" || normalized === "UDT") return "TYPE";
   if (normalized.includes("MATERIALIZED_VIEW")) return "MATERIALIZED_VIEW";
   if (value.includes("VIEW")) return "VIEW";
   if (value.includes("SEQ")) return "SEQUENCE";
+  if (value.includes("SYNONYM")) return "SYNONYM";
   if (value.includes("PROC")) return "PROCEDURE";
   if (value.includes("FUNC")) return "FUNCTION";
+  if (value.includes("TRIG")) return "TRIGGER";
   return "TABLE";
 }
 
@@ -45,7 +50,7 @@ export function buildObjectBrowserRows(options: { objects: ObjectInfo[]; databas
     const schema = objectSchema || (options.needsSchema ? options.fallbackSchema : undefined);
     const type = normalizeObjectBrowserType(object.object_type);
     const signature = routineSignatureForDisplay(type, object.signature);
-    const displayName = signature === undefined ? name : `${name}(${signature})`;
+    const displayName = `${signature === undefined ? name : `${name}(${signature})`}${object.valid === false ? " · INVALID" : ""}`;
     const signatureIdPart = signature === undefined ? "" : `:${signature}`;
     const baseId = `${schema || options.fallbackSchema || options.database}:${name}:${type}${signatureIdPart}`;
     const index = seen.get(baseId) ?? 0;
@@ -59,6 +64,7 @@ export function buildObjectBrowserRows(options: { objects: ObjectInfo[]; databas
         type,
         signature,
         comment: object.comment,
+        isPublic: object.is_public ?? undefined,
         created_at: object.created_at,
         updated_at: object.updated_at,
         partitionParentSchema: object.parent_schema ? normalizeDatabaseObjectName(object.parent_schema) : undefined,

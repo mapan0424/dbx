@@ -51,6 +51,14 @@ WHERE UPPER(s.SCHEMA_NAME) = UPPER(?)
   AND UPPER(t.TABLE_NAME) = UPPER(?)
   AND (c.IS_HIDE IS NULL OR c.IS_HIDE = FALSE)
 ORDER BY c.COL_NO`
+const xuguListViewColumnsSQL = `
+SELECT c.COL_NAME, c.TYPE_NAME, FALSE AS NOT_NULL, NULL AS DEF_VAL, c.COMMENTS, c.SCALE, c."VARYING"
+FROM ALL_VIEW_COLUMNS c
+JOIN ALL_VIEWS v ON v.DB_ID = c.DB_ID AND v.VIEW_ID = c.VIEW_ID
+JOIN ALL_SCHEMAS s ON s.DB_ID = v.DB_ID AND s.SCHEMA_ID = v.SCHEMA_ID
+WHERE UPPER(s.SCHEMA_NAME) = UPPER(?)
+  AND UPPER(v.VIEW_NAME) = UPPER(?)
+ORDER BY c.COL_NO`
 const xuguListIndexesSQL = `
 SELECT i.INDEX_NAME, i.KEYS, i.IS_UNIQUE, i.IS_PRIMARY, i.INDEX_TYPE, i.FILTER
 FROM ALL_INDEXES i
@@ -62,32 +70,59 @@ ORDER BY i.INDEX_NAME`
 
 var xuguDataTypes = []string{
 	"BOOLEAN",
+	"BOOL",
+	"TINYINT",
 	"INTEGER",
+	"INT",
 	"SMALLINT",
 	"BIGINT",
 	"FLOAT",
+	"DOUBLE",
+	"REAL",
 	"NUMERIC",
+	"DECIMAL",
 	"CHAR",
 	"VARCHAR",
-	"CLOB",
-	"DATE",
-	"TIME",
-	"TIMESTAMP",
-	"BINARY",
-	"VARBINARY",
-	"BLOB",
-	"XML",
-	"BOOL",
-	"INT",
-	"SHORT",
-	"LONGINT",
-	"LONG",
-	"REAL",
-	"DECIMAL",
-	"TEXT",
 	"NCHAR",
 	"NVARCHAR",
 	"NVARCHAR2",
+	"TEXT",
+	"CLOB",
+	"DATE",
+	"TIME",
+	"TIME WITH TIME ZONE",
+	"TIMESTAMP",
+	"TIMESTAMP WITH TIME ZONE",
+	"DATETIME",
+	"DATETIME WITH TIME ZONE",
+	"INTERVAL YEAR",
+	"INTERVAL YEAR TO MONTH",
+	"INTERVAL MONTH",
+	"INTERVAL DAY",
+	"INTERVAL DAY TO HOUR",
+	"INTERVAL DAY TO MINUTE",
+	"INTERVAL DAY TO SECOND",
+	"INTERVAL HOUR",
+	"INTERVAL HOUR TO MINUTE",
+	"INTERVAL HOUR TO SECOND",
+	"INTERVAL MINUTE",
+	"INTERVAL MINUTE TO SECOND",
+	"INTERVAL SECOND",
+	"BINARY",
+	"VARBINARY",
+	"BLOB",
+	"BFILE",
+	"BIT",
+	"VARBIT",
+	"GUID",
+	"ROWID",
+	"JSON",
+	"XML",
+	"XMLTYPE",
+	"GEOMETRY",
+	"SHORT",
+	"LONGINT",
+	"LONG",
 }
 
 type request struct {
@@ -200,6 +235,8 @@ type objectInfo struct {
 	ObjectType string  `json:"object_type"`
 	Schema     string  `json:"schema"`
 	Comment    *string `json:"comment"`
+	IsPublic   *bool   `json:"is_public,omitempty"`
+	Valid      *bool   `json:"valid,omitempty"`
 }
 
 type metadataListConstraints struct {
@@ -258,9 +295,13 @@ type foreignKeyInfo struct {
 }
 
 type triggerInfo struct {
-	Name   string `json:"name"`
-	Event  string `json:"event"`
-	Timing string `json:"timing"`
+	Name        string `json:"name"`
+	Event       string `json:"event"`
+	Timing      string `json:"timing"`
+	TriggerType string `json:"trigger_type,omitempty"`
+	Condition   string `json:"condition,omitempty"`
+	Enabled     *bool  `json:"enabled,omitempty"`
+	Valid       *bool  `json:"valid,omitempty"`
 }
 
 type server struct {
@@ -1228,7 +1269,51 @@ func (s *server) listTables(schema string, constraints metadataListConstraints) 
 		}
 		result = append(result, item)
 	}
-	return emptyIfNil(result), rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return emptyIfNil(result), nil
+}
+
+func (s *server) viewColumns(schema, view string, primaryKeys map[string]bool) ([]columnInfo, error) {
+	rows, err := s.queryRows(xuguListViewColumnsSQL, []any{schema, view})
+	if err != nil {
+		if isXuguMetadataAccessError(err) {
+			return s.columnsFromSelect(schema, view, primaryKeys)
+		}
+		return nil, err
+	}
+	defer s.closeRows(rows)
+	var result []columnInfo
+	for rows.Next() {
+		var item columnInfo
+		var notNull any
+		var scale *int
+		var varying any
+		if err := rows.Scan(
+			&item.Name,
+			&item.DataType,
+			&notNull,
+			&item.ColumnDefault,
+			&item.Comment,
+			&scale,
+			&varying,
+		); err != nil {
+			return nil, err
+		}
+		item.DataType = normalizeXuguColumnType(item.DataType, varying)
+		item.IsNullable = !truthy(notNull)
+		item.IsPrimaryKey = primaryKeys[strings.ToUpper(item.Name)]
+		item.NumericPrecision, item.NumericScale, item.CharacterMaximumLength = decodeXuguScale(item.DataType, scale)
+		result = append(result, item)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if len(result) > 0 {
+		return result, nil
+	}
+	return s.columnsFromSelect(schema, view, primaryKeys)
 }
 
 func (s *server) listObjects(schema string, constraints metadataListConstraints) ([]objectInfo, error) {
@@ -1245,9 +1330,19 @@ func (s *server) listObjects(schema string, constraints metadataListConstraints)
 	var result []objectInfo
 	for rows.Next() {
 		var item objectInfo
+		var isPublic any
+		var valid any
 		item.Schema = schema
-		if err := rows.Scan(&item.Name, &item.ObjectType, &item.Comment); err != nil {
+		if err := rows.Scan(&item.Name, &item.ObjectType, &item.Comment, &isPublic, &valid); err != nil {
 			return nil, err
+		}
+		if isPublic != nil {
+			value := truthy(isPublic)
+			item.IsPublic = &value
+		}
+		if valid != nil {
+			value := truthy(valid)
+			item.Valid = &value
 		}
 		result = append(result, item)
 	}
@@ -1298,19 +1393,66 @@ WHERE UPPER(s.SCHEMA_NAME) = UPPER(?)`,
 func xuguListObjectsQuery(schema string, constraints metadataListConstraints) xuguMetadataListQuery {
 	return xuguConstrainedMetadataListQuery(
 		`
-SELECT t.TABLE_NAME AS OBJECT_NAME, 'TABLE' AS OBJECT_TYPE, t.COMMENTS
+SELECT t.TABLE_NAME AS OBJECT_NAME, 'TABLE' AS OBJECT_TYPE, t.COMMENTS, NULL AS IS_PUBLIC, NULL AS VALID
 FROM ALL_TABLES t
 JOIN ALL_SCHEMAS s ON s.DB_ID = t.DB_ID AND s.SCHEMA_ID = t.SCHEMA_ID
 WHERE UPPER(s.SCHEMA_NAME) = UPPER(?)
 UNION ALL
-SELECT v.VIEW_NAME AS OBJECT_NAME, 'VIEW' AS OBJECT_TYPE, v.COMMENTS
+SELECT v.VIEW_NAME AS OBJECT_NAME, 'VIEW' AS OBJECT_TYPE, v.COMMENTS, NULL AS IS_PUBLIC, NULL AS VALID
 FROM ALL_VIEWS v
 JOIN ALL_SCHEMAS s ON s.DB_ID = v.DB_ID AND s.SCHEMA_ID = v.SCHEMA_ID
+WHERE UPPER(s.SCHEMA_NAME) = UPPER(?)
+UNION ALL
+SELECT p.PROC_NAME AS OBJECT_NAME,
+       CASE WHEN p.RET_TYPE IS NULL THEN 'PROCEDURE' ELSE 'FUNCTION' END AS OBJECT_TYPE,
+       p.COMMENTS, NULL AS IS_PUBLIC, p.VALID
+FROM ALL_PROCEDURES p
+JOIN ALL_SCHEMAS s ON s.DB_ID = p.DB_ID AND s.SCHEMA_ID = p.SCHEMA_ID
+WHERE UPPER(s.SCHEMA_NAME) = UPPER(?)
+UNION ALL
+SELECT p.PACK_NAME AS OBJECT_NAME, 'PACKAGE' AS OBJECT_TYPE, p.COMMENTS, NULL AS IS_PUBLIC, p.VALID
+FROM ALL_PACKAGES p
+JOIN ALL_SCHEMAS s ON s.DB_ID = p.DB_ID AND s.SCHEMA_ID = p.SCHEMA_ID
+WHERE UPPER(s.SCHEMA_NAME) = UPPER(?)
+UNION ALL
+SELECT p.PACK_NAME AS OBJECT_NAME, 'PACKAGE_BODY' AS OBJECT_TYPE, p.COMMENTS, NULL AS IS_PUBLIC, p.ALL_OK
+FROM ALL_PACKAGES p
+JOIN ALL_SCHEMAS s ON s.DB_ID = p.DB_ID AND s.SCHEMA_ID = p.SCHEMA_ID
+WHERE UPPER(s.SCHEMA_NAME) = UPPER(?)
+  AND p.BODY IS NOT NULL
+UNION ALL
+SELECT tr.TRIG_NAME AS OBJECT_NAME, 'TRIGGER' AS OBJECT_TYPE, tr.COMMENTS, NULL AS IS_PUBLIC, tr.VALID
+FROM ALL_TRIGGERS tr
+JOIN ALL_SCHEMAS s ON s.DB_ID = tr.DB_ID AND s.SCHEMA_ID = tr.SCHEMA_ID
+WHERE UPPER(s.SCHEMA_NAME) = UPPER(?)
+UNION ALL
+SELECT q.SEQ_NAME AS OBJECT_NAME, 'SEQUENCE' AS OBJECT_TYPE, NULL AS COMMENTS, NULL AS IS_PUBLIC, NULL AS VALID
+FROM ALL_SEQUENCES q
+JOIN ALL_SCHEMAS s ON s.DB_ID = q.DB_ID AND s.SCHEMA_ID = q.SCHEMA_ID
+WHERE UPPER(s.SCHEMA_NAME) = UPPER(?)
+UNION ALL
+SELECT u.TYPE_NAME AS OBJECT_NAME, 'TYPE' AS OBJECT_TYPE, u.COMMENTS, NULL AS IS_PUBLIC, u.VALID
+FROM ALL_TYPES u
+JOIN ALL_SCHEMAS s ON s.DB_ID = u.DB_ID AND s.SCHEMA_ID = u.SCHEMA_ID
+WHERE UPPER(s.SCHEMA_NAME) = UPPER(?)
+UNION ALL
+SELECT u.TYPE_NAME AS OBJECT_NAME, 'TYPE_BODY' AS OBJECT_TYPE, u.COMMENTS, NULL AS IS_PUBLIC, u.VALID
+FROM ALL_TYPES u
+JOIN ALL_SCHEMAS s ON s.DB_ID = u.DB_ID AND s.SCHEMA_ID = u.SCHEMA_ID
+WHERE UPPER(s.SCHEMA_NAME) = UPPER(?)
+  AND u.BODY IS NOT NULL
+UNION ALL
+SELECT y.SYNO_NAME AS OBJECT_NAME, 'SYNONYM' AS OBJECT_TYPE,
+       'FOR ' || target.SCHEMA_NAME || '.' || y.TARG_NAME AS COMMENTS,
+       y.IS_PUBLIC, NULL AS VALID
+FROM SYS_SYNONYMS y
+JOIN SYS_SCHEMAS s ON s.DB_ID = y.DB_ID AND s.SCHEMA_ID = y.SCHEMA_ID
+LEFT JOIN SYS_SCHEMAS target ON target.DB_ID = y.DB_ID AND target.SCHEMA_ID = y.TARG_SCHE_ID
 WHERE UPPER(s.SCHEMA_NAME) = UPPER(?)`,
-		"OBJECT_NAME, OBJECT_TYPE, COMMENTS",
+		"OBJECT_NAME, OBJECT_TYPE, COMMENTS, IS_PUBLIC, VALID",
 		"OBJECT_NAME",
 		"OBJECT_TYPE",
-		[]any{schema, schema},
+		[]any{schema, schema, schema, schema, schema, schema, schema, schema, schema, schema},
 		constraints,
 	)
 }
@@ -1375,6 +1517,24 @@ func normalizedXuguObjectTypes(values []string) []string {
 			normalized = "TABLE"
 		case "VIEW":
 			normalized = "VIEW"
+		case "PROCEDURE", "PROC":
+			normalized = "PROCEDURE"
+		case "FUNCTION", "FUNC":
+			normalized = "FUNCTION"
+		case "TRIGGER", "TRIG":
+			normalized = "TRIGGER"
+		case "PACKAGE":
+			normalized = "PACKAGE"
+		case "PACKAGE_BODY":
+			normalized = "PACKAGE_BODY"
+		case "TYPE", "UDT":
+			normalized = "TYPE"
+		case "TYPE_BODY":
+			normalized = "TYPE_BODY"
+		case "SEQUENCE", "SEQ":
+			normalized = "SEQUENCE"
+		case "SYNONYM", "SYN":
+			normalized = "SYNONYM"
 		default:
 			continue
 		}
@@ -1448,7 +1608,13 @@ func (s *server) getColumns(schema, table string) ([]columnInfo, error) {
 		item.NumericPrecision, item.NumericScale, item.CharacterMaximumLength = decodeXuguScale(item.DataType, scale)
 		result = append(result, item)
 	}
-	return emptyIfNil(result), rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if len(result) > 0 {
+		return result, nil
+	}
+	return s.viewColumns(schema, table, primaryKeys)
 }
 
 func (s *server) columnsFromSelect(schema, table string, primaryKeys map[string]bool) ([]columnInfo, error) {
@@ -1589,10 +1755,10 @@ func (s *server) listTriggers(schema, table string) ([]triggerInfo, error) {
 	}
 	table = strings.ToUpper(strings.TrimSpace(table))
 	rows, err := s.queryRows(`
-SELECT tr.TRIG_NAME, tr.TRIG_EVENT, tr.TRIG_TIME
-FROM SYS_TRIGGERS tr
-JOIN SYS_TABLES t ON t.DB_ID = tr.DB_ID AND t.TABLE_ID = tr.OBJ_ID
-JOIN SYS_SCHEMAS s ON s.DB_ID = t.DB_ID AND s.SCHEMA_ID = t.SCHEMA_ID
+SELECT tr.TRIG_NAME, tr.TRIG_EVENT, tr.TRIG_TIME, tr.TRIG_TYPE, tr.TRIG_COND, tr.ENABLE, tr.VALID
+FROM ALL_TRIGGERS tr
+JOIN ALL_TABLES t ON t.DB_ID = tr.DB_ID AND t.TABLE_ID = tr.OBJ_ID
+JOIN ALL_SCHEMAS s ON s.DB_ID = t.DB_ID AND s.SCHEMA_ID = t.SCHEMA_ID
 WHERE UPPER(s.SCHEMA_NAME) = UPPER(?)
   AND UPPER(t.TABLE_NAME) = UPPER(?)
 ORDER BY tr.TRIG_NAME`, []any{schema, table})
@@ -1606,12 +1772,16 @@ ORDER BY tr.TRIG_NAME`, []any{schema, table})
 	var result []triggerInfo
 	for rows.Next() {
 		var item triggerInfo
-		var event, timing any
-		if err := rows.Scan(&item.Name, &event, &timing); err != nil {
+		var event, timing, triggerType, condition, enabled, valid any
+		if err := rows.Scan(&item.Name, &event, &timing, &triggerType, &condition, &enabled, &valid); err != nil {
 			return nil, err
 		}
 		item.Event = triggerEventName(event)
 		item.Timing = triggerTimingName(timing)
+		item.TriggerType = triggerTypeName(triggerType)
+		item.Condition = strings.TrimSpace(fmt.Sprint(normalizeValue(condition)))
+		item.Enabled = xuguBoolPtr(enabled)
+		item.Valid = xuguBoolPtr(valid)
 		result = append(result, item)
 	}
 	return emptyIfNil(result), rows.Err()
@@ -1631,16 +1801,90 @@ func (s *server) getObjectSource(schema, name, objectType string) (map[string]an
 	if err != nil {
 		return nil, err
 	}
-	defer s.closeRows(rows)
 	var builder strings.Builder
 	for rows.Next() {
 		var line string
 		if err := rows.Scan(&line); err != nil {
+			_ = s.closeRows(rows)
 			return nil, err
 		}
 		builder.WriteString(line)
 	}
-	return map[string]any{"name": name, "object_type": objectType, "schema": schema, "source": builder.String()}, rows.Err()
+	if err := rows.Err(); err != nil {
+		_ = s.closeRows(rows)
+		return nil, err
+	}
+	if err := s.closeRows(rows); err != nil {
+		return nil, err
+	}
+	source := builder.String()
+	if strings.TrimSpace(source) == "" && strings.EqualFold(strings.TrimSpace(objectType), "SEQUENCE") {
+		source, err = s.buildSequenceDDL(schema, name)
+		if err != nil {
+			return nil, err
+		}
+	}
+	result := map[string]any{"name": name, "object_type": objectType, "schema": schema, "source": source}
+	if strings.TrimSpace(source) == "" && isXuguTypeObject(objectType) {
+		// Some Xugu installations expose TYPE names but intentionally omit both
+		// ALL_TYPES.SPEC/BODY and DBMS_METADATA output. Do not present an empty
+		// editable document as if it were a recoverable definition.
+		result["source"] = fmt.Sprintf("-- XuguDB did not expose the definition for TYPE %s.%s.\n-- ALL_TYPES.SPEC/BODY and DBMS_METADATA.GET_DDL returned no DDL.\n-- The object can still be listed and managed, but its source cannot be reconstructed from this database.", quoteIdentifier(schema), quoteIdentifier(name))
+		result["editable"] = false
+	}
+	if strings.EqualFold(strings.TrimSpace(objectType), "SYNONYM") {
+		// Editing a synonym requires replacing it atomically. Show its target safely
+		// until DBX has a dedicated create-or-replace synonym workflow.
+		result["editable"] = false
+	}
+	return result, nil
+}
+
+func isXuguTypeObject(objectType string) bool {
+	switch strings.ToUpper(strings.TrimSpace(objectType)) {
+	case "TYPE", "TYPE BODY", "TYPE_BODY", "UDT":
+		return true
+	default:
+		return false
+	}
+}
+
+func (s *server) buildSequenceDDL(schema, name string) (string, error) {
+	rows, err := s.queryRows(`
+SELECT q.CURR_VAL, q.STEP_VAL, q.MIN_VAL, q.MAX_VAL, q.IS_CYCLE
+FROM SYS_SEQUENCES q
+JOIN SYS_SCHEMAS s ON s.DB_ID = q.DB_ID AND s.SCHEMA_ID = q.SCHEMA_ID
+WHERE UPPER(s.SCHEMA_NAME) = UPPER(?) AND UPPER(q.SEQ_NAME) = UPPER(?)`, []any{schema, name})
+	if err != nil {
+		return "", err
+	}
+	defer s.closeRows(rows)
+	if !rows.Next() {
+		if err := rows.Err(); err != nil {
+			return "", err
+		}
+		return "", fmt.Errorf("sequence not found: %s.%s", schema, name)
+	}
+	var current, step, minValue, maxValue string
+	var cycle bool
+	if err := rows.Scan(&current, &step, &minValue, &maxValue, &cycle); err != nil {
+		return "", err
+	}
+	if err := rows.Err(); err != nil {
+		return "", err
+	}
+	return formatSequenceDDL(schema, name, current, step, minValue, maxValue, cycle), nil
+}
+
+func formatSequenceDDL(schema, name, current, step, minValue, maxValue string, cycle bool) string {
+	cycleClause := "NOCYCLE"
+	if cycle {
+		cycleClause = "CYCLE"
+	}
+	return fmt.Sprintf(
+		"CREATE SEQUENCE %s.%s MINVALUE %s MAXVALUE %s START WITH %s INCREMENT BY %s %s;",
+		quoteIdentifier(schema), quoteIdentifier(name), minValue, maxValue, current, step, cycleClause,
+	)
 }
 
 func (s *server) getTableDDL(schema, table string) (string, error) {
@@ -1649,24 +1893,62 @@ func (s *server) getTableDDL(schema, table string) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	if ddl, found, err := s.viewDDL(schema, table); err != nil {
+		return "", err
+	} else if found {
+		return ddl, nil
+	}
 	var ddl string
 	rows, err := s.queryRows("SELECT TO_CHAR(DBMS_METADATA.GET_DDL('TABLE', ?, ?)) FROM DUAL", []any{strings.ToUpper(table), schema})
 	if err == nil {
-		defer s.closeRows(rows)
 		if rows.Next() {
 			if scanErr := rows.Scan(&ddl); scanErr == nil && strings.TrimSpace(ddl) != "" {
 				if err := rows.Err(); err != nil {
+					_ = s.closeRows(rows)
+					return "", err
+				}
+				if err := s.closeRows(rows); err != nil {
 					return "", err
 				}
 				return s.appendTableIndexDDL(schema, table, ddl), nil
 			}
 		}
+		_ = s.closeRows(rows)
 	}
 	ddl, err = s.buildTableDDL(schema, table)
 	if err != nil {
 		return "", err
 	}
 	return s.appendTableIndexDDL(schema, table, ddl), nil
+}
+
+func (s *server) viewDDL(schema, view string) (string, bool, error) {
+	rows, err := s.queryRows(`
+SELECT COALESCE(TO_CHAR(v.DEFINE), '')
+FROM ALL_VIEWS v
+JOIN ALL_SCHEMAS s ON s.DB_ID = v.DB_ID AND s.SCHEMA_ID = v.SCHEMA_ID
+WHERE UPPER(s.SCHEMA_NAME) = UPPER(?) AND UPPER(v.VIEW_NAME) = UPPER(?)`, []any{schema, strings.ToUpper(strings.TrimSpace(view))})
+	if err != nil {
+		return "", false, err
+	}
+	defer s.closeRows(rows)
+	if !rows.Next() {
+		if err := rows.Err(); err != nil {
+			return "", false, err
+		}
+		return "", false, nil
+	}
+	var ddl string
+	if err := rows.Scan(&ddl); err != nil {
+		return "", false, err
+	}
+	if err := rows.Err(); err != nil {
+		return "", false, err
+	}
+	if strings.TrimSpace(ddl) == "" {
+		return "", true, fmt.Errorf("view DDL is not available for %s.%s", schema, view)
+	}
+	return ddl, true, nil
 }
 
 func (s *server) getExplainInfo(sqlText string) (string, error) {
@@ -1684,7 +1966,7 @@ func (s *server) getExplainInfo(sqlText string) (string, error) {
 	}
 	var builder strings.Builder
 	for rows.Next() {
-		values, err := scanRow(rows, len(columns))
+		values, err := scanRow(rows, len(columns), nil)
 		if err != nil {
 			return "", err
 		}
@@ -1855,7 +2137,7 @@ func readQuerySessionPage(session *querySession, pageSize int) (queryPageResult,
 		if !session.rows.Next() {
 			return result, session.rows.Err()
 		}
-		row, err := scanRow(session.rows, len(session.columns))
+		row, err := scanRow(session.rows, len(session.columns), session.columnTypes)
 		if err != nil {
 			return queryPageResult{}, err
 		}
@@ -1867,7 +2149,7 @@ func readQuerySessionPage(session *querySession, pageSize int) (queryPageResult,
 		return result, nil
 	}
 	if session.rows.Next() {
-		row, err := scanRow(session.rows, len(session.columns))
+		row, err := scanRow(session.rows, len(session.columns), session.columnTypes)
 		if err != nil {
 			return queryPageResult{}, err
 		}
@@ -1928,7 +2210,7 @@ func (s *server) executeSelect(sqlText string, maxRows int) (queryResult, error)
 			result.Truncated = true
 			break
 		}
-		values, err := scanRow(rows, len(columns))
+		values, err := scanRow(rows, len(columns), result.ColumnTypes)
 		if err != nil {
 			return queryResult{}, err
 		}
@@ -1937,7 +2219,7 @@ func (s *server) executeSelect(sqlText string, maxRows int) (queryResult, error)
 	return result, rows.Err()
 }
 
-func scanRow(rows *sql.Rows, columnCount int) ([]any, error) {
+func scanRow(rows *sql.Rows, columnCount int, columnTypes []string) ([]any, error) {
 	values := make([]any, columnCount)
 	scanTargets := make([]any, columnCount)
 	for i := range values {
@@ -1947,9 +2229,16 @@ func scanRow(rows *sql.Rows, columnCount int) ([]any, error) {
 		return nil, err
 	}
 	for i, value := range values {
-		values[i] = normalizeValue(value)
+		values[i] = normalizeValue(value, columnTypeAt(columnTypes, i))
 	}
 	return values, nil
+}
+
+func columnTypeAt(columnTypes []string, index int) string {
+	if index < 0 || index >= len(columnTypes) {
+		return ""
+	}
+	return columnTypes[index]
 }
 
 func columnTypeNames(rows *sql.Rows) []string {
@@ -2053,27 +2342,56 @@ func objectSourceQuery(schema, name, objectType string) (string, []any, error) {
 	case "VIEW":
 		return `
 SELECT TO_CHAR(v.DEFINE)
-FROM SYS_VIEWS v
-JOIN SYS_SCHEMAS s ON s.DB_ID = v.DB_ID AND s.SCHEMA_ID = v.SCHEMA_ID
+FROM ALL_VIEWS v
+JOIN ALL_SCHEMAS s ON s.DB_ID = v.DB_ID AND s.SCHEMA_ID = v.SCHEMA_ID
 WHERE UPPER(s.SCHEMA_NAME) = UPPER(?) AND UPPER(v.VIEW_NAME) = UPPER(?)`, []any{schema, name}, nil
 	case "TRIGGER":
 		return `
 SELECT TO_CHAR(t.DEFINE)
-FROM SYS_TRIGGERS t
-JOIN SYS_SCHEMAS s ON s.DB_ID = t.DB_ID AND s.SCHEMA_ID = t.SCHEMA_ID
+FROM ALL_TRIGGERS t
+JOIN ALL_SCHEMAS s ON s.DB_ID = t.DB_ID AND s.SCHEMA_ID = t.SCHEMA_ID
 WHERE UPPER(s.SCHEMA_NAME) = UPPER(?) AND UPPER(t.TRIG_NAME) = UPPER(?)`, []any{schema, name}, nil
 	case "PROCEDURE", "FUNCTION":
+		returnTypeFilter := "p.RET_TYPE IS NULL"
+		if objectType == "FUNCTION" {
+			returnTypeFilter = "p.RET_TYPE IS NOT NULL"
+		}
 		return `
 SELECT TO_CHAR(p.DEFINE)
-FROM SYS_PROCEDURES p
-JOIN SYS_SCHEMAS s ON s.DB_ID = p.DB_ID AND s.SCHEMA_ID = p.SCHEMA_ID
-WHERE UPPER(s.SCHEMA_NAME) = UPPER(?) AND UPPER(p.PROC_NAME) = UPPER(?)`, []any{schema, name}, nil
-	case "PACKAGE", "PACKAGE BODY":
+FROM ALL_PROCEDURES p
+JOIN ALL_SCHEMAS s ON s.DB_ID = p.DB_ID AND s.SCHEMA_ID = p.SCHEMA_ID
+WHERE UPPER(s.SCHEMA_NAME) = UPPER(?) AND UPPER(p.PROC_NAME) = UPPER(?) AND ` + returnTypeFilter, []any{schema, name}, nil
+	case "PACKAGE", "PACKAGE BODY", "PACKAGE_BODY":
+		definition := "COALESCE(TO_CHAR(k.SPEC), '')"
+		if objectType == "PACKAGE BODY" || objectType == "PACKAGE_BODY" {
+			definition = "COALESCE(TO_CHAR(k.BODY), '')"
+		}
 		return `
-SELECT COALESCE(TO_CHAR(k.SPEC), '') || COALESCE(TO_CHAR(k.BODY), '')
-FROM SYS_PACKAGES k
-JOIN SYS_SCHEMAS s ON s.DB_ID = k.DB_ID AND s.SCHEMA_ID = k.SCHEMA_ID
+SELECT ` + definition + `
+FROM ALL_PACKAGES k
+JOIN ALL_SCHEMAS s ON s.DB_ID = k.DB_ID AND s.SCHEMA_ID = k.SCHEMA_ID
 WHERE UPPER(s.SCHEMA_NAME) = UPPER(?) AND UPPER(k.PACK_NAME) = UPPER(?)`, []any{schema, name}, nil
+	case "TYPE", "TYPE BODY", "TYPE_BODY":
+		definition := "COALESCE(TO_CHAR(t.SPEC), '')"
+		if objectType == "TYPE BODY" || objectType == "TYPE_BODY" {
+			definition = "COALESCE(TO_CHAR(t.BODY), '')"
+		}
+		return `
+SELECT ` + definition + `
+FROM ALL_TYPES t
+JOIN ALL_SCHEMAS s ON s.DB_ID = t.DB_ID AND s.SCHEMA_ID = t.SCHEMA_ID
+WHERE UPPER(s.SCHEMA_NAME) = UPPER(?) AND UPPER(t.TYPE_NAME) = UPPER(?)`, []any{schema, name}, nil
+	case "SEQUENCE":
+		return "SELECT TO_CHAR(DBMS_METADATA.GET_DDL('SEQUENCE', ?, ?)) FROM DUAL", []any{name, schema}, nil
+	case "SYNONYM":
+		return `
+SELECT 'CREATE ' || CASE WHEN y.IS_PUBLIC THEN 'PUBLIC ' ELSE '' END ||
+       'SYNONYM ' || s.SCHEMA_NAME || '.' || y.SYNO_NAME ||
+       ' FOR ' || target.SCHEMA_NAME || '.' || y.TARG_NAME
+FROM SYS_SYNONYMS y
+JOIN SYS_SCHEMAS s ON s.DB_ID = y.DB_ID AND s.SCHEMA_ID = y.SCHEMA_ID
+LEFT JOIN SYS_SCHEMAS target ON target.DB_ID = y.DB_ID AND target.SCHEMA_ID = y.TARG_SCHE_ID
+WHERE UPPER(s.SCHEMA_NAME) = UPPER(?) AND UPPER(y.SYNO_NAME) = UPPER(?)`, []any{schema, name}, nil
 	default:
 		return "", nil, fmt.Errorf("object source is not supported for %s", objectType)
 	}
@@ -2401,6 +2719,30 @@ func triggerTimingName(value any) string {
 	}
 }
 
+func triggerTypeName(value any) string {
+	switch fmt.Sprint(normalizeValue(value)) {
+	case "1":
+		return "FOR EACH ROW"
+	case "2":
+		return "FOR STATEMENT"
+	default:
+		return fmt.Sprint(normalizeValue(value))
+	}
+}
+
+func xuguBoolPtr(value any) *bool {
+	switch strings.ToUpper(strings.TrimSpace(fmt.Sprint(normalizeValue(value)))) {
+	case "1", "T", "TRUE", "Y", "YES":
+		result := true
+		return &result
+	case "0", "F", "FALSE", "N", "NO":
+		result := false
+		return &result
+	default:
+		return nil
+	}
+}
+
 func joinValues(values []any, sep string) string {
 	parts := make([]string, len(values))
 	for i, value := range values {
@@ -2474,11 +2816,18 @@ func quoteIdentifier(value string) string {
 	return `"` + strings.ReplaceAll(value, `"`, `""`) + `"`
 }
 
-func normalizeValue(value any) any {
+func normalizeValue(value any, columnTypeName ...string) any {
+	typeName := ""
+	if len(columnTypeName) > 0 {
+		typeName = columnTypeName[0]
+	}
 	switch v := value.(type) {
 	case nil:
 		return nil
 	case []byte:
+		if isXuguBinaryColumnType(typeName) {
+			return bytesToHex(v)
+		}
 		return string(v)
 	case time.Time:
 		return v.Format(time.RFC3339Nano)
@@ -2511,6 +2860,28 @@ func normalizeValue(value any) any {
 	default:
 		return fmt.Sprint(v)
 	}
+}
+
+func isXuguBinaryColumnType(columnTypeName string) bool {
+	normalized := strings.ToUpper(strings.ReplaceAll(strings.TrimSpace(columnTypeName), " ", ""))
+	switch normalized {
+	case "BINARY", "VARBINARY", "BLOB", "BFILE", "BIT", "VARBIT":
+		return true
+	default:
+		return false
+	}
+}
+
+func bytesToHex(bytes []byte) string {
+	const digits = "0123456789abcdef"
+	result := make([]byte, 2+len(bytes)*2)
+	result[0] = '0'
+	result[1] = 'x'
+	for i, b := range bytes {
+		result[2+i*2] = digits[b>>4]
+		result[2+i*2+1] = digits[b&0x0f]
+	}
+	return string(result)
 }
 
 func emptyIfNil[T any](values []T) []T {
