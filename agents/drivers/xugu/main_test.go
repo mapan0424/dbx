@@ -590,6 +590,19 @@ func TestXuguObjectSourceQuerySupportsSharedObjectKinds(t *testing.T) {
 	if !strings.Contains(typeBodyQuery, "ALL_TYPES") || !strings.Contains(typeBodyQuery, "TO_CHAR(u.BODY)") || !strings.Contains(typeBodyQuery, "u.BODY IS NOT NULL") {
 		t.Fatalf("type body query must return catalog BODY content: %s", typeBodyQuery)
 	}
+
+	for _, objectType := range []string{"VIEW", "TRIGGER", "PROCEDURE", "FUNCTION", "PACKAGE", "PACKAGE_BODY"} {
+		query, _, err := objectSourceQuery("APP", "demo", objectType)
+		if err != nil {
+			t.Fatalf("%s source query: %v", objectType, err)
+		}
+		if !strings.Contains(query, "FROM ALL_") || !strings.Contains(query, "JOIN ALL_SCHEMAS") {
+			t.Fatalf("%s must use access-scoped ALL_* metadata: %s", objectType, query)
+		}
+		if strings.Contains(query, "SYS_") {
+			t.Fatalf("%s must not require SYS_* metadata access: %s", objectType, query)
+		}
+	}
 }
 
 func TestMetadataListConstraintsFromParams(t *testing.T) {

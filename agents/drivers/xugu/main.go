@@ -1715,20 +1715,10 @@ func (s *server) getTableDDL(schema, table string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	var ddl string
-	rows, err := s.queryRows("SELECT TO_CHAR(DBMS_METADATA.GET_DDL('TABLE', ?, ?)) FROM DUAL", []any{strings.ToUpper(table), schema})
-	if err == nil {
-		defer s.closeRows(rows)
-		if rows.Next() {
-			if scanErr := rows.Scan(&ddl); scanErr == nil && strings.TrimSpace(ddl) != "" {
-				if err := rows.Err(); err != nil {
-					return "", err
-				}
-				return s.appendTableIndexDDL(schema, table, ddl), nil
-			}
-		}
-	}
-	ddl, err = s.buildTableDDL(schema, table)
+	// DBMS_METADATA.GET_DDL can block indefinitely on XuguDB, even when the
+	// table metadata itself is accessible. Reconstruct the DDL from the same
+	// ALL_* catalog views used by the object browser instead.
+	ddl, err := s.buildTableDDL(schema, table)
 	if err != nil {
 		return "", err
 	}
@@ -2159,32 +2149,32 @@ func objectSourceQuery(schema, name, objectType string) (string, []any, error) {
 	case "VIEW":
 		return `
 SELECT TO_CHAR(v.DEFINE)
-FROM SYS_VIEWS v
-JOIN SYS_SCHEMAS s ON s.DB_ID = v.DB_ID AND s.SCHEMA_ID = v.SCHEMA_ID
+FROM ALL_VIEWS v
+JOIN ALL_SCHEMAS s ON s.DB_ID = v.DB_ID AND s.SCHEMA_ID = v.SCHEMA_ID
 WHERE UPPER(s.SCHEMA_NAME) = UPPER(?) AND UPPER(v.VIEW_NAME) = UPPER(?)`, []any{schema, name}, nil
 	case "TRIGGER":
 		return `
 SELECT TO_CHAR(t.DEFINE)
-FROM SYS_TRIGGERS t
-JOIN SYS_SCHEMAS s ON s.DB_ID = t.DB_ID AND s.SCHEMA_ID = t.SCHEMA_ID
+FROM ALL_TRIGGERS t
+JOIN ALL_SCHEMAS s ON s.DB_ID = t.DB_ID AND s.SCHEMA_ID = t.SCHEMA_ID
 WHERE UPPER(s.SCHEMA_NAME) = UPPER(?) AND UPPER(t.TRIG_NAME) = UPPER(?)`, []any{schema, name}, nil
 	case "PROCEDURE", "FUNCTION":
 		return `
 SELECT TO_CHAR(p.DEFINE)
-FROM SYS_PROCEDURES p
-JOIN SYS_SCHEMAS s ON s.DB_ID = p.DB_ID AND s.SCHEMA_ID = p.SCHEMA_ID
+FROM ALL_PROCEDURES p
+JOIN ALL_SCHEMAS s ON s.DB_ID = p.DB_ID AND s.SCHEMA_ID = p.SCHEMA_ID
 WHERE UPPER(s.SCHEMA_NAME) = UPPER(?) AND UPPER(p.PROC_NAME) = UPPER(?)`, []any{schema, name}, nil
 	case "PACKAGE":
 		return `
 SELECT COALESCE(TO_CHAR(k.SPEC), '')
-FROM SYS_PACKAGES k
-JOIN SYS_SCHEMAS s ON s.DB_ID = k.DB_ID AND s.SCHEMA_ID = k.SCHEMA_ID
+FROM ALL_PACKAGES k
+JOIN ALL_SCHEMAS s ON s.DB_ID = k.DB_ID AND s.SCHEMA_ID = k.SCHEMA_ID
 WHERE UPPER(s.SCHEMA_NAME) = UPPER(?) AND UPPER(k.PACK_NAME) = UPPER(?)`, []any{schema, name}, nil
 	case "PACKAGE BODY", "PACKAGE_BODY":
 		return `
 SELECT COALESCE(TO_CHAR(k.BODY), '')
-FROM SYS_PACKAGES k
-JOIN SYS_SCHEMAS s ON s.DB_ID = k.DB_ID AND s.SCHEMA_ID = k.SCHEMA_ID
+FROM ALL_PACKAGES k
+JOIN ALL_SCHEMAS s ON s.DB_ID = k.DB_ID AND s.SCHEMA_ID = k.SCHEMA_ID
 WHERE UPPER(s.SCHEMA_NAME) = UPPER(?) AND UPPER(k.PACK_NAME) = UPPER(?)`, []any{schema, name}, nil
 	case "TYPE":
 		return `
@@ -2258,10 +2248,6 @@ func (s *server) buildTableDDL(schema, table string) (string, error) {
 }
 
 func (s *server) appendTableIndexDDL(schema, table, ddl string) string {
-	indexDDL, err := s.tableIndexDDL(schema, table)
-	if err == nil && strings.TrimSpace(indexDDL) != "" {
-		return appendDDLStatement(ddl, indexDDL)
-	}
 	indexes, err := s.listIndexes(schema, table)
 	if err != nil || len(indexes) == 0 {
 		return ddl
@@ -2302,27 +2288,6 @@ func (s *server) appendTableIndexDDL(schema, table, ddl string) string {
 		return ddl
 	}
 	return appendDDLStatement(ddl, builder.String())
-}
-
-func (s *server) tableIndexDDL(schema, table string) (string, error) {
-	rows, err := s.queryRows(
-		"SELECT TO_CHAR(DBMS_METADATA.GET_DDL('INDEX', ?, ?)) FROM DUAL",
-		[]any{strings.ToUpper(strings.TrimSpace(table)), schema},
-	)
-	if err != nil {
-		return "", err
-	}
-	defer s.closeRows(rows)
-	var ddl string
-	if rows.Next() {
-		if err := rows.Scan(&ddl); err != nil {
-			return "", err
-		}
-	}
-	if err := rows.Err(); err != nil {
-		return "", err
-	}
-	return ddl, nil
 }
 
 func (s *server) tableComment(schema, table string) (string, error) {
