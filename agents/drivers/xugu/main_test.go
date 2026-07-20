@@ -642,6 +642,84 @@ func TestParseForeignKeyColumns(t *testing.T) {
 	}
 }
 
+func TestRenderXuguTableDDLPreservesProgrammableTableMetadata(t *testing.T) {
+	amountDefault := "0"
+	description := "child table"
+	ddl := renderXuguTableDDL(
+		"APP", "CHILD",
+		[]columnInfo{
+			{Name: "ID", DataType: "INTEGER", IsNullable: false},
+			{Name: "PARENT_ID", DataType: "INTEGER", IsNullable: false},
+			{Name: "AMOUNT", DataType: "NUMERIC", IsNullable: true, ColumnDefault: &amountDefault},
+		},
+		xuguTableMetadata{
+			PctFree:        15,
+			CopyNum:        3,
+			PartitionType:  1,
+			PartitionKey:   `"ID"`,
+			PartitionCount: 2,
+			Comment:        description,
+		},
+		map[string]xuguIdentityInfo{"ID": {Column: "ID", Start: 10, Step: 5}},
+		[]xuguConstraintInfo{
+			{Name: "PK_CHILD", Type: "P", Definition: `"ID"`, Enabled: true},
+			{Name: "CK_CHILD_AMOUNT", Type: "C", Definition: `("AMOUNT") >= (0)`, Enabled: true},
+			{
+				Name: "FK_CHILD_PARENT", Type: "F", Definition: `("PARENT_ID")("ID")`,
+				ReferenceSchema: "APP", ReferenceTable: "PARENT", UpdateAction: "n", DeleteAction: "c", Enabled: true,
+			},
+		},
+		[]xuguPartitionInfo{{Name: "P_10", Value: "10"}, {Name: "P_MAX", Value: "MAXVALUES"}}, nil,
+	)
+
+	for _, want := range []string{
+		`"ID" INTEGER IDENTITY(10,5) NOT NULL`,
+		`CONSTRAINT "PK_CHILD" PRIMARY KEY ("ID")`,
+		`CONSTRAINT "CK_CHILD_AMOUNT" CHECK (("AMOUNT") >= (0))`,
+		`CONSTRAINT "FK_CHILD_PARENT" FOREIGN KEY ("PARENT_ID") REFERENCES "APP"."PARENT" ("ID") ON UPDATE NO ACTION ON DELETE CASCADE NOT DEFERRABLE`,
+		"PCTFREE 15 COPY NUMBER 3",
+		`PARTITION BY RANGE ("ID") PARTITIONS (`,
+		`"P_10" VALUES LESS THAN (10)`,
+		`"P_MAX" VALUES LESS THAN (MAXVALUES)`,
+		"COMMENT 'child table'",
+	} {
+		if !strings.Contains(ddl, want) {
+			t.Fatalf("generated DDL is missing %q:\n%s", want, ddl)
+		}
+	}
+}
+
+func TestRenderXuguTableDDLTemporaryTableCommitMode(t *testing.T) {
+	ddl := renderXuguTableDDL("APP", "TMP", []columnInfo{{Name: "ID", DataType: "INTEGER", IsNullable: true}},
+		xuguTableMetadata{TempType: 1, OnCommitDelete: true}, nil, nil, nil, nil)
+	if !strings.HasPrefix(ddl, `CREATE TEMP TABLE "APP"."TMP"`) || !strings.Contains(ddl, "ON COMMIT DELETE ROWS") {
+		t.Fatalf("unexpected temporary table DDL: %s", ddl)
+	}
+	globalDDL := renderXuguTableDDL("APP", "GTMP", []columnInfo{{Name: "ID", DataType: "INTEGER", IsNullable: true}},
+		xuguTableMetadata{TempType: 2, OnCommitDelete: false}, nil, nil, nil, nil)
+	if !strings.HasPrefix(globalDDL, `CREATE GLOBAL TEMP TABLE "APP"."GTMP"`) || !strings.Contains(globalDDL, "ON COMMIT PRESERVE ROWS") {
+		t.Fatalf("unexpected global temporary table DDL: %s", globalDDL)
+	}
+}
+
+func TestRenderXuguTableDDLSubpartitionDefinitions(t *testing.T) {
+	ddl := renderXuguTableDDL("APP", "SUBPART", []columnInfo{{Name: "ID", DataType: "INTEGER", IsNullable: true}},
+		xuguTableMetadata{PartitionType: 2, PartitionKey: `"REGION"`, SubpartitionType: 1, SubpartitionKey: `"ID"`}, nil, nil,
+		[]xuguPartitionInfo{{Name: "P_EAST", Value: "'east'"}},
+		[]xuguPartitionInfo{{Name: "SP_10", Value: "10"}, {Name: "SP_MAX", Value: "MAXVALUES"}})
+	for _, want := range []string{
+		`PARTITION BY LIST ("REGION")`,
+		`"P_EAST" VALUES ('east')`,
+		`SUBPARTITION BY RANGE ("ID") SUBPARTITIONS (`,
+		`"SP_10" VALUES LESS THAN (10)`,
+		`"SP_MAX" VALUES LESS THAN (MAXVALUES)`,
+	} {
+		if !strings.Contains(ddl, want) {
+			t.Fatalf("generated DDL is missing %q:\n%s", want, ddl)
+		}
+	}
+}
+
 func TestDecodeXuguScale(t *testing.T) {
 	numericScale := 32*65536 + 6
 	precision, scale, length := decodeXuguScale("NUMERIC", &numericScale)
