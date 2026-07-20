@@ -43,7 +43,7 @@ WHERE UPPER(s.SCHEMA_NAME) = UPPER(?)
   AND UPPER(t.TABLE_NAME) = UPPER(?)
   AND c.CONS_TYPE = 'P'`
 const xuguListColumnsSQL = `
-SELECT c.COL_NAME, c.TYPE_NAME, c.NOT_NULL, c.DEF_VAL, c.COMMENTS, c.SCALE, c."VARYING"
+SELECT c.COL_NAME, c.TYPE_NAME, c.NOT_NULL, c.DEF_VAL, c.ON_NULL, c.COMMENTS, c.SCALE, c."VARYING"
 FROM ALL_COLUMNS c
 JOIN ALL_TABLES t ON t.DB_ID = c.DB_ID AND t.TABLE_ID = c.TABLE_ID
 JOIN ALL_SCHEMAS s ON s.DB_ID = t.DB_ID AND s.SCHEMA_ID = t.SCHEMA_ID
@@ -268,6 +268,7 @@ type columnInfo struct {
 	DataType               string  `json:"data_type"`
 	IsNullable             bool    `json:"is_nullable"`
 	ColumnDefault          *string `json:"column_default"`
+	DefaultOnNull          int     `json:"default_on_null,omitempty"`
 	IsPrimaryKey           bool    `json:"is_primary_key"`
 	Extra                  *string `json:"extra"`
 	Comment                *string `json:"comment"`
@@ -1580,6 +1581,7 @@ func (s *server) getColumns(schema, table string) ([]columnInfo, error) {
 	for rows.Next() {
 		var item columnInfo
 		var notNull any
+		var onNull any
 		var scale *int
 		var varying any
 		if err := rows.Scan(
@@ -1587,6 +1589,7 @@ func (s *server) getColumns(schema, table string) ([]columnInfo, error) {
 			&item.DataType,
 			&notNull,
 			&item.ColumnDefault,
+			&onNull,
 			&item.Comment,
 			&scale,
 			&varying,
@@ -1595,6 +1598,7 @@ func (s *server) getColumns(schema, table string) ([]columnInfo, error) {
 		}
 		item.DataType = normalizeXuguColumnType(item.DataType, varying)
 		item.IsNullable = !truthy(notNull)
+		item.DefaultOnNull = xuguInt(onNull)
 		item.IsPrimaryKey = primaryKeys[strings.ToUpper(item.Name)]
 		item.NumericPrecision, item.NumericScale, item.CharacterMaximumLength = decodeXuguScale(item.DataType, scale)
 		result = append(result, item)
@@ -2447,6 +2451,14 @@ func renderXuguTableDDL(schema, table string, columns []columnInfo, metadata xug
 		}
 		if column.ColumnDefault != nil && strings.TrimSpace(*column.ColumnDefault) != "" {
 			item.WriteString(" DEFAULT ")
+			switch column.DefaultOnNull {
+			case 1:
+				// ON_NULL=1 means that an explicit NULL is replaced during insert.
+				// The explicit spelling also covers the legacy DEFAULT ON NULL form.
+				item.WriteString("ON NULL FOR INSERT ONLY ")
+			case 2:
+				item.WriteString("ON NULL FOR INSERT AND UPDATE ")
+			}
 			item.WriteString(strings.TrimSpace(*column.ColumnDefault))
 		}
 		if !column.IsNullable {
@@ -2574,8 +2586,17 @@ func renderXuguPartitionDDL(metadata xuguTableMetadata, partitions, subpartition
 					builder.WriteString(interval)
 				}
 			}
-			if metadata.PartitionType == 3 && len(partitions) == 0 && metadata.PartitionCount > 0 {
-				builder.WriteString(fmt.Sprintf(" PARTITIONS %d", metadata.PartitionCount))
+			if metadata.PartitionType == 3 {
+				// HASH partitions have no RANGE/LIST-style values. ALL_PARTIS can
+				// contain physical hash-partition rows, but only their count belongs
+				// in CREATE TABLE syntax.
+				count := metadata.PartitionCount
+				if count <= 0 {
+					count = len(partitions)
+				}
+				if count > 0 {
+					builder.WriteString(fmt.Sprintf(" PARTITIONS %d", count))
+				}
 			} else if len(partitions) > 0 {
 				builder.WriteString(" PARTITIONS (\n")
 				for i, partition := range partitions {
@@ -2607,8 +2628,14 @@ func renderXuguPartitionDDL(metadata xuguTableMetadata, partitions, subpartition
 			builder.WriteString(" (")
 			builder.WriteString(key)
 			builder.WriteByte(')')
-			if metadata.SubpartitionType == 3 && len(subpartitions) == 0 && metadata.SubpartitionCount > 0 {
-				builder.WriteString(fmt.Sprintf(" SUBPARTITIONS %d", metadata.SubpartitionCount))
+			if metadata.SubpartitionType == 3 {
+				count := metadata.SubpartitionCount
+				if count <= 0 {
+					count = len(subpartitions)
+				}
+				if count > 0 {
+					builder.WriteString(fmt.Sprintf(" SUBPARTITIONS %d", count))
+				}
 			} else if len(subpartitions) > 0 {
 				builder.WriteString(" SUBPARTITIONS (\n")
 				for i, partition := range subpartitions {
@@ -2660,10 +2687,14 @@ func xuguReferentialAction(value string) string {
 
 func xuguMatchClause(value string) string {
 	switch strings.ToUpper(strings.TrimSpace(value)) {
-	case "F":
+	case "A":
 		return "MATCH FULL"
 	case "P":
 		return "MATCH PARTIAL"
+	case "U":
+		// SIMPLE is Xugu's default and it is represented by omitting the
+		// clause; unlike FULL/PARTIAL, `MATCH SIMPLE` is not valid Xugu SQL.
+		return ""
 	default:
 		return ""
 	}

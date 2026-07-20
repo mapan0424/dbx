@@ -720,6 +720,47 @@ func TestRenderXuguTableDDLSubpartitionDefinitions(t *testing.T) {
 	}
 }
 
+func TestRenderXuguTableDDLPreservesHashPartitionCount(t *testing.T) {
+	ddl := renderXuguTableDDL("APP", "HASH_PART", []columnInfo{{Name: "ID", DataType: "INTEGER", IsNullable: true}},
+		xuguTableMetadata{PartitionType: 3, PartitionKey: `"ID"`, PartitionCount: 4}, nil, nil,
+		[]xuguPartitionInfo{{Name: "SYS_P1", Value: "1"}, {Name: "SYS_P2", Value: "2"}}, nil)
+	if !strings.Contains(ddl, `PARTITION BY HASH ("ID") PARTITIONS 4`) {
+		t.Fatalf("hash partition count was not preserved: %s", ddl)
+	}
+	if strings.Contains(ddl, "VALUES") {
+		t.Fatalf("hash partition DDL must not render RANGE/LIST values: %s", ddl)
+	}
+}
+
+func TestRenderXuguTableDDLPreservesMatchAndDefaultOnNull(t *testing.T) {
+	insertOnlyDefault := "'insert'"
+	insertUpdateDefault := "'update'"
+	ddl := renderXuguTableDDL("APP", "CHILD",
+		[]columnInfo{
+			{Name: "A", DataType: "INTEGER", IsNullable: false},
+			{Name: "B", DataType: "INTEGER", IsNullable: false},
+			{Name: "INSERT_ONLY", DataType: "VARCHAR", IsNullable: false, ColumnDefault: &insertOnlyDefault, DefaultOnNull: 1},
+			{Name: "INSERT_UPDATE", DataType: "VARCHAR", IsNullable: false, ColumnDefault: &insertUpdateDefault, DefaultOnNull: 2},
+		},
+		xuguTableMetadata{}, nil,
+		[]xuguConstraintInfo{{
+			Name: "FK_CHILD_PARENT", Type: "F", Definition: `("A","B")("A","B")`,
+			ReferenceSchema: "APP", ReferenceTable: "PARENT", MatchType: "A", Enabled: true,
+		}}, nil, nil)
+	for _, want := range []string{
+		`DEFAULT ON NULL FOR INSERT ONLY 'insert'`,
+		`DEFAULT ON NULL FOR INSERT AND UPDATE 'update'`,
+		`FOREIGN KEY ("A", "B") REFERENCES "APP"."PARENT" ("A", "B") MATCH FULL`,
+	} {
+		if !strings.Contains(ddl, want) {
+			t.Fatalf("generated DDL is missing %q:\n%s", want, ddl)
+		}
+	}
+	if got := xuguMatchClause("U"); got != "" {
+		t.Fatalf("MATCH_TYPE U = %q, want omitted default MATCH SIMPLE", got)
+	}
+}
+
 func TestDecodeXuguScale(t *testing.T) {
 	numericScale := 32*65536 + 6
 	precision, scale, length := decodeXuguScale("NUMERIC", &numericScale)
