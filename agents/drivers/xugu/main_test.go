@@ -547,6 +547,67 @@ func TestIndexSQLUsesLowPrivilegeDictionary(t *testing.T) {
 	}
 }
 
+func TestTableChildMetadataUsesLowPrivilegeDictionary(t *testing.T) {
+	for name, query := range map[string]string{
+		"constraints":   xuguTableConstraintsSQL,
+		"partitions":    xuguTablePartitionsSQL,
+		"subpartitions": xuguTableSubpartitionsSQL,
+	} {
+		upper := strings.ToUpper(query)
+		if !strings.Contains(upper, "ALL_") {
+			t.Fatalf("%s metadata should query ALL_* views: %s", name, query)
+		}
+		if strings.Contains(upper, "SYS_") {
+			t.Fatalf("%s metadata must not require SYS_* privileges: %s", name, query)
+		}
+	}
+}
+
+func TestTableChildMetadataPresentationHelpers(t *testing.T) {
+	if got := xuguConstraintTypeName("F"); got != "FOREIGN KEY" {
+		t.Fatalf("foreign key type = %q", got)
+	}
+	if got := xuguMatchTypeName("U"); got != "SIMPLE" {
+		t.Fatalf("simple match type = %q", got)
+	}
+	if got := xuguAutoPartitionUnit(2); got != "MONTH" {
+		t.Fatalf("auto partition unit = %q", got)
+	}
+}
+
+func TestTableChildMetadataRPCsReturnCatalogObjects(t *testing.T) {
+	db, err := sql.Open("xugu-test-table-objects", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	s := newServer()
+	s.db = db
+	s.params.Database = "SHOP_DEMO"
+
+	for _, test := range []struct {
+		method string
+		want   string
+	}{
+		{method: "list_constraints", want: "FOREIGN KEY"},
+		{method: "list_partitions", want: "RANGE"},
+		{method: "list_subpartitions", want: "LIST"},
+	} {
+		response, shutdown := s.handleLine(fmt.Sprintf(`{"jsonrpc":"2.0","id":1,"method":"%s","params":{"database":"SHOP_DEMO","schema":"SYSDBA","table":"SHOP_ORDERS"}}`, test.method))
+		if shutdown || response.Error != nil {
+			t.Fatalf("%s failed: shutdown=%v error=%v", test.method, shutdown, response.Error)
+		}
+		encoded, err := json.Marshal(response.Result)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(string(encoded), test.want) {
+			t.Fatalf("%s result did not contain %q: %s", test.method, test.want, encoded)
+		}
+	}
+}
+
 func TestXuguMetadataAccessErrorDetection(t *testing.T) {
 	if !isXuguMetadataAccessError(errors.New("[E18012] 权限不够")) {
 		t.Fatal("expected E18012 permission error to be treated as metadata access error")
@@ -890,6 +951,42 @@ func init() {
 	sql.Register("xugu-test-blocking", &xuguBlockingDriver{})
 	sql.Register("xugu-test-fast", &xuguFastDriver{})
 	sql.Register("xugu-test-legacy-columns", &xuguLegacyColumnsDriver{})
+	sql.Register("xugu-test-table-objects", &xuguTableObjectsDriver{})
+}
+
+type xuguTableObjectsDriver struct{}
+
+func (d *xuguTableObjectsDriver) Open(name string) (driver.Conn, error) {
+	return &xuguTableObjectsConn{}, nil
+}
+
+type xuguTableObjectsConn struct{}
+
+func (c *xuguTableObjectsConn) Prepare(query string) (driver.Stmt, error) {
+	return nil, errors.New("not supported")
+}
+func (c *xuguTableObjectsConn) Close() error              { return nil }
+func (c *xuguTableObjectsConn) Begin() (driver.Tx, error) { return nil, errors.New("not supported") }
+func (c *xuguTableObjectsConn) QueryContext(_ context.Context, query string, _ []driver.NamedValue) (driver.Rows, error) {
+	switch upper := strings.ToUpper(query); {
+	case strings.Contains(upper, "FROM ALL_CONSTRAINTS"):
+		return &xuguStaticRows{
+			columns: []string{"CONS_NAME", "CONS_TYPE", "DEFINE", "SCHEMA_NAME", "TABLE_NAME", "MATCH_TYPE", "UPDATE_ACTION", "DELETE_ACTION", "DEFERRABLE", "INITDEFERRED", "ENABLE", "VALID"},
+			values:  [][]driver.Value{{"FK_ORDERS_USERS", "F", `("USER_ID")("USER_ID")`, "SYSDBA", "SHOP_USERS", "U", "n", "n", false, false, true, true}},
+		}, nil
+	case strings.Contains(upper, "FROM ALL_PARTIS"):
+		return &xuguStaticRows{
+			columns: []string{"PARTI_NO", "PARTI_NAME", "PARTI_VAL", "ONLINE", "PARTI_TYPE", "PARTI_KEY", "AUTO_PARTI_TYPE", "AUTO_PARTI_SPAN"},
+			values:  [][]driver.Value{{int64(1), "P_2025", "'2026-01-01'", true, int64(1), `"ORDER_TIME"`, int64(0), int64(0)}},
+		}, nil
+	case strings.Contains(upper, "FROM ALL_SUBPARTIS"):
+		return &xuguStaticRows{
+			columns: []string{"SUBPARTI_NO", "SUBPARTI_NAME", "SUBPARTI_VAL", "SUBPARTI_TYPE", "SUBPARTI_KEY"},
+			values:  [][]driver.Value{{int64(1), "SP_PENDING", "'10'", int64(2), `"ORDER_STATUS"`}},
+		}, nil
+	default:
+		return nil, fmt.Errorf("unexpected query: %s", query)
+	}
 }
 
 type xuguLegacyColumnsDriver struct{}
