@@ -317,6 +317,104 @@ func TestBuildDSNParsesDBXURL(t *testing.T) {
 	}
 }
 
+func TestBuildDSNOverridesSelectedDatabase(t *testing.T) {
+	tests := []struct {
+		name   string
+		params connectParams
+		want   string
+	}{
+		{
+			name: "native DSN",
+			params: connectParams{
+				Database:         "SHOP_DEMO",
+				ConnectionString: "IP=db.example.com;DB=SYSTEM;User=SYSDBA;PWD=secret;Port=5138",
+			},
+			want: "IP=db.example.com;DB=SHOP_DEMO;User=SYSDBA;PWD=secret;Port=5138",
+		},
+		{
+			name: "JDBC URL",
+			params: connectParams{
+				Database:         "SHOP_DEMO",
+				Username:         "sysdba",
+				Password:         "secret",
+				ConnectionString: "jdbc:xugu://db.example.com:15138/SYSTEM?note=DB=shadow",
+				URLParams:        "TRACE_LABEL=DB=SYSTEM",
+			},
+			want: "IP=db.example.com;DB=SHOP_DEMO;User=sysdba;PWD=secret;Port=15138;CHAR_SET=UTF8;TRACE_LABEL=DB=SYSTEM",
+		},
+		{
+			name: "DBX URL",
+			params: connectParams{
+				Database:         "SHOP_DEMO",
+				ConnectionString: "xugu://sysdba:secret@db.example.com:15138/SYSTEM?note=DB=shadow",
+				URLParams:        "TRACE_LABEL=DB=SYSTEM",
+			},
+			want: "IP=db.example.com;DB=SHOP_DEMO;User=sysdba;PWD=secret;Port=15138;CHAR_SET=UTF8;TRACE_LABEL=DB=SYSTEM",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := buildDSN(test.params); got != test.want {
+				t.Fatalf("unexpected dsn:\n got: %s\nwant: %s", got, test.want)
+			}
+		})
+	}
+}
+
+func TestBuildDSNPreservesConnectionDatabaseWithoutSelection(t *testing.T) {
+	tests := []struct {
+		name   string
+		params connectParams
+		want   string
+	}{
+		{
+			name: "native DSN",
+			params: connectParams{
+				Database:         "   ",
+				ConnectionString: "IP=db.example.com;DB=SYSTEM;User=SYSDBA;PWD=secret;Port=5138",
+			},
+			want: "IP=db.example.com;DB=SYSTEM;User=SYSDBA;PWD=secret;Port=5138",
+		},
+		{
+			name: "JDBC URL",
+			params: connectParams{
+				Username:         "sysdba",
+				Password:         "secret",
+				ConnectionString: "jdbc:xugu://db.example.com:15138/SYSTEM",
+			},
+			want: "IP=db.example.com;DB=SYSTEM;User=sysdba;PWD=secret;Port=15138;CHAR_SET=UTF8",
+		},
+		{
+			name: "DBX URL",
+			params: connectParams{
+				ConnectionString: "xugu://sysdba:secret@db.example.com:15138/SYSTEM",
+			},
+			want: "IP=db.example.com;DB=SYSTEM;User=sysdba;PWD=secret;Port=15138;CHAR_SET=UTF8",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := buildDSN(test.params); got != test.want {
+				t.Fatalf("unexpected dsn:\n got: %s\nwant: %s", got, test.want)
+			}
+		})
+	}
+}
+
+func TestBuildDSNOverridesOnlyNativeDatabaseParameters(t *testing.T) {
+	dsn := buildDSN(connectParams{
+		Database:         "  sales;east's  ",
+		ConnectionString: "IP=db.example.com;DB=SYSTEM;User=SYSDBA;PWD='secret;DB=shadow';Port=5138;NOTE='DB=archive;keep';db=LEGACY",
+	})
+	want := "IP=db.example.com;DB='sales;east''s';User=SYSDBA;PWD='secret;DB=shadow';Port=5138;NOTE='DB=archive;keep';db='sales;east''s'"
+
+	if dsn != want {
+		t.Fatalf("unexpected dsn:\n got: %s\nwant: %s", dsn, want)
+	}
+}
+
 func TestBuildDSNAppendsURLParams(t *testing.T) {
 	dsn := buildDSN(connectParams{
 		Host:      "db.example.com",

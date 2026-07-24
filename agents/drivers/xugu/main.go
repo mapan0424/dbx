@@ -1072,12 +1072,16 @@ func newXuguDatabaseSession(
 
 func buildDSN(params connectParams) string {
 	connectionString := strings.TrimSpace(params.ConnectionString)
+	selectedDatabase := strings.TrimSpace(params.Database)
 	if looksLikeXuguDSN(connectionString) {
+		if selectedDatabase != "" {
+			return overrideXuguDSNDatabase(connectionString, selectedDatabase)
+		}
 		return connectionString
 	}
 	if parsed := parseXuguURL(connectionString); parsed.Host != "" {
-		if parsed.Database == "" {
-			parsed.Database = params.Database
+		if selectedDatabase != "" {
+			parsed.Database = selectedDatabase
 		}
 		if parsed.Username == "" {
 			parsed.Username = params.Username
@@ -1089,6 +1093,9 @@ func buildDSN(params connectParams) string {
 	}
 
 	if jdbc := parseXuguJDBCURL(connectionString); jdbc.Host != "" {
+		if selectedDatabase != "" {
+			jdbc.Database = selectedDatabase
+		}
 		return buildXuguDSN(jdbc.Host, jdbc.Port, jdbc.Database, params.Username, params.Password, params.URLParams)
 	}
 
@@ -1098,6 +1105,49 @@ func buildDSN(params connectParams) string {
 func looksLikeXuguDSN(value string) bool {
 	upper := strings.ToUpper(value)
 	return strings.Contains(upper, "IP=") && strings.Contains(upper, "DB=") && strings.Contains(upper, "USER=")
+}
+
+func overrideXuguDSNDatabase(dsn, database string) string {
+	var result strings.Builder
+	result.Grow(len(dsn) + len(database))
+
+	segmentStart := 0
+	inQuotes := false
+	for index := 0; index < len(dsn); index++ {
+		switch dsn[index] {
+		case '\'':
+			if inQuotes && index+1 < len(dsn) && dsn[index+1] == '\'' {
+				index++
+				continue
+			}
+			inQuotes = !inQuotes
+		case ';':
+			if !inQuotes {
+				result.WriteString(overrideXuguDSNSegmentDatabase(dsn[segmentStart:index], database))
+				result.WriteByte(';')
+				segmentStart = index + 1
+			}
+		}
+	}
+	result.WriteString(overrideXuguDSNSegmentDatabase(dsn[segmentStart:], database))
+	return result.String()
+}
+
+func overrideXuguDSNSegmentDatabase(segment, database string) string {
+	separator := strings.IndexByte(segment, '=')
+	if separator < 0 || !strings.EqualFold(strings.TrimSpace(segment[:separator]), "DB") {
+		return segment
+	}
+
+	// Xugu DSN values may quote semicolons and escape quotes by doubling them.
+	return segment[:separator+1] + encodeXuguDSNValue(database)
+}
+
+func encodeXuguDSNValue(value string) string {
+	if !strings.ContainsAny(value, ";'") {
+		return value
+	}
+	return "'" + strings.ReplaceAll(value, "'", "''") + "'"
 }
 
 type xuguURLInfo struct {
