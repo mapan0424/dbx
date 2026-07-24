@@ -39,6 +39,9 @@ async function setup(dbType: ConnectionConfig["db_type"], overrides: Record<stri
     deleteSchemaCachePrefix: vi.fn().mockResolvedValue(undefined),
     listConstraints: vi.fn().mockResolvedValue([]),
     listInstalledAgents: vi.fn().mockResolvedValue([]),
+    listInstalledAgentsLocal: vi.fn().mockResolvedValue([
+      { db_type: "xugu", installed: true, installed_version: "0.1.23" },
+    ]),
     listPartitions: vi.fn().mockResolvedValue([]),
     listSubpartitions: vi.fn().mockResolvedValue([]),
     loadSchemaCache: vi.fn().mockResolvedValue(null),
@@ -102,6 +105,17 @@ describe("connectionStore Xugu table child metadata", () => {
     const postgres = await setup("postgres");
     const postgresChildren = findNode(postgres.store.treeNodes, postgres.tableId)?.children?.map((node) => node.type);
     expect(postgresChildren).toEqual(["group-columns", "group-indexes", "group-fkeys", "group-triggers"]);
+  });
+
+  it("hides Xugu-only groups when the installed Agent predates their metadata methods", async () => {
+    const { store, tableId } = await setup("xugu", {
+      listInstalledAgentsLocal: vi.fn().mockResolvedValue([
+        { db_type: "xugu", installed: true, installed_version: "0.1.22" },
+      ]),
+    });
+
+    const childTypes = findNode(store.treeNodes, tableId)?.children?.map((node) => node.type);
+    expect(childTypes).toEqual(["group-columns", "group-fkeys", "group-triggers", "group-indexes"]);
   });
 
   it("routes Xugu child groups to their dedicated metadata calls, including empty results", async () => {

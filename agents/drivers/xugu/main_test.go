@@ -561,6 +561,9 @@ func TestTableChildMetadataUsesLowPrivilegeDictionary(t *testing.T) {
 			t.Fatalf("%s metadata must not require SYS_* privileges: %s", name, query)
 		}
 	}
+	if !strings.Contains(strings.ToUpper(xuguTableConstraintsSQL), "C.CONS_TYPE <> 'F'") {
+		t.Fatalf("generic constraints must exclude foreign keys: %s", xuguTableConstraintsSQL)
+	}
 }
 
 func TestTableChildMetadataPresentationHelpers(t *testing.T) {
@@ -590,7 +593,7 @@ func TestTableChildMetadataRPCsReturnCatalogObjects(t *testing.T) {
 		method string
 		want   string
 	}{
-		{method: "list_constraints", want: "FOREIGN KEY"},
+		{method: "list_constraints", want: "PRIMARY KEY"},
 		{method: "list_partitions", want: "RANGE"},
 		{method: "list_subpartitions", want: "LIST"},
 	} {
@@ -970,9 +973,12 @@ func (c *xuguTableObjectsConn) Begin() (driver.Tx, error) { return nil, errors.N
 func (c *xuguTableObjectsConn) QueryContext(_ context.Context, query string, _ []driver.NamedValue) (driver.Rows, error) {
 	switch upper := strings.ToUpper(query); {
 	case strings.Contains(upper, "FROM ALL_CONSTRAINTS"):
+		if !strings.Contains(upper, "C.CONS_TYPE <> 'F'") {
+			return nil, errors.New("generic constraints query must exclude foreign keys")
+		}
 		return &xuguStaticRows{
 			columns: []string{"CONS_NAME", "CONS_TYPE", "DEFINE", "SCHEMA_NAME", "TABLE_NAME", "MATCH_TYPE", "UPDATE_ACTION", "DELETE_ACTION", "DEFERRABLE", "INITDEFERRED", "ENABLE", "VALID"},
-			values:  [][]driver.Value{{"FK_ORDERS_USERS", "F", `("USER_ID")("USER_ID")`, "SYSDBA", "SHOP_USERS", "U", "n", "n", false, false, true, true}},
+			values:  [][]driver.Value{{"PK_ORDERS", "P", `("ORDER_ID")`, nil, nil, nil, nil, nil, false, false, true, true}},
 		}, nil
 	case strings.Contains(upper, "FROM ALL_PARTIS"):
 		return &xuguStaticRows{
