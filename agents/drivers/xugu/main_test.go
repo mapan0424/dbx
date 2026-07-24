@@ -891,7 +891,8 @@ func TestRenderXuguTableDDLPreservesProgrammableTableMetadata(t *testing.T) {
 		`"ID" INTEGER IDENTITY(10,5) NOT NULL`,
 		`CONSTRAINT "PK_CHILD" PRIMARY KEY ("ID")`,
 		`CONSTRAINT "CK_CHILD_AMOUNT" CHECK (("AMOUNT") >= (0))`,
-		`CONSTRAINT "FK_CHILD_PARENT" FOREIGN KEY ("PARENT_ID") REFERENCES "APP"."PARENT" ("ID") ON UPDATE NO ACTION ON DELETE CASCADE NOT DEFERRABLE`,
+		// Foreign keys are emitted after CREATE TABLE (ALTER), not inline.
+		`ALTER TABLE "APP"."CHILD" ADD CONSTRAINT "FK_CHILD_PARENT" FOREIGN KEY ("PARENT_ID") REFERENCES "APP"."PARENT" ("ID") ON UPDATE NO ACTION ON DELETE CASCADE NOT DEFERRABLE`,
 		"PCTFREE 15 COPY NUMBER 3",
 		`PARTITION BY RANGE ("ID") PARTITIONS (`,
 		`"P_10" VALUES LESS THAN (10)`,
@@ -901,6 +902,14 @@ func TestRenderXuguTableDDLPreservesProgrammableTableMetadata(t *testing.T) {
 		if !strings.Contains(ddl, want) {
 			t.Fatalf("generated DDL is missing %q:\n%s", want, ddl)
 		}
+	}
+	// Ensure FK is not declared inside the CREATE TABLE body.
+	createBody := ddl
+	if idx := strings.Index(ddl, "ALTER TABLE"); idx >= 0 {
+		createBody = ddl[:idx]
+	}
+	if strings.Contains(createBody, "FOREIGN KEY") {
+		t.Fatalf("foreign keys must not be inlined in CREATE TABLE:\n%s", ddl)
 	}
 }
 
@@ -965,7 +974,7 @@ func TestRenderXuguTableDDLPreservesMatchAndDefaultOnNull(t *testing.T) {
 	for _, want := range []string{
 		`DEFAULT ON NULL FOR INSERT ONLY 'insert'`,
 		`DEFAULT ON NULL FOR INSERT AND UPDATE 'update'`,
-		`FOREIGN KEY ("A", "B") REFERENCES "APP"."PARENT" ("A", "B") MATCH FULL`,
+		`ALTER TABLE "APP"."CHILD" ADD CONSTRAINT "FK_CHILD_PARENT" FOREIGN KEY ("A", "B") REFERENCES "APP"."PARENT" ("A", "B") MATCH FULL`,
 	} {
 		if !strings.Contains(ddl, want) {
 			t.Fatalf("generated DDL is missing %q:\n%s", want, ddl)
@@ -1022,11 +1031,118 @@ func TestAppendDDLStatement(t *testing.T) {
 	}
 }
 
+func TestShouldSkipIndexForTableDDL(t *testing.T) {
+	uniqueCols := uniqueKeyColumnSets([]xuguConstraintInfo{
+		{Name: "PK_T", Type: "P", Definition: `"ID"`},
+		{Name: "UK_T_CODE", Type: "U", Definition: `"CODE"`},
+	})
+	tests := []struct {
+		name  string
+		index indexInfo
+		skip  bool
+	}{
+		{name: "primary index", index: indexInfo{Name: "PK_IDX", Columns: []string{"ID"}, IsPrimary: true, IsUnique: true}, skip: true},
+		{name: "unique constraint backing index", index: indexInfo{Name: "UK_IDX", Columns: []string{"CODE"}, IsUnique: true}, skip: true},
+		{name: "non-unique secondary index", index: indexInfo{Name: "IX_NAME", Columns: []string{"NAME"}, IsUnique: false}, skip: false},
+		{name: "unique index on other columns", index: indexInfo{Name: "UX_OTHER", Columns: []string{"OTHER"}, IsUnique: true}, skip: false},
+		{name: "empty columns", index: indexInfo{Name: "BAD", Columns: nil, IsUnique: true}, skip: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := shouldSkipIndexForTableDDL(tt.index, uniqueCols); got != tt.skip {
+				t.Fatalf("shouldSkipIndexForTableDDL(%+v) = %v, want %v", tt.index, got, tt.skip)
+			}
+		})
+	}
+}
+
+func TestNormalizeXuguDefaultExpr(t *testing.T) {
+	tests := []struct {
+		in, dataType, want string
+	}{
+		{in: `"SYSDATE"`, dataType: "DATETIME", want: "SYSDATE"},
+		{in: `"sysdate"`, dataType: "DATETIME", want: "SYSDATE"},
+		{in: "SYSDATE", dataType: "DATETIME", want: "SYSDATE"},
+		{in: "(GETDATE())", dataType: "DATETIME", want: "SYSDATE"},
+		{in: "uuid()", dataType: "CHAR", want: "sys_guid()"},
+		{in: "0000-00-00 00:00:00", dataType: "DATETIME", want: "'1970-01-01 00:00:00'"},
+		{in: "0000-00-00", dataType: "DATE", want: "'1970-01-01'"},
+		{in: "'plain'", dataType: "VARCHAR", want: "'plain'"},
+		{in: "0", dataType: "INTEGER", want: "0"},
+		{in: "''", dataType: "INTEGER", want: ""},
+		{in: "''", dataType: "VARCHAR", want: "''"},
+		{in: "- (1)", dataType: "INTEGER", want: "-1"},
+	}
+	for _, tt := range tests {
+		if got := normalizeXuguDefaultExpr(tt.in, tt.dataType); got != tt.want {
+			t.Fatalf("normalizeXuguDefaultExpr(%q, %q) = %q, want %q", tt.in, tt.dataType, got, tt.want)
+		}
+	}
+}
+
+func TestRenderXuguTableDDLNormalizesQuotedSysdateDefault(t *testing.T) {
+	def := `"SYSDATE"`
+	ddl := renderXuguTableDDL("APP", "T",
+		[]columnInfo{{Name: "TS", DataType: "DATETIME", IsNullable: false, ColumnDefault: &def}},
+		xuguTableMetadata{}, nil, nil, nil, nil)
+	if !strings.Contains(ddl, `DEFAULT SYSDATE`) {
+		t.Fatalf("expected unquoted SYSDATE default, got:\n%s", ddl)
+	}
+	if strings.Contains(ddl, `DEFAULT "SYSDATE"`) {
+		t.Fatalf("quoted SYSDATE default should be normalized:\n%s", ddl)
+	}
+}
+
 func TestQuoteStringLiteralEscapesSingleQuotes(t *testing.T) {
 	if got := quoteStringLiteral("owner's note"); got != "'owner''s note'" {
 		t.Fatalf("unexpected quoted string: %s", got)
 	}
 }
+
+func TestQuoteIdentifierPreservesCase(t *testing.T) {
+	tests := []struct {
+		in, want string
+	}{
+		{in: "tibms_sx_agent", want: `"tibms_sx_agent"`},
+		{in: "tb_FileTrans", want: `"tb_FileTrans"`},
+		{in: "hgListId", want: `"hgListId"`},
+		{in: `weird"name`, want: `"weird""name"`},
+	}
+	for _, tt := range tests {
+		if got := quoteIdentifier(tt.in); got != tt.want {
+			t.Fatalf("quoteIdentifier(%q) = %s, want %s", tt.in, got, tt.want)
+		}
+	}
+}
+
+func TestRenderXuguTableDDLPreservesQuotedIdentifierCase(t *testing.T) {
+	ddl := renderXuguTableDDL(
+		"tibms_sx_agent", "tb_FileTrans",
+		[]columnInfo{
+			{Name: "hgListId", DataType: "VARCHAR", IsNullable: false, CharacterMaximumLength: intPtr(50)},
+			{Name: "tableName", DataType: "VARCHAR", IsNullable: false, CharacterMaximumLength: intPtr(50)},
+		},
+		xuguTableMetadata{},
+		nil,
+		[]xuguConstraintInfo{{Name: "PK_tb_FileTrans", Type: "P", Definition: `"hgListId"`, Enabled: true}},
+		nil, nil,
+	)
+	for _, want := range []string{
+		`CREATE TABLE "tibms_sx_agent"."tb_FileTrans"`,
+		`"hgListId" VARCHAR(50) NOT NULL`,
+		`"tableName" VARCHAR(50) NOT NULL`,
+		`CONSTRAINT "PK_tb_FileTrans" PRIMARY KEY ("hgListId")`,
+	} {
+		if !strings.Contains(ddl, want) {
+			t.Fatalf("DDL missing case-preserving fragment %q:\n%s", want, ddl)
+		}
+	}
+	if strings.Contains(ddl, `"TIBMS_SX_AGENT"`) || strings.Contains(ddl, `"TB_FILETRANS"`) || strings.Contains(ddl, `"HGLISTID"`) {
+		t.Fatalf("DDL uppercased identifiers that should keep catalog case:\n%s", ddl)
+	}
+}
+
+func intPtr(v int) *int { return &v }
 
 func TestNormalizeValuePreservesDriverNumericTypes(t *testing.T) {
 	if value := normalizeValue(int32(7)); value != int64(7) {

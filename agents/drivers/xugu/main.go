@@ -2012,19 +2012,60 @@ func (s *server) getObjectSource(schema, name, objectType string) (map[string]an
 }
 
 func (s *server) getTableDDL(schema, table string) (string, error) {
-	var err error
-	schema, err = s.normalizeSchema(schema)
+	// Resolve the catalog's stored casing. Metadata lookups are case-insensitive
+	// (UPPER(...)=UPPER(?)), but the emitted DDL must quote the original names so
+	// double-quoted identifiers keep mixed-case schema/table/column spellings.
+	catalogSchema, catalogTable, err := s.resolveCatalogTableName(schema, table)
 	if err != nil {
 		return "", err
 	}
 	// DBMS_METADATA.GET_DDL can block indefinitely on XuguDB, even when the
 	// table metadata itself is accessible. Reconstruct the DDL from the same
 	// ALL_* catalog views used by the object browser instead.
-	ddl, err := s.buildTableDDL(schema, table)
+	ddl, err := s.buildTableDDL(catalogSchema, catalogTable)
 	if err != nil {
 		return "", err
 	}
-	return s.appendTableIndexDDL(schema, table, ddl), nil
+	return s.appendTableIndexDDL(catalogSchema, catalogTable, ddl), nil
+}
+
+// resolveCatalogTableName returns SCHEMA_NAME/TABLE_NAME exactly as stored in
+// ALL_SCHEMAS/ALL_TABLES. Callers use those values when quoting identifiers in
+// exported DDL so case is preserved under double quotes.
+func (s *server) resolveCatalogTableName(schema, table string) (string, string, error) {
+	schema = strings.TrimSpace(schema)
+	table = strings.TrimSpace(table)
+	if schema == "" {
+		current, err := s.currentSchema()
+		if err != nil {
+			return "", "", err
+		}
+		schema = current
+	}
+	if table == "" {
+		return "", "", errors.New("table is required")
+	}
+	rows, err := s.queryRows(`
+SELECT s.SCHEMA_NAME, t.TABLE_NAME
+FROM ALL_TABLES t
+JOIN ALL_SCHEMAS s ON s.DB_ID = t.DB_ID AND s.SCHEMA_ID = t.SCHEMA_ID
+WHERE UPPER(s.SCHEMA_NAME) = UPPER(?)
+  AND UPPER(t.TABLE_NAME) = UPPER(?)`, []any{schema, table})
+	if err != nil {
+		return "", "", err
+	}
+	defer s.closeRows(rows)
+	if !rows.Next() {
+		if err := rows.Err(); err != nil {
+			return "", "", err
+		}
+		return "", "", fmt.Errorf("table not found: %s.%s", schema, table)
+	}
+	var catalogSchema, catalogTable string
+	if err := rows.Scan(&catalogSchema, &catalogTable); err != nil {
+		return "", "", err
+	}
+	return catalogSchema, catalogTable, rows.Err()
 }
 
 func (s *server) getExplainInfo(sqlText string) (string, error) {
@@ -2714,17 +2755,19 @@ func renderXuguTableDDL(schema, table string, columns []columnInfo, metadata xug
 		if identity, ok := identities[strings.ToUpper(column.Name)]; ok {
 			item.WriteString(fmt.Sprintf(" IDENTITY(%d,%d)", identity.Start, identity.Step))
 		}
-		if column.ColumnDefault != nil && strings.TrimSpace(*column.ColumnDefault) != "" {
-			item.WriteString(" DEFAULT ")
-			switch column.DefaultOnNull {
-			case 1:
-				// ON_NULL=1 means that an explicit NULL is replaced during insert.
-				// The explicit spelling also covers the legacy DEFAULT ON NULL form.
-				item.WriteString("ON NULL FOR INSERT ONLY ")
-			case 2:
-				item.WriteString("ON NULL FOR INSERT AND UPDATE ")
+		if column.ColumnDefault != nil {
+			if def := normalizeXuguDefaultExpr(strings.TrimSpace(*column.ColumnDefault), column.DataType); def != "" {
+				item.WriteString(" DEFAULT ")
+				switch column.DefaultOnNull {
+				case 1:
+					// ON_NULL=1 means that an explicit NULL is replaced during insert.
+					// The explicit spelling also covers the legacy DEFAULT ON NULL form.
+					item.WriteString("ON NULL FOR INSERT ONLY ")
+				case 2:
+					item.WriteString("ON NULL FOR INSERT AND UPDATE ")
+				}
+				item.WriteString(def)
 			}
-			item.WriteString(strings.TrimSpace(*column.ColumnDefault))
 		}
 		if !column.IsNullable {
 			item.WriteString(" NOT NULL")
@@ -2735,7 +2778,16 @@ func renderXuguTableDDL(schema, table string, columns []columnInfo, metadata xug
 		}
 		items = append(items, item.String())
 	}
+	// Inline only constraints that are valid inside CREATE TABLE. Foreign keys
+	// must be added with ALTER TABLE: Xugu rejects self-referencing FKs (and
+	// any FK whose parent is not yet visible) during CREATE, matching DBeaver's
+	// xugu-metadata exporter which always emits ALTER for F/PK/CHECK extras.
+	var foreignKeys []xuguConstraintInfo
 	for _, constraint := range constraints {
+		if strings.EqualFold(strings.TrimSpace(constraint.Type), "F") {
+			foreignKeys = append(foreignKeys, constraint)
+			continue
+		}
 		if item := renderXuguConstraintDDL(constraint); item != "" {
 			items = append(items, "  "+item)
 		}
@@ -2761,6 +2813,12 @@ func renderXuguTableDDL(schema, table string, columns []columnInfo, metadata xug
 	if strings.TrimSpace(metadata.Comment) != "" {
 		builder.WriteString("\nCOMMENT ")
 		builder.WriteString(quoteStringLiteral(strings.TrimSpace(metadata.Comment)))
+	}
+	for _, constraint := range foreignKeys {
+		if item := renderXuguForeignKeyAlterDDL(schema, table, constraint); item != "" {
+			builder.WriteString(";\n\n")
+			builder.WriteString(item)
+		}
 	}
 	for _, constraint := range constraints {
 		if !constraint.Enabled && strings.TrimSpace(constraint.Name) != "" {
@@ -2790,49 +2848,67 @@ func renderXuguConstraintDDL(constraint xuguConstraintInfo) string {
 	case "C":
 		return prefix + "CHECK (" + definition + ")"
 	case "F":
-		localColumns, referencedColumns := parseForeignKeyColumns(definition)
-		if len(localColumns) == 0 || len(referencedColumns) == 0 || strings.TrimSpace(constraint.ReferenceTable) == "" {
-			return ""
-		}
-		var builder strings.Builder
-		builder.WriteString(prefix)
-		builder.WriteString("FOREIGN KEY (")
-		builder.WriteString(quotedIdentifiers(localColumns))
-		builder.WriteString(") REFERENCES ")
-		if strings.TrimSpace(constraint.ReferenceSchema) != "" {
-			builder.WriteString(quoteIdentifier(constraint.ReferenceSchema))
-			builder.WriteByte('.')
-		}
-		builder.WriteString(quoteIdentifier(constraint.ReferenceTable))
-		builder.WriteString(" (")
-		builder.WriteString(quotedIdentifiers(referencedColumns))
-		builder.WriteByte(')')
-		if match := xuguMatchClause(constraint.MatchType); match != "" {
-			builder.WriteByte(' ')
-			builder.WriteString(match)
-		}
-		if action := xuguReferentialAction(constraint.UpdateAction); action != "" {
-			builder.WriteString(" ON UPDATE ")
-			builder.WriteString(action)
-		}
-		if action := xuguReferentialAction(constraint.DeleteAction); action != "" {
-			builder.WriteString(" ON DELETE ")
-			builder.WriteString(action)
-		}
-		if constraint.Deferrable {
-			builder.WriteString(" DEFERRABLE")
-			if constraint.InitiallyDeferred {
-				builder.WriteString(" INITIALLY DEFERRED")
-			} else {
-				builder.WriteString(" INITIALLY IMMEDIATE")
-			}
-		} else {
-			builder.WriteString(" NOT DEFERRABLE")
-		}
-		return builder.String()
+		// Foreign keys are rendered as ALTER TABLE statements; see renderXuguForeignKeyAlterDDL.
+		return ""
 	default:
 		return ""
 	}
+}
+
+// renderXuguForeignKeyAlterDDL emits FK constraints after CREATE TABLE. Self-
+// referencing trees (e.g. SHOP_CATEGORIES.PARENT_ID -> CATEGORY_ID) fail when
+// declared inline because the table does not exist yet during CREATE validation.
+func renderXuguForeignKeyAlterDDL(schema, table string, constraint xuguConstraintInfo) string {
+	name := strings.TrimSpace(constraint.Name)
+	definition := strings.TrimSpace(constraint.Definition)
+	if name == "" || definition == "" {
+		return ""
+	}
+	localColumns, referencedColumns := parseForeignKeyColumns(definition)
+	if len(localColumns) == 0 || len(referencedColumns) == 0 || strings.TrimSpace(constraint.ReferenceTable) == "" {
+		return ""
+	}
+	var builder strings.Builder
+	builder.WriteString("ALTER TABLE ")
+	builder.WriteString(quoteIdentifier(schema))
+	builder.WriteByte('.')
+	builder.WriteString(quoteIdentifier(table))
+	builder.WriteString(" ADD CONSTRAINT ")
+	builder.WriteString(quoteIdentifier(name))
+	builder.WriteString(" FOREIGN KEY (")
+	builder.WriteString(quotedIdentifiers(localColumns))
+	builder.WriteString(") REFERENCES ")
+	if strings.TrimSpace(constraint.ReferenceSchema) != "" {
+		builder.WriteString(quoteIdentifier(constraint.ReferenceSchema))
+		builder.WriteByte('.')
+	}
+	builder.WriteString(quoteIdentifier(constraint.ReferenceTable))
+	builder.WriteString(" (")
+	builder.WriteString(quotedIdentifiers(referencedColumns))
+	builder.WriteByte(')')
+	if match := xuguMatchClause(constraint.MatchType); match != "" {
+		builder.WriteByte(' ')
+		builder.WriteString(match)
+	}
+	if action := xuguReferentialAction(constraint.UpdateAction); action != "" {
+		builder.WriteString(" ON UPDATE ")
+		builder.WriteString(action)
+	}
+	if action := xuguReferentialAction(constraint.DeleteAction); action != "" {
+		builder.WriteString(" ON DELETE ")
+		builder.WriteString(action)
+	}
+	if constraint.Deferrable {
+		builder.WriteString(" DEFERRABLE")
+		if constraint.InitiallyDeferred {
+			builder.WriteString(" INITIALLY DEFERRED")
+		} else {
+			builder.WriteString(" INITIALLY IMMEDIATE")
+		}
+	} else {
+		builder.WriteString(" NOT DEFERRABLE")
+	}
+	return builder.String()
 }
 
 func renderXuguPartitionDDL(metadata xuguTableMetadata, partitions, subpartitions []xuguPartitionInfo) string {
@@ -3037,9 +3113,15 @@ func (s *server) appendTableIndexDDL(schema, table, ddl string) string {
 	if err != nil || len(indexes) == 0 {
 		return ddl
 	}
+	// PRIMARY KEY / UNIQUE constraints already create backing indexes. Replaying
+	// CREATE UNIQUE INDEX for those columns fails with "identical index exists".
+	var uniqueConstraintColumns [][]string
+	if constraints, cerr := s.tableConstraints(schema, table); cerr == nil {
+		uniqueConstraintColumns = uniqueKeyColumnSets(constraints)
+	}
 	var builder strings.Builder
 	for _, index := range indexes {
-		if index.IsPrimary || len(index.Columns) == 0 {
+		if shouldSkipIndexForTableDDL(index, uniqueConstraintColumns) {
 			continue
 		}
 		if builder.Len() > 0 {
@@ -3073,6 +3155,122 @@ func (s *server) appendTableIndexDDL(schema, table, ddl string) string {
 		return ddl
 	}
 	return appendDDLStatement(ddl, builder.String())
+}
+
+// uniqueKeyColumnSets returns column lists for PRIMARY KEY and UNIQUE constraints.
+// Xugu stores those definitions as quoted identifiers inside ALL_CONSTRAINTS.DEFINE.
+func uniqueKeyColumnSets(constraints []xuguConstraintInfo) [][]string {
+	var result [][]string
+	for _, constraint := range constraints {
+		switch strings.ToUpper(strings.TrimSpace(constraint.Type)) {
+		case "P", "U":
+			columns := parseQuotedIdentifiers(constraint.Definition)
+			if len(columns) == 0 {
+				continue
+			}
+			result = append(result, columns)
+		}
+	}
+	return result
+}
+
+// shouldSkipIndexForTableDDL drops indexes that CREATE TABLE already materializes
+// through PRIMARY KEY / UNIQUE constraints, so the exported script can be replayed.
+func shouldSkipIndexForTableDDL(index indexInfo, uniqueConstraintColumns [][]string) bool {
+	if index.IsPrimary || len(index.Columns) == 0 {
+		return true
+	}
+	if !index.IsUnique {
+		return false
+	}
+	for _, columns := range uniqueConstraintColumns {
+		if sameColumnListFold(index.Columns, columns) {
+			return true
+		}
+	}
+	return false
+}
+
+func sameColumnListFold(left, right []string) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for i := range left {
+		if !strings.EqualFold(strings.TrimSpace(left[i]), strings.TrimSpace(right[i])) {
+			return false
+		}
+	}
+	return true
+}
+
+// normalizeXuguDefaultExpr rewrites catalog default expressions into CREATE-safe
+// forms. ALL_COLUMNS.DEF_VAL often quotes function names as identifiers
+// (e.g. "SYSDATE"); DBeaver's exporter unquotes those well-known functions.
+// Returns "" when the default should be omitted (e.g. empty string on INTEGER).
+func normalizeXuguDefaultExpr(value, dataType string) string {
+	trimmed := strings.TrimSpace(value)
+	if trimmed == "" {
+		return ""
+	}
+	// Some migrated tables store DEF_VAL = '' on numeric columns, which Xugu
+	// rejects as "默认值表达式''错误". Skip those rather than emit invalid SQL.
+	if isXuguEmptyStringLiteral(trimmed) && !isXuguCharacterType(dataType) {
+		return ""
+	}
+	if len(trimmed) >= 2 && trimmed[0] == '"' && trimmed[len(trimmed)-1] == '"' {
+		inner := strings.TrimSpace(trimmed[1 : len(trimmed)-1])
+		switch strings.ToUpper(inner) {
+		case "SYSDATE", "CURRENT_DATE", "CURRENT_TIMESTAMP", "CURRENT_TIME", "USER", "UID", "SYS_GUID":
+			return strings.ToUpper(inner)
+		}
+	}
+	lower := strings.ToLower(trimmed)
+	if strings.Contains(lower, "uuid()") {
+		return strings.ReplaceAll(lower, "uuid()", "sys_guid()")
+	}
+	if strings.EqualFold(trimmed, "(GETDATE())") || strings.EqualFold(trimmed, "sysdate") {
+		return "SYSDATE"
+	}
+	if trimmed == "0000-00-00 00:00:00" {
+		return "'1970-01-01 00:00:00'"
+	}
+	if trimmed == "0000-00-00" {
+		return "'1970-01-01'"
+	}
+	// Catalog sometimes stores unary minus with a space: "- (1)" -> "-1".
+	if compact := compactUnaryMinusDefault(trimmed); compact != "" {
+		return compact
+	}
+	return trimmed
+}
+
+func isXuguEmptyStringLiteral(value string) bool {
+	switch strings.TrimSpace(value) {
+	case "''", `""`, "N''", "n''":
+		return true
+	default:
+		return false
+	}
+}
+
+func isXuguCharacterType(dataType string) bool {
+	upper := strings.ToUpper(strings.TrimSpace(dataType))
+	return strings.Contains(upper, "CHAR") ||
+		strings.Contains(upper, "CLOB") ||
+		strings.Contains(upper, "TEXT") ||
+		strings.Contains(upper, "BINARY") ||
+		strings.Contains(upper, "BLOB") ||
+		strings.Contains(upper, "JSON") ||
+		strings.Contains(upper, "XML")
+}
+
+func compactUnaryMinusDefault(value string) string {
+	// Match patterns like "- (1)" / "- ( 12 )" produced by some migrations.
+	match := unaryMinusDefaultRegexp.FindStringSubmatch(strings.TrimSpace(value))
+	if len(match) != 2 {
+		return ""
+	}
+	return "-" + match[1]
 }
 
 func (s *server) tableComment(schema, table string) (string, error) {
@@ -3157,6 +3355,7 @@ func normalizeXuguColumnType(dataType string, varying any) string {
 }
 
 var quotedIdentifierRegexp = regexp.MustCompile(`"([^"]+)"`)
+var unaryMinusDefaultRegexp = regexp.MustCompile(`^-\s*\(\s*([0-9]+(?:\.[0-9]+)?)\s*\)$`)
 
 func parseQuotedIdentifiers(value string) []string {
 	matches := quotedIdentifierRegexp.FindAllStringSubmatch(value, -1)
