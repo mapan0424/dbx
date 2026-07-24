@@ -1037,6 +1037,32 @@ func TestNormalizeValuePreservesDriverNumericTypes(t *testing.T) {
 	}
 }
 
+func TestTrimStatementSQLKeepsXuguProgrammableObjectTerminators(t *testing.T) {
+	cases := []struct {
+		name string
+		sql  string
+	}{
+		{"procedure", "CREATE OR REPLACE PROCEDURE p AS BEGIN NULL; END;"},
+		{"function", "CREATE OR REPLACE FUNCTION f RETURN INTEGER AS BEGIN RETURN 1; END;"},
+		{"trigger", "CREATE OR REPLACE TRIGGER t BEFORE INSERT ON events FOR EACH ROW BEGIN NULL; END;"},
+		{"package", "CREATE OR REPLACE PACKAGE pkg AS PROCEDURE ping; END pkg;"},
+		{"package body", "CREATE OR REPLACE PACKAGE BODY pkg AS PROCEDURE ping AS BEGIN NULL; END ping; END pkg;"},
+		{"leading comments", "-- generated source\n/* object DDL */\nCREATE OR REPLACE PROCEDURE p AS BEGIN NULL; END;"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := trimStatementSQL(tc.sql); got != tc.sql {
+				t.Fatalf("trimStatementSQL() = %q, want %q", got, tc.sql)
+			}
+		})
+	}
+
+	if got := trimStatementSQL("CREATE TABLE items (id INTEGER);"); got != "CREATE TABLE items (id INTEGER)" {
+		t.Fatalf("regular SQL terminator should be removed, got %q", got)
+	}
+}
+
 func contains(values []string, target string) bool {
 	for _, value := range values {
 		if value == target {

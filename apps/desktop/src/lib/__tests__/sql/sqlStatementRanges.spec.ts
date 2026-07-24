@@ -80,6 +80,30 @@ BEGIN
   NULL;
 END;`;
 
+const xuguProgrammableObjectFixtures = [
+  `CREATE OR REPLACE PROCEDURE dbx_xugu_procedure AS
+  v_value INTEGER;
+BEGIN
+  v_value := 1;
+END;`,
+  `CREATE OR REPLACE FUNCTION dbx_xugu_function RETURN INTEGER AS
+BEGIN
+  RETURN 1;
+END;`,
+  `CREATE OR REPLACE TRIGGER dbx_xugu_trigger
+BEFORE INSERT ON dbx_xugu_events
+FOR EACH ROW
+BEGIN
+  NULL;
+END;`,
+  `CREATE OR REPLACE PACKAGE BODY dbx_xugu_package AS
+  PROCEDURE ping AS
+  BEGIN
+    NULL;
+  END ping;
+END dbx_xugu_package;`,
+];
+
 const mysqlRoutineFixture = `CREATE PROCEDURE p()
 BEGIN
   SELECT 1;
@@ -221,6 +245,14 @@ describe("splitSqlStatementRanges", () => {
 
   it("keeps nested GaussDB procedure blocks together", () => {
     expect(rangeSqlTexts(splitSqlStatementRanges(gaussDbNestedProcedure, "gaussdb"))).toEqual([gaussDbNestedProcedure]);
+  });
+
+  it("keeps Xugu programmable object DDL together and retains its terminator", () => {
+    for (const sql of xuguProgrammableObjectFixtures) {
+      const ranges = splitSqlStatementRanges(`${sql}\nSELECT 1;`, "xugu");
+      expect(rangeSqlTexts(ranges)).toEqual([sql, "SELECT 1"]);
+      expect(ranges[0].sql.trimEnd()).toMatch(/END(?:\s+\w+)?;$/);
+    }
   });
 
   it("keeps SAP HANA DO blocks together", () => {

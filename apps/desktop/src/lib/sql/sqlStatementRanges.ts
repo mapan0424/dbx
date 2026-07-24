@@ -249,7 +249,7 @@ const ALTER_BODY_KEYWORDS = new Set(["ADD", "ALTER", "COMMENT", "DROP", "MODIFY"
 const CLICKHOUSE_ALTER_TABLE_HEADER = /^ALTER\s+TABLE\s+(?:(?:[A-Za-z_][\w$]*|`(?:``|[^`])+`|"(?:""|[^"])+")\s*\.\s*)?(?:[A-Za-z_][\w$]*|`(?:``|[^`])+`|"(?:""|[^"])+")(?:\s+ON\s+CLUSTER\s+(?:[A-Za-z_][\w$]*|`(?:``|[^`])+`|"(?:""|[^"])+"|'(?:''|[^'])+'))?\s*$/i;
 const SET_OPERATION_KEYWORDS = new Set(["UNION", "INTERSECT", "EXCEPT", "MINUS"]);
 const SET_OPERATION_MODIFIER_KEYWORDS = new Set(["ALL", "DISTINCT"]);
-const ORACLE_LIKE_PL_SQL_DATABASES: ReadonlySet<DatabaseType> = new Set(["oracle", "dameng", "gaussdb", "yashandb", "oscar", "oceanbase-oracle"]);
+const ORACLE_LIKE_PL_SQL_DATABASES: ReadonlySet<DatabaseType> = new Set(["oracle", "dameng", "gaussdb", "yashandb", "oscar", "oceanbase-oracle", "xugu"]);
 const MYSQL_ROUTINE_BLOCK_DATABASES: ReadonlySet<DatabaseType> = new Set(["mysql", "doris", "starrocks", "manticoresearch", "goldendb"]);
 const MYSQL_CREATE_TABLE_OPTION_DATABASES: ReadonlySet<DatabaseType> = new Set(["mysql", "doris", "starrocks", "manticoresearch", "goldendb", "gbase"]);
 const MYSQL_ROUTINE_OBJECT_TYPES = new Set(["PROCEDURE", "FUNCTION", "TRIGGER", "EVENT"]);
@@ -1663,7 +1663,11 @@ function oraclePlSqlBlockIsComplete(sql: string): boolean {
   const tokens = oraclePlSqlTokens(sql);
   if (!startsWithOraclePlSqlBlock(sql)) return false;
 
-  const stack: string[] = [];
+  // A package/type body owns an outer END in addition to the BEGIN/END
+  // pairs in each contained routine. Keep that outer scope on the stack so
+  // `END inner_routine;` cannot prematurely finish the object.
+  const stack: string[] = isOraclePlSqlObjectBody(sql) ? ["OBJECT_BODY"] : [];
+  let sawBegin = false;
   for (let index = 0; index < tokens.length; index += 1) {
     const token = tokens[index];
     if (token.kind !== "word") continue;
@@ -1676,6 +1680,7 @@ function oraclePlSqlBlockIsComplete(sql: string): boolean {
       if (tokens[index - 1]?.kind === "word" && tokens[index - 1]?.value === "TRANSACTION") continue;
       const previous = previousWordToken(tokens, index);
       if (previous === "END") continue;
+      sawBegin = true;
       if (stack[stack.length - 1] === "DECLARATION") stack[stack.length - 1] = "BLOCK";
       else stack.push("BLOCK");
       continue;
@@ -1695,14 +1700,25 @@ function oraclePlSqlBlockIsComplete(sql: string): boolean {
     }
     if (token.value === "END") {
       const next = nextWordToken(tokens, index);
-      const target = ORACLE_PL_SQL_TERMINATORS.has(next ?? "") ? next : "BLOCK";
       const top = stack[stack.length - 1];
+      const target = ORACLE_PL_SQL_TERMINATORS.has(next ?? "") ? next : top === "OBJECT_BODY" ? "OBJECT_BODY" : "BLOCK";
       if (top === target || (target === "BLOCK" && top === "BLOCK")) stack.pop();
       continue;
     }
   }
 
-  return stack.length === 0 && tokens[tokens.length - 1]?.kind === "semicolon";
+  return sawBegin && stack.length === 0 && tokens[tokens.length - 1]?.kind === "semicolon";
+}
+
+function isOraclePlSqlObjectBody(sql: string): boolean {
+  const words = oraclePlSqlWords(sql);
+  if (words[0] !== "CREATE") return false;
+
+  let index = 1;
+  while (["OR", "REPLACE", "EDITIONABLE", "NONEDITIONABLE"].includes(words[index] ?? "")) {
+    index += 1;
+  }
+  return (words[index] === "PACKAGE" || words[index] === "TYPE") && words[index + 1] === "BODY";
 }
 
 function oraclePlSqlWords(sql: string): string[] {

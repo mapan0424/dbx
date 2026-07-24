@@ -189,6 +189,7 @@ impl SqlDialectProfile {
                 | DatabaseType::Yashandb
                 | DatabaseType::Oscar
                 | DatabaseType::OceanbaseOracle
+                | DatabaseType::Xugu
         )
     }
 }
@@ -2082,7 +2083,10 @@ impl OraclePlSqlBlock {
             return false;
         }
 
-        let mut depth = 0usize;
+        // Package/type bodies have an outer END in addition to the bodies of
+        // their contained routines. Account for that scope before parsing the
+        // nested BEGIN/END pairs so an inner END cannot end the object.
+        let mut depth = usize::from(self.is_object_body());
         let mut saw_begin = false;
         let mut complete = false;
         let mut pending_end: Option<bool> = None;
@@ -2120,6 +2124,11 @@ impl OraclePlSqlBlock {
     fn starts_create_plsql_object(tokens: &[OraclePlSqlToken]) -> bool {
         let tokens = Self::skip_or_replace(tokens);
         tokens.first().is_some_and(|token| token.is_any_word(&["FUNCTION", "PROCEDURE", "TRIGGER", "PACKAGE", "TYPE"]))
+    }
+
+    fn is_object_body(&self) -> bool {
+        let tokens = Self::skip_or_replace(&self.tokens[1..]);
+        matches!(tokens, [object, body, ..] if object.is_any_word(&["PACKAGE", "TYPE"]) && body.is_word("BODY"))
     }
 
     fn skip_or_replace(tokens: &[OraclePlSqlToken]) -> &[OraclePlSqlToken] {
@@ -3081,6 +3090,7 @@ END;";
         assert_eq!(split_sql_statements_for_database(sql, DatabaseType::Oracle), vec![sql.to_string()]);
         assert_eq!(split_sql_statements_for_database(sql, DatabaseType::Dameng), vec![sql.to_string()]);
         assert_eq!(split_sql_statements_for_database(sql, DatabaseType::Gaussdb), vec![sql.to_string()]);
+        assert_eq!(split_sql_statements_for_database(sql, DatabaseType::Xugu), vec![sql.to_string()]);
     }
 
     #[test]
@@ -3228,6 +3238,10 @@ SELECT 1;";
             vec!["CREATE OR REPLACE FUNCTION number_tochar(nums VARCHAR(20))\nRETURN VARCHAR(20)\nAS\n    res VARCHAR(20);\nBEGIN\n    RETURN '一';\nEND;", "SELECT 1"]
         );
         assert_eq!(
+            split_sql_statements_for_database(sql, DatabaseType::Xugu),
+            vec!["CREATE OR REPLACE FUNCTION number_tochar(nums VARCHAR(20))\nRETURN VARCHAR(20)\nAS\n    res VARCHAR(20);\nBEGIN\n    RETURN '一';\nEND;", "SELECT 1"]
+        );
+        assert_eq!(
             split_sql_statements_for_database(sql, DatabaseType::Dameng),
             vec!["CREATE OR REPLACE FUNCTION number_tochar(nums VARCHAR(20))\nRETURN VARCHAR(20)\nAS\n    res VARCHAR(20);\nBEGIN\n    RETURN '一';\nEND;", "SELECT 1"]
         );
@@ -3252,6 +3266,13 @@ SELECT 1;";
                 "SELECT 1"
             ]
         );
+        assert_eq!(
+            split_sql_statements_for_database(sql, DatabaseType::Xugu),
+            vec![
+                "CREATE OR REPLACE PROCEDURE update_salary(p_id NUMBER, p_amount NUMBER)\nAS\nBEGIN\n    UPDATE employees SET salary = salary + p_amount WHERE id = p_id;\n    COMMIT;\nEND;",
+                "SELECT 1"
+            ]
+        );
     }
 
     #[test]
@@ -3268,6 +3289,13 @@ SELECT 1;";
 
         assert_eq!(
             split_sql_statements_for_database(sql, DatabaseType::Oracle),
+            vec![
+                "CREATE TRIGGER trg_audit\nBEFORE INSERT ON employees\nFOR EACH ROW\nBEGIN\n    INSERT INTO audit_log VALUES (:NEW.id, 'INSERT');\nEND;",
+                "SELECT 1"
+            ]
+        );
+        assert_eq!(
+            split_sql_statements_for_database(sql, DatabaseType::Xugu),
             vec![
                 "CREATE TRIGGER trg_audit\nBEFORE INSERT ON employees\nFOR EACH ROW\nBEGIN\n    INSERT INTO audit_log VALUES (:NEW.id, 'INSERT');\nEND;",
                 "SELECT 1"
@@ -3312,6 +3340,34 @@ SELECT 1;";
             split_sql_statements_for_database(sql, DatabaseType::Oracle),
             vec![
                 "CREATE OR REPLACE PACKAGE pkg_utils AS\n    FUNCTION get_version RETURN VARCHAR2;\n    PROCEDURE log_message(msg VARCHAR2);\nEND pkg_utils;",
+                "SELECT 1"
+            ]
+        );
+        assert_eq!(
+            split_sql_statements_for_database(sql, DatabaseType::Xugu),
+            vec![
+                "CREATE OR REPLACE PACKAGE pkg_utils AS\n    FUNCTION get_version RETURN VARCHAR2;\n    PROCEDURE log_message(msg VARCHAR2);\nEND pkg_utils;",
+                "SELECT 1"
+            ]
+        );
+    }
+
+    #[test]
+    fn xugu_split_keeps_create_package_body_together() {
+        let sql = "\
+CREATE OR REPLACE PACKAGE BODY dbx_pkg AS
+    PROCEDURE ping AS
+    BEGIN
+        NULL;
+    END ping;
+END dbx_pkg;
+/
+SELECT 1;";
+
+        assert_eq!(
+            split_sql_statements_for_database(sql, DatabaseType::Xugu),
+            vec![
+                "CREATE OR REPLACE PACKAGE BODY dbx_pkg AS\n    PROCEDURE ping AS\n    BEGIN\n        NULL;\n    END ping;\nEND dbx_pkg;",
                 "SELECT 1"
             ]
         );

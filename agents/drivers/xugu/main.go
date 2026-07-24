@@ -3363,7 +3363,61 @@ func errorResponse(id json.RawMessage, err error) response {
 }
 
 func trimStatementSQL(sqlText string) string {
-	return strings.TrimRight(strings.TrimSpace(sqlText), "; \t\r\n")
+	trimmed := strings.TrimSpace(sqlText)
+	if isXuguProgrammableObjectDDL(trimmed) {
+		// Xugu's compiler requires the terminator after END. The desktop
+		// statement splitter already removes only client-side delimiters, while
+		// retaining this one for Oracle-style procedural objects.
+		return trimmed
+	}
+	return strings.TrimRight(trimmed, "; \t\r\n")
+}
+
+func isXuguProgrammableObjectDDL(sqlText string) bool {
+	fields := strings.Fields(strings.ToUpper(stripLeadingSQLComments(sqlText)))
+	if len(fields) < 2 || fields[0] != "CREATE" {
+		return false
+	}
+
+	index := 1
+	if len(fields) > index+1 && fields[index] == "OR" && fields[index+1] == "REPLACE" {
+		index += 2
+	}
+	if len(fields) > index && (fields[index] == "EDITIONABLE" || fields[index] == "NONEDITIONABLE") {
+		index++
+	}
+	if len(fields) <= index {
+		return false
+	}
+
+	switch fields[index] {
+	case "PROCEDURE", "FUNCTION", "TRIGGER", "PACKAGE":
+		return true
+	default:
+		return false
+	}
+}
+
+func stripLeadingSQLComments(sqlText string) string {
+	remaining := strings.TrimLeft(sqlText, " \t\r\n")
+	for {
+		switch {
+		case strings.HasPrefix(remaining, "--"):
+			lineEnd := strings.IndexByte(remaining, '\n')
+			if lineEnd < 0 {
+				return ""
+			}
+			remaining = strings.TrimLeft(remaining[lineEnd+1:], " \t\r\n")
+		case strings.HasPrefix(remaining, "/*"):
+			commentEnd := strings.Index(remaining[2:], "*/")
+			if commentEnd < 0 {
+				return ""
+			}
+			remaining = strings.TrimLeft(remaining[commentEnd+4:], " \t\r\n")
+		default:
+			return remaining
+		}
+	}
 }
 
 func isQuerySQL(sqlText string) bool {
