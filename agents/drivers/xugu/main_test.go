@@ -929,6 +929,37 @@ func TestRenderXuguTableDDLPreservesProgrammableTableMetadata(t *testing.T) {
 	if strings.Contains(createBody, "FOREIGN KEY") {
 		t.Fatalf("foreign keys must not be inlined in CREATE TABLE:\n%s", ddl)
 	}
+	if !strings.HasSuffix(strings.TrimSpace(ddl), ";") {
+		t.Fatalf("standalone table DDL must end with a statement terminator:\n%s", ddl)
+	}
+}
+
+func TestRenderXuguTableDDLSkipsImplicitIdentityUniqueConstraint(t *testing.T) {
+	ddl := renderXuguTableDDL(
+		"AppSchema", "tbIdentityAndDefaults",
+		[]columnInfo{
+			{Name: "identityStandard", DataType: "INTEGER", IsNullable: false},
+			{Name: "identityCustom", DataType: "INTEGER", IsNullable: false},
+			{Name: "other", DataType: "VARCHAR", IsNullable: false},
+		},
+		xuguTableMetadata{},
+		map[string]xuguIdentityInfo{
+			"identityStandard": {Column: "identityStandard", Start: 1, Step: 1},
+			"identityCustom":   {Column: "identityCustom", Start: 100, Step: 10},
+		},
+		[]xuguConstraintInfo{
+			{Name: "PK_S1", Type: "P", Definition: `"identityStandard"`},
+			{Name: "UK_S1", Type: "U", Definition: `"identityCustom"`},
+			{Name: "UK_OTHER", Type: "U", Definition: `"other"`},
+		},
+		nil, nil,
+	)
+	if strings.Contains(ddl, `CONSTRAINT "UK_S1" UNIQUE ("identityCustom")`) {
+		t.Fatalf("implicit IDENTITY unique constraint must not be exported:\n%s", ddl)
+	}
+	if !strings.Contains(ddl, `CONSTRAINT "UK_OTHER" UNIQUE ("other")`) {
+		t.Fatalf("ordinary unique constraint must be preserved:\n%s", ddl)
+	}
 }
 
 func TestBuildTableDDLReadsForeignKeysFromCatalog(t *testing.T) {
@@ -1098,6 +1129,13 @@ func TestAppendDDLStatement(t *testing.T) {
 
 	if got != want {
 		t.Fatalf("unexpected DDL append:\ngot:  %q\nwant: %q", got, want)
+	}
+}
+
+func TestRenderXuguTableDDLTerminatesStandaloneScript(t *testing.T) {
+	ddl := renderXuguTableDDL("AppSchema", "tbNoIndex", []columnInfo{{Name: "id", DataType: "INTEGER", IsNullable: false}}, xuguTableMetadata{}, nil, nil, nil, nil)
+	if got, want := ddl, "CREATE TABLE \"AppSchema\".\"tbNoIndex\" (\n  \"id\" INTEGER NOT NULL\n);"; got != want {
+		t.Fatalf("standalone DDL = %q, want %q", got, want)
 	}
 }
 

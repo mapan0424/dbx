@@ -2874,6 +2874,13 @@ func renderXuguTableDDL(schema, table string, columns []columnInfo, metadata xug
 			foreignKeys = append(foreignKeys, constraint)
 			continue
 		}
+		// Xugu exposes the implicit unique key that it creates for every
+		// IDENTITY column through ALL_CONSTRAINTS. Re-emitting it as an
+		// explicit UNIQUE clause makes CREATE TABLE fail with E5170 because
+		// the IDENTITY definition already supplies that uniqueness.
+		if shouldSkipXuguIdentityUniqueConstraint(constraint, identities) {
+			continue
+		}
 		if item := renderXuguConstraintDDL(constraint); item != "" {
 			items = append(items, "  "+item)
 		}
@@ -2916,7 +2923,22 @@ func renderXuguTableDDL(schema, table string, columns []columnInfo, metadata xug
 			builder.WriteString(quoteIdentifier(constraint.Name))
 		}
 	}
-	return builder.String()
+	// A table DDL response is also used as a standalone script. Do not rely on
+	// appendTableIndexDDL to terminate the CREATE/ALTER statement: tables with
+	// no independent indexes must remain directly executable as well.
+	return terminateDDLScript(builder.String())
+}
+
+func shouldSkipXuguIdentityUniqueConstraint(constraint xuguConstraintInfo, identities map[string]xuguIdentityInfo) bool {
+	if !strings.EqualFold(strings.TrimSpace(constraint.Type), "U") || len(identities) == 0 {
+		return false
+	}
+	columns := parseQuotedIdentifiers(constraint.Definition)
+	if len(columns) != 1 {
+		return false
+	}
+	_, isIdentity := identities[columns[0]]
+	return isIdentity
 }
 
 func renderXuguConstraintDDL(constraint xuguConstraintInfo) string {
@@ -3366,6 +3388,14 @@ func appendDDLStatement(ddl, extra string) string {
 		ddl += ";"
 	}
 	return ddl + "\n\n" + extra
+}
+
+func terminateDDLScript(ddl string) string {
+	ddl = strings.TrimRight(ddl, "\r\n\t ")
+	if ddl == "" || strings.HasSuffix(ddl, ";") {
+		return ddl
+	}
+	return ddl + ";"
 }
 
 func columnTypeDDL(column columnInfo) string {
