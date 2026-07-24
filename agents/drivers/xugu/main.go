@@ -100,6 +100,24 @@ WHERE UPPER(s.SCHEMA_NAME) = UPPER(?)
   AND UPPER(t.TABLE_NAME) = UPPER(?)
   AND c.CONS_TYPE <> 'F'
 ORDER BY c.CONS_NAME`
+
+// Keep foreign keys separate from the generic constraint query. The desktop
+// presents them in their own group, while table DDL must replay them only after
+// CREATE TABLE so that self-referencing tables can be restored safely.
+const xuguTableForeignKeysSQL = `
+SELECT c.CONS_NAME, c.CONS_TYPE, c.DEFINE,
+       rs.SCHEMA_NAME, rt.TABLE_NAME,
+       c.MATCH_TYPE, c.UPDATE_ACTION, c.DELETE_ACTION,
+       c.DEFERRABLE, c.INITDEFERRED, c.ENABLE, c.VALID
+FROM ALL_CONSTRAINTS c
+JOIN ALL_TABLES t ON t.DB_ID = c.DB_ID AND t.TABLE_ID = c.TABLE_ID
+JOIN ALL_SCHEMAS s ON s.DB_ID = t.DB_ID AND s.SCHEMA_ID = t.SCHEMA_ID
+LEFT JOIN ALL_TABLES rt ON rt.DB_ID = c.DB_ID AND rt.TABLE_ID = c.REF_TABLE_ID
+LEFT JOIN ALL_SCHEMAS rs ON rs.DB_ID = rt.DB_ID AND rs.SCHEMA_ID = rt.SCHEMA_ID
+WHERE UPPER(s.SCHEMA_NAME) = UPPER(?)
+  AND UPPER(t.TABLE_NAME) = UPPER(?)
+  AND c.CONS_TYPE = 'F'
+ORDER BY c.CONS_NAME`
 const xuguTablePartitionsSQL = `
 SELECT p.PARTI_NO, p.PARTI_NAME, p.PARTI_VAL, p.ONLINE,
        t.PARTI_TYPE, t.PARTI_KEY, t.AUTO_PARTI_TYPE, t.AUTO_PARTI_SPAN
@@ -1844,37 +1862,22 @@ func (s *server) listForeignKeys(schema, table string) ([]foreignKeyInfo, error)
 		return nil, err
 	}
 	table = strings.ToUpper(strings.TrimSpace(table))
-	rows, err := s.queryRows(`
-SELECT c.CONS_NAME, c.DEFINE, rs.SCHEMA_NAME, rt.TABLE_NAME, c.UPDATE_ACTION, c.DELETE_ACTION
-FROM ALL_CONSTRAINTS c
-JOIN ALL_TABLES t ON t.DB_ID = c.DB_ID AND t.TABLE_ID = c.TABLE_ID
-JOIN ALL_SCHEMAS s ON s.DB_ID = t.DB_ID AND s.SCHEMA_ID = t.SCHEMA_ID
-LEFT JOIN ALL_TABLES rt ON rt.DB_ID = c.DB_ID AND rt.TABLE_ID = c.REF_TABLE_ID
-LEFT JOIN ALL_SCHEMAS rs ON rs.DB_ID = rt.DB_ID AND rs.SCHEMA_ID = rt.SCHEMA_ID
-WHERE UPPER(s.SCHEMA_NAME) = UPPER(?)
-  AND UPPER(t.TABLE_NAME) = UPPER(?)
-  AND c.CONS_TYPE = 'F'
-ORDER BY c.CONS_NAME`, []any{schema, table})
+	constraints, err := s.tableForeignKeys(schema, table)
 	if err != nil {
 		if isXuguMetadataAccessError(err) {
 			return []foreignKeyInfo{}, nil
 		}
 		return nil, err
 	}
-	defer s.closeRows(rows)
 	var result []foreignKeyInfo
-	for rows.Next() {
-		var name, define, refSchema, refTable, updateAction, deleteAction any
-		if err := rows.Scan(&name, &define, &refSchema, &refTable, &updateAction, &deleteAction); err != nil {
-			return nil, err
-		}
-		local, ref := parseForeignKeyColumns(xuguString(define))
+	for _, constraint := range constraints {
+		local, ref := parseForeignKeyColumns(constraint.Definition)
 		for i, column := range local {
 			item := foreignKeyInfo{
-				Name: xuguString(name), Column: column, RefTable: xuguString(refTable),
-				RefSchema: optionalString(xuguString(refSchema)),
-				OnUpdate:  optionalString(xuguReferentialAction(xuguString(updateAction))),
-				OnDelete:  optionalString(xuguReferentialAction(xuguString(deleteAction))),
+				Name: constraint.Name, Column: column, RefTable: constraint.ReferenceTable,
+				RefSchema: optionalString(constraint.ReferenceSchema),
+				OnUpdate:  optionalString(xuguReferentialAction(constraint.UpdateAction)),
+				OnDelete:  optionalString(xuguReferentialAction(constraint.DeleteAction)),
 			}
 			if i < len(ref) {
 				item.RefColumn = ref[i]
@@ -1882,7 +1885,7 @@ ORDER BY c.CONS_NAME`, []any{schema, table})
 			result = append(result, item)
 		}
 	}
-	return emptyIfNil(result), rows.Err()
+	return emptyIfNil(result), nil
 }
 
 func (s *server) listTriggers(schema, table string) ([]triggerInfo, error) {
@@ -2557,6 +2560,10 @@ func (s *server) buildTableDDL(schema, table string) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	foreignKeys, err := s.tableForeignKeys(schema, table)
+	if err != nil {
+		return "", err
+	}
 	partitions, err := s.tablePartitions(schema, table, false)
 	if err != nil {
 		return "", err
@@ -2565,7 +2572,10 @@ func (s *server) buildTableDDL(schema, table string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return renderXuguTableDDL(schema, table, columns, metadata, identities, constraints, partitions, subpartitions), nil
+	allConstraints := make([]xuguConstraintInfo, 0, len(constraints)+len(foreignKeys))
+	allConstraints = append(allConstraints, constraints...)
+	allConstraints = append(allConstraints, foreignKeys...)
+	return renderXuguTableDDL(schema, table, columns, metadata, identities, allConstraints, partitions, subpartitions), nil
 }
 
 func (s *server) tableMetadata(schema, table string) (xuguTableMetadata, error) {
@@ -2619,7 +2629,15 @@ func (s *server) tableIdentities(schema, table string) (map[string]xuguIdentityI
 }
 
 func (s *server) tableConstraints(schema, table string) ([]xuguConstraintInfo, error) {
-	rows, err := s.queryRows(xuguTableConstraintsSQL, []any{schema, table})
+	return s.readTableConstraints(xuguTableConstraintsSQL, schema, table)
+}
+
+func (s *server) tableForeignKeys(schema, table string) ([]xuguConstraintInfo, error) {
+	return s.readTableConstraints(xuguTableForeignKeysSQL, schema, table)
+}
+
+func (s *server) readTableConstraints(query, schema, table string) ([]xuguConstraintInfo, error) {
+	rows, err := s.queryRows(query, []any{schema, table})
 	if err != nil {
 		return nil, err
 	}
@@ -3203,65 +3221,36 @@ func sameColumnListFold(left, right []string) bool {
 	return true
 }
 
-// normalizeXuguDefaultExpr rewrites catalog default expressions into CREATE-safe
-// forms. ALL_COLUMNS.DEF_VAL often quotes function names as identifiers
-// (e.g. "SYSDATE"); DBeaver's exporter unquotes those well-known functions.
-// Returns "" when the default should be omitted (e.g. empty string on INTEGER).
-func normalizeXuguDefaultExpr(value, dataType string) string {
+// normalizeXuguDefaultExpr only rewrites complete catalog tokens whose Xugu
+// equivalents are known to be semantically identical. In particular, do not
+// lowercase an expression or replace text inside a string literal: exported DDL
+// must preserve metadata when a transformation cannot be proven safe.
+func normalizeXuguDefaultExpr(value, _ string) string {
 	trimmed := strings.TrimSpace(value)
 	if trimmed == "" {
 		return ""
 	}
-	// Some migrated tables store DEF_VAL = '' on numeric columns, which Xugu
-	// rejects as "默认值表达式''错误". Skip those rather than emit invalid SQL.
-	if isXuguEmptyStringLiteral(trimmed) && !isXuguCharacterType(dataType) {
-		return ""
-	}
-	if len(trimmed) >= 2 && trimmed[0] == '"' && trimmed[len(trimmed)-1] == '"' {
-		inner := strings.TrimSpace(trimmed[1 : len(trimmed)-1])
+	if inner, ok := unquoteXuguIdentifier(trimmed); ok {
+		inner = strings.TrimSpace(inner)
 		switch strings.ToUpper(inner) {
 		case "SYSDATE", "CURRENT_DATE", "CURRENT_TIMESTAMP", "CURRENT_TIME", "USER", "UID", "SYS_GUID":
 			return strings.ToUpper(inner)
 		}
 	}
-	lower := strings.ToLower(trimmed)
-	if strings.Contains(lower, "uuid()") {
-		return strings.ReplaceAll(lower, "uuid()", "sys_guid()")
+	// UUID() appears in catalog metadata from supported migrations. Transform
+	// only the entire function token, never a substring inside a literal or a
+	// larger expression.
+	if strings.EqualFold(trimmed, "UUID()") {
+		return "SYS_GUID()"
 	}
 	if strings.EqualFold(trimmed, "(GETDATE())") || strings.EqualFold(trimmed, "sysdate") {
 		return "SYSDATE"
-	}
-	if trimmed == "0000-00-00 00:00:00" {
-		return "'1970-01-01 00:00:00'"
-	}
-	if trimmed == "0000-00-00" {
-		return "'1970-01-01'"
 	}
 	// Catalog sometimes stores unary minus with a space: "- (1)" -> "-1".
 	if compact := compactUnaryMinusDefault(trimmed); compact != "" {
 		return compact
 	}
 	return trimmed
-}
-
-func isXuguEmptyStringLiteral(value string) bool {
-	switch strings.TrimSpace(value) {
-	case "''", `""`, "N''", "n''":
-		return true
-	default:
-		return false
-	}
-}
-
-func isXuguCharacterType(dataType string) bool {
-	upper := strings.ToUpper(strings.TrimSpace(dataType))
-	return strings.Contains(upper, "CHAR") ||
-		strings.Contains(upper, "CLOB") ||
-		strings.Contains(upper, "TEXT") ||
-		strings.Contains(upper, "BINARY") ||
-		strings.Contains(upper, "BLOB") ||
-		strings.Contains(upper, "JSON") ||
-		strings.Contains(upper, "XML")
 }
 
 func compactUnaryMinusDefault(value string) string {
@@ -3354,38 +3343,63 @@ func normalizeXuguColumnType(dataType string, varying any) string {
 	}
 }
 
-var quotedIdentifierRegexp = regexp.MustCompile(`"([^"]+)"`)
 var unaryMinusDefaultRegexp = regexp.MustCompile(`^-\s*\(\s*([0-9]+(?:\.[0-9]+)?)\s*\)$`)
 
+// parseQuotedIdentifiers is a small SQL lexer for delimited identifiers. A
+// doubled double quote represents one quote inside an identifier, so a regular
+// expression such as "([^\"]+)" is insufficient for keys like "a""b".
 func parseQuotedIdentifiers(value string) []string {
-	matches := quotedIdentifierRegexp.FindAllStringSubmatch(value, -1)
-	result := make([]string, 0, len(matches))
-	for _, match := range matches {
-		if len(match) == 2 {
-			result = append(result, match[1])
+	var result []string
+	for i := 0; i < len(value); {
+		if value[i] != '"' {
+			i++
+			continue
 		}
+		identifier, next, ok := readXuguQuotedIdentifier(value, i)
+		if !ok {
+			break
+		}
+		result = append(result, identifier)
+		i = next
 	}
-	return result
+	return emptyIfNil(result)
+}
+
+func unquoteXuguIdentifier(value string) (string, bool) {
+	value = strings.TrimSpace(value)
+	if len(value) < 2 || value[0] != '"' {
+		return "", false
+	}
+	identifier, next, ok := readXuguQuotedIdentifier(value, 0)
+	return identifier, ok && strings.TrimSpace(value[next:]) == ""
+}
+
+func readXuguQuotedIdentifier(value string, start int) (string, int, bool) {
+	if start >= len(value) || value[start] != '"' {
+		return "", start, false
+	}
+	var builder strings.Builder
+	for i := start + 1; i < len(value); i++ {
+		if value[i] != '"' {
+			builder.WriteByte(value[i])
+			continue
+		}
+		if i+1 < len(value) && value[i+1] == '"' {
+			builder.WriteByte('"')
+			i++
+			continue
+		}
+		return builder.String(), i + 1, true
+	}
+	return "", start, false
 }
 
 func parseIndexKeys(value string) []string {
-	quoted := parseQuotedIdentifiers(value)
-	if len(quoted) > 0 {
-		return quoted
-	}
-	parts := strings.Split(value, ",")
-	result := make([]string, 0, len(parts))
-	for _, part := range parts {
-		part = strings.Trim(strings.TrimSpace(part), `"`)
-		if part != "" {
-			result = append(result, part)
-		}
-	}
-	return result
+	return parseIdentifierList(value)
 }
 
 func parseForeignKeyColumns(define string) ([]string, []string) {
-	groups := regexp.MustCompile(`\(([^()]*)\)`).FindAllStringSubmatch(define, -1)
+	groups := xuguParenthesizedGroups(define)
 	if len(groups) < 2 {
 		columns := parseQuotedIdentifiers(define)
 		if len(columns)%2 == 0 {
@@ -3394,7 +3408,96 @@ func parseForeignKeyColumns(define string) ([]string, []string) {
 		}
 		return columns, nil
 	}
-	return parseQuotedIdentifiers(groups[0][1]), parseQuotedIdentifiers(groups[1][1])
+	return parseIdentifierList(groups[0]), parseIdentifierList(groups[1])
+}
+
+func parseIdentifierList(value string) []string {
+	parts := splitXuguTopLevel(value, ',')
+	result := make([]string, 0, len(parts))
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		if identifier, ok := unquoteXuguIdentifier(part); ok {
+			result = append(result, identifier)
+			continue
+		}
+		result = append(result, strings.Trim(part, `"`))
+	}
+	return result
+}
+
+func xuguParenthesizedGroups(value string) []string {
+	var result []string
+	depth, start := 0, -1
+	inQuote := false
+	for i := 0; i < len(value); i++ {
+		if inQuote {
+			if value[i] == '"' {
+				if i+1 < len(value) && value[i+1] == '"' {
+					i++
+				} else {
+					inQuote = false
+				}
+			}
+			continue
+		}
+		switch value[i] {
+		case '"':
+			inQuote = true
+		case '(':
+			if depth == 0 {
+				start = i + 1
+			}
+			depth++
+		case ')':
+			if depth == 0 {
+				continue
+			}
+			depth--
+			if depth == 0 && start >= 0 {
+				result = append(result, value[start:i])
+				start = -1
+			}
+		}
+	}
+	return result
+}
+
+func splitXuguTopLevel(value string, separator byte) []string {
+	var result []string
+	start, depth := 0, 0
+	inQuote := false
+	for i := 0; i < len(value); i++ {
+		if inQuote {
+			if value[i] == '"' {
+				if i+1 < len(value) && value[i+1] == '"' {
+					i++
+				} else {
+					inQuote = false
+				}
+			}
+			continue
+		}
+		switch value[i] {
+		case '"':
+			inQuote = true
+		case '(':
+			depth++
+		case ')':
+			if depth > 0 {
+				depth--
+			}
+		default:
+			if value[i] == separator && depth == 0 {
+				result = append(result, value[start:i])
+				start = i + 1
+			}
+		}
+	}
+	result = append(result, value[start:])
+	return result
 }
 
 func truthy(value any) bool {

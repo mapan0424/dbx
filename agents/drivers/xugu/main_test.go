@@ -648,6 +648,7 @@ func TestIndexSQLUsesLowPrivilegeDictionary(t *testing.T) {
 func TestTableChildMetadataUsesLowPrivilegeDictionary(t *testing.T) {
 	for name, query := range map[string]string{
 		"constraints":   xuguTableConstraintsSQL,
+		"foreign keys":  xuguTableForeignKeysSQL,
 		"partitions":    xuguTablePartitionsSQL,
 		"subpartitions": xuguTableSubpartitionsSQL,
 	} {
@@ -661,6 +662,9 @@ func TestTableChildMetadataUsesLowPrivilegeDictionary(t *testing.T) {
 	}
 	if !strings.Contains(strings.ToUpper(xuguTableConstraintsSQL), "C.CONS_TYPE <> 'F'") {
 		t.Fatalf("generic constraints must exclude foreign keys: %s", xuguTableConstraintsSQL)
+	}
+	if !strings.Contains(strings.ToUpper(xuguTableForeignKeysSQL), "C.CONS_TYPE = 'F'") {
+		t.Fatalf("foreign-key metadata must query only foreign keys: %s", xuguTableForeignKeysSQL)
 	}
 }
 
@@ -857,6 +861,20 @@ func TestParseForeignKeyColumns(t *testing.T) {
 	}
 }
 
+func TestParseQuotedIdentifiersHandlesEscapedQuotesAndDelimiters(t *testing.T) {
+	definition := `("a""b","comma,name","paren(name)")("id""q","ref,code","ref(paren)")`
+	local, ref := parseForeignKeyColumns(definition)
+	if got, want := strings.Join(local, "|"), `a"b|comma,name|paren(name)`; got != want {
+		t.Fatalf("local columns = %q, want %q", got, want)
+	}
+	if got, want := strings.Join(ref, "|"), `id"q|ref,code|ref(paren)`; got != want {
+		t.Fatalf("referenced columns = %q, want %q", got, want)
+	}
+	if got, want := strings.Join(parseIndexKeys(`"a""b","comma,name","paren(name)"`), "|"), `a"b|comma,name|paren(name)`; got != want {
+		t.Fatalf("index keys = %q, want %q", got, want)
+	}
+}
+
 func TestRenderXuguTableDDLPreservesProgrammableTableMetadata(t *testing.T) {
 	amountDefault := "0"
 	description := "child table"
@@ -910,6 +928,58 @@ func TestRenderXuguTableDDLPreservesProgrammableTableMetadata(t *testing.T) {
 	}
 	if strings.Contains(createBody, "FOREIGN KEY") {
 		t.Fatalf("foreign keys must not be inlined in CREATE TABLE:\n%s", ddl)
+	}
+}
+
+func TestBuildTableDDLReadsForeignKeysFromCatalog(t *testing.T) {
+	db, err := sql.Open("xugu-test-table-ddl", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	s := newServer()
+	s.db = db
+	ddl, err := s.buildTableDDL("APP", "CHILD")
+	if err != nil {
+		t.Fatalf("build table DDL: %v", err)
+	}
+
+	want := `ALTER TABLE "APP"."CHILD" ADD CONSTRAINT "FK_CHILD_PARENT" FOREIGN KEY ("PARENT_ID") REFERENCES "APP"."PARENT" ("ID") ON UPDATE NO ACTION ON DELETE CASCADE NOT DEFERRABLE`
+	if !strings.Contains(ddl, want) {
+		t.Fatalf("catalog foreign key missing from reconstructed DDL:\n%s", ddl)
+	}
+	createBody := ddl[:strings.Index(ddl, "ALTER TABLE")]
+	if strings.Contains(createBody, "FOREIGN KEY") {
+		t.Fatalf("catalog foreign key must be emitted after CREATE TABLE:\n%s", ddl)
+	}
+	foreignKeys, err := s.listForeignKeys("APP", "CHILD")
+	if err != nil || len(foreignKeys) != 1 || foreignKeys[0].Name != "FK_CHILD_PARENT" {
+		t.Fatalf("dedicated foreign-key catalog query = %#v, err=%v", foreignKeys, err)
+	}
+}
+
+func TestDDLMetadataLexerPreservesQuotedConstraintAndIndexColumns(t *testing.T) {
+	constraints := []xuguConstraintInfo{
+		{Name: `PK"quoted`, Type: "P", Definition: `"id""value"`},
+		{Name: `UK,quoted`, Type: "U", Definition: `"comma,name","paren(name)"`},
+		{
+			Name: `FK"quoted`, Type: "F", Definition: `("child""id","child,name")("parent""id","parent,name")`,
+			ReferenceSchema: `App"Schema`, ReferenceTable: `Parent,Table`, UpdateAction: "n", DeleteAction: "c",
+		},
+	}
+	ddl := renderXuguTableDDL("APP", "CHILD", []columnInfo{{Name: `id"value`, DataType: "INTEGER", IsNullable: false}}, xuguTableMetadata{}, nil, constraints, nil, nil)
+	for _, want := range []string{
+		`CONSTRAINT "PK""quoted" PRIMARY KEY ("id""value")`,
+		`CONSTRAINT "UK,quoted" UNIQUE ("comma,name","paren(name)")`,
+		`ALTER TABLE "APP"."CHILD" ADD CONSTRAINT "FK""quoted" FOREIGN KEY ("child""id", "child,name") REFERENCES "App""Schema"."Parent,Table" ("parent""id", "parent,name")`,
+	} {
+		if !strings.Contains(ddl, want) {
+			t.Fatalf("DDL missing escaped identifier fragment %q:\n%s", want, ddl)
+		}
+	}
+	if !shouldSkipIndexForTableDDL(indexInfo{Name: "UK_BACKING", Columns: []string{"comma,name", "paren(name)"}, IsUnique: true}, uniqueKeyColumnSets(constraints)) {
+		t.Fatal("unique index with quoted comma/parenthesis columns should match its UNIQUE constraint")
 	}
 }
 
@@ -1064,12 +1134,14 @@ func TestNormalizeXuguDefaultExpr(t *testing.T) {
 		{in: `"sysdate"`, dataType: "DATETIME", want: "SYSDATE"},
 		{in: "SYSDATE", dataType: "DATETIME", want: "SYSDATE"},
 		{in: "(GETDATE())", dataType: "DATETIME", want: "SYSDATE"},
-		{in: "uuid()", dataType: "CHAR", want: "sys_guid()"},
-		{in: "0000-00-00 00:00:00", dataType: "DATETIME", want: "'1970-01-01 00:00:00'"},
-		{in: "0000-00-00", dataType: "DATE", want: "'1970-01-01'"},
+		{in: "uuid()", dataType: "CHAR", want: "SYS_GUID()"},
+		{in: "'UUID()'", dataType: "VARCHAR", want: "'UUID()'"},
+		{in: "CASE WHEN flag = 1 THEN 'UUID()' ELSE 'x' END", dataType: "VARCHAR", want: "CASE WHEN flag = 1 THEN 'UUID()' ELSE 'x' END"},
+		{in: "0000-00-00 00:00:00", dataType: "DATETIME", want: "0000-00-00 00:00:00"},
+		{in: "0000-00-00", dataType: "DATE", want: "0000-00-00"},
 		{in: "'plain'", dataType: "VARCHAR", want: "'plain'"},
 		{in: "0", dataType: "INTEGER", want: "0"},
-		{in: "''", dataType: "INTEGER", want: ""},
+		{in: "''", dataType: "INTEGER", want: "''"},
 		{in: "''", dataType: "VARCHAR", want: "''"},
 		{in: "- (1)", dataType: "INTEGER", want: "-1"},
 	}
@@ -1169,6 +1241,54 @@ func init() {
 	sql.Register("xugu-test-fast", &xuguFastDriver{})
 	sql.Register("xugu-test-legacy-columns", &xuguLegacyColumnsDriver{})
 	sql.Register("xugu-test-table-objects", &xuguTableObjectsDriver{})
+	sql.Register("xugu-test-table-ddl", &xuguTableDDLDriver{})
+}
+
+type xuguTableDDLDriver struct{}
+
+func (d *xuguTableDDLDriver) Open(name string) (driver.Conn, error) {
+	return &xuguTableDDLConn{}, nil
+}
+
+type xuguTableDDLConn struct{}
+
+func (c *xuguTableDDLConn) Prepare(query string) (driver.Stmt, error) {
+	return nil, errors.New("not supported")
+}
+func (c *xuguTableDDLConn) Close() error              { return nil }
+func (c *xuguTableDDLConn) Begin() (driver.Tx, error) { return nil, errors.New("not supported") }
+func (c *xuguTableDDLConn) QueryContext(_ context.Context, query string, _ []driver.NamedValue) (driver.Rows, error) {
+	upper := strings.ToUpper(query)
+	constraintColumns := []string{"CONS_NAME", "CONS_TYPE", "DEFINE", "SCHEMA_NAME", "TABLE_NAME", "MATCH_TYPE", "UPDATE_ACTION", "DELETE_ACTION", "DEFERRABLE", "INITDEFERRED", "ENABLE", "VALID"}
+	switch {
+	case strings.Contains(upper, "C.CONS_TYPE = 'P'"):
+		return &xuguStaticRows{columns: []string{"DEFINE"}, values: [][]driver.Value{{`"ID"`}}}, nil
+	case strings.Contains(upper, "C.CONS_TYPE <> 'F'"):
+		return &xuguStaticRows{columns: constraintColumns, values: [][]driver.Value{{"PK_CHILD", "P", `"ID"`, nil, nil, nil, nil, nil, false, false, true, true}}}, nil
+	case strings.Contains(upper, "C.CONS_TYPE = 'F'"):
+		return &xuguStaticRows{columns: constraintColumns, values: [][]driver.Value{{"FK_CHILD_PARENT", "F", `("PARENT_ID")("ID")`, "APP", "PARENT", "U", "n", "c", false, false, true, true}}}, nil
+	case strings.Contains(upper, "C.IS_SERIAL"):
+		return &xuguStaticRows{columns: []string{"COL_NAME", "MIN_VAL", "STEP_VAL"}}, nil
+	case strings.Contains(upper, "FROM ALL_COLUMNS"):
+		return &xuguStaticRows{
+			columns: []string{"COL_NAME", "TYPE_NAME", "NOT_NULL", "DEF_VAL", "ON_NULL", "COMMENTS", "SCALE", "VARYING"},
+			values: [][]driver.Value{
+				{"ID", "INTEGER", true, nil, int64(0), nil, int64(-1), false},
+				{"PARENT_ID", "INTEGER", false, nil, int64(0), nil, int64(-1), false},
+			},
+		}, nil
+	case strings.Contains(upper, "T.TEMP_TYPE"):
+		return &xuguStaticRows{
+			columns: []string{"TEMP_TYPE", "ON_COMMIT_DEL", "PCTFREE", "COPY_NUM", "PARTI_TYPE", "PARTI_NUM", "PARTI_KEY", "AUTO_PARTI_TYPE", "AUTO_PARTI_SPAN", "SUBPARTI_TYPE", "SUBPARTI_NUM", "SUBPARTI_KEY", "COMMENTS"},
+			values:  [][]driver.Value{{int64(0), false, int64(0), int64(0), int64(0), int64(0), nil, int64(0), int64(0), int64(0), int64(0), nil, nil}},
+		}, nil
+	case strings.Contains(upper, "FROM ALL_PARTIS"):
+		return &xuguStaticRows{columns: []string{"PARTI_NO", "PARTI_NAME", "PARTI_VAL", "ONLINE", "PARTI_TYPE", "PARTI_KEY", "AUTO_PARTI_TYPE", "AUTO_PARTI_SPAN"}}, nil
+	case strings.Contains(upper, "FROM ALL_SUBPARTIS"):
+		return &xuguStaticRows{columns: []string{"SUBPARTI_NO", "SUBPARTI_NAME", "SUBPARTI_VAL", "SUBPARTI_TYPE", "SUBPARTI_KEY"}}, nil
+	default:
+		return nil, fmt.Errorf("unexpected DDL catalog query: %s", query)
+	}
 }
 
 type xuguTableObjectsDriver struct{}
