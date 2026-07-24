@@ -39,9 +39,7 @@ async function setup(dbType: ConnectionConfig["db_type"], overrides: Record<stri
     deleteSchemaCachePrefix: vi.fn().mockResolvedValue(undefined),
     listConstraints: vi.fn().mockResolvedValue([]),
     listInstalledAgents: vi.fn().mockResolvedValue([]),
-    listInstalledAgentsLocal: vi.fn().mockResolvedValue([
-      { db_type: "xugu", installed: true, installed_version: "0.1.23" },
-    ]),
+    listInstalledAgentsLocal: vi.fn().mockResolvedValue([{ db_type: "xugu", installed: true, installed_version: "0.1.23" }]),
     listPartitions: vi.fn().mockResolvedValue([]),
     listSubpartitions: vi.fn().mockResolvedValue([]),
     loadSchemaCache: vi.fn().mockResolvedValue(null),
@@ -109,9 +107,7 @@ describe("connectionStore Xugu table child metadata", () => {
 
   it("hides Xugu-only groups when the installed Agent predates their metadata methods", async () => {
     const { store, tableId } = await setup("xugu", {
-      listInstalledAgentsLocal: vi.fn().mockResolvedValue([
-        { db_type: "xugu", installed: true, installed_version: "0.1.22" },
-      ]),
+      listInstalledAgentsLocal: vi.fn().mockResolvedValue([{ db_type: "xugu", installed: true, installed_version: "0.1.22" }]),
     });
 
     const childTypes = findNode(store.treeNodes, tableId)?.children?.map((node) => node.type);

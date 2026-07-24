@@ -3831,7 +3831,7 @@ export const useConnectionStore = defineStore("connection", () => {
     const effectiveDbType = effectiveDatabaseTypeForConnection(config);
     const metadataCapabilities = getTableMetadataCapabilities(effectiveDbType);
     const isXugu = effectiveDbType === "xugu";
-    const supportsXuguChildMetadata = isXugu && node.type === "table" && await supportsXuguTableChildMetadata();
+    const supportsXuguChildMetadata = isXugu && node.type === "table" && (await supportsXuguTableChildMetadata());
     if (supportsXuguChildMetadata) {
       children.push({
         id: `${parentId}:__constraints`,

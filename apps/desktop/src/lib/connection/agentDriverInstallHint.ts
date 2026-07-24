@@ -20,9 +20,7 @@ export function hasInstalledAgentVersion(drivers: readonly AgentDriverInstallSta
   const installed = parse(installedVersion);
   const minimum = parse(minimumVersion);
   if (!installed || !minimum) return false;
-  return installed[0] > minimum[0]
-    || (installed[0] === minimum[0] && (installed[1] > minimum[1]
-      || (installed[1] === minimum[1] && installed[2] >= minimum[2])));
+  return installed[0] > minimum[0] || (installed[0] === minimum[0] && (installed[1] > minimum[1] || (installed[1] === minimum[1] && installed[2] >= minimum[2])));
 }
 
 export function agentDriverInstallKey(dbType: DatabaseType | undefined, driverProfile?: string): string | undefined {
