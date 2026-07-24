@@ -1113,6 +1113,7 @@ func TestShouldSkipIndexForTableDDL(t *testing.T) {
 	}{
 		{name: "primary index", index: indexInfo{Name: "PK_IDX", Columns: []string{"ID"}, IsPrimary: true, IsUnique: true}, skip: true},
 		{name: "unique constraint backing index", index: indexInfo{Name: "UK_IDX", Columns: []string{"CODE"}, IsUnique: true}, skip: true},
+		{name: "quoted case-distinct unique index", index: indexInfo{Name: "UK_IDX_CASE", Columns: []string{"Code"}, IsUnique: true}, skip: false},
 		{name: "non-unique secondary index", index: indexInfo{Name: "IX_NAME", Columns: []string{"NAME"}, IsUnique: false}, skip: false},
 		{name: "unique index on other columns", index: indexInfo{Name: "UX_OTHER", Columns: []string{"OTHER"}, IsUnique: true}, skip: false},
 		{name: "empty columns", index: indexInfo{Name: "BAD", Columns: nil, IsUnique: true}, skip: true},
@@ -1183,6 +1184,85 @@ func TestQuoteIdentifierPreservesCase(t *testing.T) {
 	for _, tt := range tests {
 		if got := quoteIdentifier(tt.in); got != tt.want {
 			t.Fatalf("quoteIdentifier(%q) = %s, want %s", tt.in, got, tt.want)
+		}
+	}
+}
+
+func TestSelectXuguCatalogTableNamePrefersExactCaseAndRejectsAmbiguity(t *testing.T) {
+	candidates := []xuguCatalogTableName{
+		{Schema: "SYSDBA", Table: "DBX_CASE_TABLE"},
+		{Schema: "SYSDBA", Table: "dbx_case_table"},
+	}
+
+	schema, table, err := selectXuguCatalogTableName("SYSDBA", "dbx_case_table", candidates)
+	if err != nil || schema != "SYSDBA" || table != "dbx_case_table" {
+		t.Fatalf("exact-case selection = (%q, %q, %v), want lower-case catalog table", schema, table, err)
+	}
+
+	if _, _, err := selectXuguCatalogTableName("SYSDBA", "Dbx_Case_Table", candidates); err == nil || !strings.Contains(err.Error(), "ambiguous") {
+		t.Fatalf("mixed-case ambiguous selection error = %v, want ambiguity error", err)
+	}
+
+	schema, table, err = selectXuguCatalogTableName("sysdba", "dbx_plain_table", []xuguCatalogTableName{{Schema: "SYSDBA", Table: "DBX_PLAIN_TABLE"}})
+	if err != nil || schema != "SYSDBA" || table != "DBX_PLAIN_TABLE" {
+		t.Fatalf("single-candidate fallback = (%q, %q, %v), want catalog spelling", schema, table, err)
+	}
+}
+
+func TestCatalogTableLookupQueriesAvoidCaseFoldingBoundParameters(t *testing.T) {
+	exact := xuguCatalogTableNameQuery("S'CHEMA", "MiX'ed", false)
+	if strings.Contains(strings.ToUpper(exact), "UPPER(") {
+		t.Fatalf("exact catalog lookup must not case-fold identifiers:\n%s", exact)
+	}
+	if !strings.Contains(exact, "s.SCHEMA_NAME = 'S''CHEMA'") || !strings.Contains(exact, "t.TABLE_NAME = 'MiX''ed'") {
+		t.Fatalf("exact catalog lookup must escape and preserve identifier spelling:\n%s", exact)
+	}
+
+	folded := xuguCatalogTableNameQuery("S'CHEMA", "MiX'ed", true)
+	if strings.Contains(folded, "UPPER(?)") {
+		t.Fatalf("case-insensitive lookup must not call UPPER(?) on bound parameters:\n%s", folded)
+	}
+	for _, fragment := range []string{"UPPER(s.SCHEMA_NAME) = 'S''CHEMA'", "UPPER(t.TABLE_NAME) = 'MIX''ED'"} {
+		if !strings.Contains(folded, fragment) {
+			t.Fatalf("case-insensitive lookup missing %q:\n%s", fragment, folded)
+		}
+	}
+}
+
+func TestTableDDLCatalogQueriesUseExactIdentifiers(t *testing.T) {
+	queries := map[string]string{
+		"primary key":    xuguPrimaryKeyColumnsSQL,
+		"columns":        xuguListColumnsSQL,
+		"legacy columns": xuguLegacyListColumnsSQL,
+		"indexes":        xuguListIndexesSQL,
+		"table metadata": xuguTableMetadataSQL,
+		"identities":     xuguTableIdentitySQL,
+		"constraints":    xuguTableConstraintsSQL,
+		"foreign keys":   xuguTableForeignKeysSQL,
+		"partitions":     xuguTablePartitionsSQL,
+		"subpartitions":  xuguTableSubpartitionsSQL,
+	}
+	for name, query := range queries {
+		t.Run(name, func(t *testing.T) {
+			upper := strings.ToUpper(query)
+			if strings.Contains(upper, "UPPER(S.SCHEMA_NAME)") || strings.Contains(upper, "UPPER(T.TABLE_NAME)") {
+				t.Fatalf("%s query must not case-fold resolved catalog identifiers:\n%s", name, query)
+			}
+			if !strings.Contains(query, "s.SCHEMA_NAME = ?") || !strings.Contains(query, "t.TABLE_NAME = ?") {
+				t.Fatalf("%s query must match resolved catalog identifiers exactly:\n%s", name, query)
+			}
+		})
+	}
+}
+
+func TestTableCatalogQueryEscapesAndPreservesMixedCaseIdentifiers(t *testing.T) {
+	query := xuguTableCatalogQuery(xuguListColumnsSQL, "MiX'Schema", "TaB'le")
+	if strings.Contains(query, "?") {
+		t.Fatalf("resolved table metadata query must not retain bound identifier placeholders:\n%s", query)
+	}
+	for _, want := range []string{"s.SCHEMA_NAME = 'MiX''Schema'", "t.TABLE_NAME = 'TaB''le'"} {
+		if !strings.Contains(query, want) {
+			t.Fatalf("resolved table metadata query missing %q:\n%s", want, query)
 		}
 	}
 }
@@ -1261,6 +1341,8 @@ func (c *xuguTableDDLConn) QueryContext(_ context.Context, query string, _ []dri
 	upper := strings.ToUpper(query)
 	constraintColumns := []string{"CONS_NAME", "CONS_TYPE", "DEFINE", "SCHEMA_NAME", "TABLE_NAME", "MATCH_TYPE", "UPDATE_ACTION", "DELETE_ACTION", "DEFERRABLE", "INITDEFERRED", "ENABLE", "VALID"}
 	switch {
+	case strings.Contains(upper, "SELECT S.SCHEMA_NAME, T.TABLE_NAME") && strings.Contains(upper, "FROM ALL_TABLES"):
+		return &xuguStaticRows{columns: []string{"SCHEMA_NAME", "TABLE_NAME"}, values: [][]driver.Value{{"APP", "CHILD"}}}, nil
 	case strings.Contains(upper, "C.CONS_TYPE = 'P'"):
 		return &xuguStaticRows{columns: []string{"DEFINE"}, values: [][]driver.Value{{`"ID"`}}}, nil
 	case strings.Contains(upper, "C.CONS_TYPE <> 'F'"):
@@ -1345,6 +1427,8 @@ func (c *xuguLegacyColumnsConn) Begin() (driver.Tx, error) { return nil, errors.
 func (c *xuguLegacyColumnsConn) QueryContext(_ context.Context, query string, _ []driver.NamedValue) (driver.Rows, error) {
 	upper := strings.ToUpper(query)
 	switch {
+	case strings.Contains(upper, "SELECT S.SCHEMA_NAME, T.TABLE_NAME") && strings.Contains(upper, "FROM ALL_TABLES"):
+		return &xuguStaticRows{columns: []string{"SCHEMA_NAME", "TABLE_NAME"}, values: [][]driver.Value{{"SYSDBA", "PRODUCTS"}}}, nil
 	case strings.Contains(upper, "ALL_CONSTRAINTS"):
 		return &xuguStaticRows{columns: []string{"DEFINE"}, values: [][]driver.Value{{`PRIMARY KEY ("PRODUCT_ID")`}}}, nil
 	case strings.Contains(upper, "ON_NULL"):

@@ -34,21 +34,25 @@ const xuguListSchemasSQL = `
 SELECT SCHEMA_NAME
 FROM ALL_SCHEMAS
 ORDER BY SCHEMA_NAME`
+const xuguCatalogTableNameSelectSQL = `
+SELECT s.SCHEMA_NAME, t.TABLE_NAME
+FROM ALL_TABLES t
+JOIN ALL_SCHEMAS s ON s.DB_ID = t.DB_ID AND s.SCHEMA_ID = t.SCHEMA_ID`
 const xuguPrimaryKeyColumnsSQL = `
 SELECT c.DEFINE
 FROM ALL_CONSTRAINTS c
 JOIN ALL_TABLES t ON t.DB_ID = c.DB_ID AND t.TABLE_ID = c.TABLE_ID
 JOIN ALL_SCHEMAS s ON s.DB_ID = t.DB_ID AND s.SCHEMA_ID = t.SCHEMA_ID
-WHERE UPPER(s.SCHEMA_NAME) = UPPER(?)
-  AND UPPER(t.TABLE_NAME) = UPPER(?)
+WHERE s.SCHEMA_NAME = ?
+  AND t.TABLE_NAME = ?
   AND c.CONS_TYPE = 'P'`
 const xuguListColumnsSQL = `
 SELECT c.COL_NAME, c.TYPE_NAME, c.NOT_NULL, c.DEF_VAL, c.ON_NULL, c.COMMENTS, c.SCALE, c."VARYING"
 FROM ALL_COLUMNS c
 JOIN ALL_TABLES t ON t.DB_ID = c.DB_ID AND t.TABLE_ID = c.TABLE_ID
 JOIN ALL_SCHEMAS s ON s.DB_ID = t.DB_ID AND s.SCHEMA_ID = t.SCHEMA_ID
-WHERE UPPER(s.SCHEMA_NAME) = UPPER(?)
-  AND UPPER(t.TABLE_NAME) = UPPER(?)
+WHERE s.SCHEMA_NAME = ?
+  AND t.TABLE_NAME = ?
   AND (c.IS_HIDE IS NULL OR c.IS_HIDE = FALSE)
 ORDER BY c.COL_NO`
 const xuguLegacyListColumnsSQL = `
@@ -56,8 +60,8 @@ SELECT c.COL_NAME, c.TYPE_NAME, c.NOT_NULL, c.DEF_VAL, c.COMMENTS, c.SCALE, c."V
 FROM ALL_COLUMNS c
 JOIN ALL_TABLES t ON t.DB_ID = c.DB_ID AND t.TABLE_ID = c.TABLE_ID
 JOIN ALL_SCHEMAS s ON s.DB_ID = t.DB_ID AND s.SCHEMA_ID = t.SCHEMA_ID
-WHERE UPPER(s.SCHEMA_NAME) = UPPER(?)
-  AND UPPER(t.TABLE_NAME) = UPPER(?)
+WHERE s.SCHEMA_NAME = ?
+  AND t.TABLE_NAME = ?
   AND (c.IS_HIDE IS NULL OR c.IS_HIDE = FALSE)
 ORDER BY c.COL_NO`
 const xuguListIndexesSQL = `
@@ -65,8 +69,8 @@ SELECT i.INDEX_NAME, i.KEYS, i.IS_UNIQUE, i.IS_PRIMARY, i.INDEX_TYPE, i.FILTER
 FROM ALL_INDEXES i
 JOIN ALL_TABLES t ON t.DB_ID = i.DB_ID AND t.TABLE_ID = i.TABLE_ID
 JOIN ALL_SCHEMAS s ON s.DB_ID = t.DB_ID AND s.SCHEMA_ID = t.SCHEMA_ID
-WHERE UPPER(s.SCHEMA_NAME) = UPPER(?)
-  AND UPPER(t.TABLE_NAME) = UPPER(?)
+WHERE s.SCHEMA_NAME = ?
+  AND t.TABLE_NAME = ?
 ORDER BY i.INDEX_NAME`
 const xuguTableMetadataSQL = `
 SELECT t.TEMP_TYPE, t.ON_COMMIT_DEL, t.PCTFREE, t.COPY_NUM,
@@ -75,16 +79,16 @@ SELECT t.TEMP_TYPE, t.ON_COMMIT_DEL, t.PCTFREE, t.COPY_NUM,
        t.SUBPARTI_TYPE, t.SUBPARTI_NUM, t.SUBPARTI_KEY, t.COMMENTS
 FROM ALL_TABLES t
 JOIN ALL_SCHEMAS s ON s.DB_ID = t.DB_ID AND s.SCHEMA_ID = t.SCHEMA_ID
-WHERE UPPER(s.SCHEMA_NAME) = UPPER(?)
-  AND UPPER(t.TABLE_NAME) = UPPER(?)`
+WHERE s.SCHEMA_NAME = ?
+  AND t.TABLE_NAME = ?`
 const xuguTableIdentitySQL = `
 SELECT c.COL_NAME, q.MIN_VAL, q.STEP_VAL
 FROM ALL_COLUMNS c
 JOIN ALL_TABLES t ON t.DB_ID = c.DB_ID AND t.TABLE_ID = c.TABLE_ID
 JOIN ALL_SCHEMAS s ON s.DB_ID = t.DB_ID AND s.SCHEMA_ID = t.SCHEMA_ID
 JOIN ALL_SEQUENCES q ON q.DB_ID = c.DB_ID AND q.SEQ_ID = c.SERIAL_ID
-WHERE UPPER(s.SCHEMA_NAME) = UPPER(?)
-  AND UPPER(t.TABLE_NAME) = UPPER(?)
+WHERE s.SCHEMA_NAME = ?
+  AND t.TABLE_NAME = ?
   AND c.IS_SERIAL = TRUE`
 const xuguTableConstraintsSQL = `
 SELECT c.CONS_NAME, c.CONS_TYPE, c.DEFINE,
@@ -96,8 +100,8 @@ JOIN ALL_TABLES t ON t.DB_ID = c.DB_ID AND t.TABLE_ID = c.TABLE_ID
 JOIN ALL_SCHEMAS s ON s.DB_ID = t.DB_ID AND s.SCHEMA_ID = t.SCHEMA_ID
 LEFT JOIN ALL_TABLES rt ON rt.DB_ID = c.DB_ID AND rt.TABLE_ID = c.REF_TABLE_ID
 LEFT JOIN ALL_SCHEMAS rs ON rs.DB_ID = rt.DB_ID AND rs.SCHEMA_ID = rt.SCHEMA_ID
-WHERE UPPER(s.SCHEMA_NAME) = UPPER(?)
-  AND UPPER(t.TABLE_NAME) = UPPER(?)
+WHERE s.SCHEMA_NAME = ?
+  AND t.TABLE_NAME = ?
   AND c.CONS_TYPE <> 'F'
 ORDER BY c.CONS_NAME`
 
@@ -114,8 +118,8 @@ JOIN ALL_TABLES t ON t.DB_ID = c.DB_ID AND t.TABLE_ID = c.TABLE_ID
 JOIN ALL_SCHEMAS s ON s.DB_ID = t.DB_ID AND s.SCHEMA_ID = t.SCHEMA_ID
 LEFT JOIN ALL_TABLES rt ON rt.DB_ID = c.DB_ID AND rt.TABLE_ID = c.REF_TABLE_ID
 LEFT JOIN ALL_SCHEMAS rs ON rs.DB_ID = rt.DB_ID AND rs.SCHEMA_ID = rt.SCHEMA_ID
-WHERE UPPER(s.SCHEMA_NAME) = UPPER(?)
-  AND UPPER(t.TABLE_NAME) = UPPER(?)
+WHERE s.SCHEMA_NAME = ?
+  AND t.TABLE_NAME = ?
   AND c.CONS_TYPE = 'F'
 ORDER BY c.CONS_NAME`
 const xuguTablePartitionsSQL = `
@@ -124,8 +128,8 @@ SELECT p.PARTI_NO, p.PARTI_NAME, p.PARTI_VAL, p.ONLINE,
 FROM ALL_PARTIS p
 JOIN ALL_TABLES t ON t.DB_ID = p.DB_ID AND t.TABLE_ID = p.TABLE_ID
 JOIN ALL_SCHEMAS s ON s.DB_ID = t.DB_ID AND s.SCHEMA_ID = t.SCHEMA_ID
-WHERE UPPER(s.SCHEMA_NAME) = UPPER(?)
-  AND UPPER(t.TABLE_NAME) = UPPER(?)
+WHERE s.SCHEMA_NAME = ?
+  AND t.TABLE_NAME = ?
 ORDER BY p.PARTI_NO`
 const xuguTableSubpartitionsSQL = `
 SELECT p.SUBPARTI_NO, p.SUBPARTI_NAME, p.SUBPARTI_VAL,
@@ -133,8 +137,8 @@ SELECT p.SUBPARTI_NO, p.SUBPARTI_NAME, p.SUBPARTI_VAL,
 FROM ALL_SUBPARTIS p
 JOIN ALL_TABLES t ON t.DB_ID = p.DB_ID AND t.TABLE_ID = p.TABLE_ID
 JOIN ALL_SCHEMAS s ON s.DB_ID = t.DB_ID AND s.SCHEMA_ID = t.SCHEMA_ID
-WHERE UPPER(s.SCHEMA_NAME) = UPPER(?)
-  AND UPPER(t.TABLE_NAME) = UPPER(?)
+WHERE s.SCHEMA_NAME = ?
+  AND t.TABLE_NAME = ?
 ORDER BY p.SUBPARTI_NO`
 
 var xuguDataTypes = []string{
@@ -1711,11 +1715,11 @@ func xuguFuzzyLikePattern(value string) string {
 }
 
 func (s *server) getColumns(schema, table string) ([]columnInfo, error) {
-	schema, err := s.normalizeSchema(schema)
+	catalogSchema, catalogTable, err := s.resolveCatalogTableName(schema, table)
 	if err != nil {
 		return nil, err
 	}
-	table = strings.ToUpper(strings.TrimSpace(table))
+	schema, table = catalogSchema, catalogTable
 	primaryKeys, err := s.primaryKeyColumns(schema, table)
 	if err != nil {
 		return nil, err
@@ -1746,7 +1750,7 @@ func (s *server) getColumns(schema, table string) ([]columnInfo, error) {
 		item.DataType = normalizeXuguColumnType(item.DataType, varying)
 		item.IsNullable = !truthy(notNull)
 		item.DefaultOnNull = xuguInt(onNull)
-		item.IsPrimaryKey = primaryKeys[strings.ToUpper(item.Name)]
+		item.IsPrimaryKey = primaryKeys[item.Name]
 		item.NumericPrecision, item.NumericScale, item.CharacterMaximumLength = decodeXuguScale(item.DataType, scale)
 		result = append(result, item)
 	}
@@ -1754,15 +1758,14 @@ func (s *server) getColumns(schema, table string) ([]columnInfo, error) {
 }
 
 func (s *server) queryColumnRows(schema, table string) (*sql.Rows, bool, error) {
-	args := []any{schema, table}
-	rows, err := s.queryRows(xuguListColumnsSQL, args)
+	rows, err := s.queryRows(xuguTableCatalogQuery(xuguListColumnsSQL, schema, table), nil)
 	if err == nil {
 		return rows, true, nil
 	}
 	if !isXuguMissingOnNullColumnError(err) {
 		return nil, false, err
 	}
-	rows, err = s.queryRows(xuguLegacyListColumnsSQL, args)
+	rows, err = s.queryRows(xuguTableCatalogQuery(xuguLegacyListColumnsSQL, schema, table), nil)
 	return rows, false, err
 }
 
@@ -1784,7 +1787,7 @@ func (s *server) columnsFromSelect(schema, table string, primaryKeys map[string]
 		item := columnInfo{
 			Name:         columnType.Name(),
 			DataType:     columnType.DatabaseTypeName(),
-			IsPrimaryKey: primaryKeys[strings.ToUpper(columnType.Name())],
+			IsPrimaryKey: primaryKeys[columnType.Name()],
 		}
 		if nullable, ok := columnType.Nullable(); ok {
 			item.IsNullable = nullable
@@ -1801,7 +1804,7 @@ func (s *server) columnsFromSelect(schema, table string, primaryKeys map[string]
 }
 
 func (s *server) primaryKeyColumns(schema, table string) (map[string]bool, error) {
-	rows, err := s.queryRows(xuguPrimaryKeyColumnsSQL, []any{schema, table})
+	rows, err := s.queryRows(xuguTableCatalogQuery(xuguPrimaryKeyColumnsSQL, schema, table), nil)
 	if err != nil {
 		if isXuguMetadataAccessError(err) {
 			return map[string]bool{}, nil
@@ -1816,19 +1819,18 @@ func (s *server) primaryKeyColumns(schema, table string) (map[string]bool, error
 			return nil, err
 		}
 		for _, column := range parseQuotedIdentifiers(define) {
-			result[strings.ToUpper(column)] = true
+			result[column] = true
 		}
 	}
 	return result, rows.Err()
 }
 
 func (s *server) listIndexes(schema, table string) ([]indexInfo, error) {
-	schema, err := s.normalizeSchema(schema)
+	catalogSchema, catalogTable, err := s.resolveCatalogTableName(schema, table)
 	if err != nil {
 		return nil, err
 	}
-	table = strings.ToUpper(strings.TrimSpace(table))
-	rows, err := s.queryRows(xuguListIndexesSQL, []any{schema, table})
+	rows, err := s.queryRows(xuguTableCatalogQuery(xuguListIndexesSQL, catalogSchema, catalogTable), nil)
 	if err != nil {
 		if isXuguMetadataAccessError(err) {
 			return []indexInfo{}, nil
@@ -2015,11 +2017,19 @@ func (s *server) getObjectSource(schema, name, objectType string) (map[string]an
 }
 
 func (s *server) getTableDDL(schema, table string) (string, error) {
-	// Resolve the catalog's stored casing. Metadata lookups are case-insensitive
-	// (UPPER(...)=UPPER(?)), but the emitted DDL must quote the original names so
-	// double-quoted identifiers keep mixed-case schema/table/column spellings.
+	// Resolve the catalog's stored casing before issuing exact metadata lookups,
+	// so emitted DDL quotes the original names and preserves double-quoted
+	// schema/table/column spellings.
+	if strings.TrimSpace(schema) != "" {
+		if err := s.setSchema(schema); err != nil {
+			return "", err
+		}
+	}
 	catalogSchema, catalogTable, err := s.resolveCatalogTableName(schema, table)
 	if err != nil {
+		return "", err
+	}
+	if err := s.setSchema(catalogSchema); err != nil {
 		return "", err
 	}
 	// DBMS_METADATA.GET_DDL can block indefinitely on XuguDB, even when the
@@ -2032,9 +2042,15 @@ func (s *server) getTableDDL(schema, table string) (string, error) {
 	return s.appendTableIndexDDL(catalogSchema, catalogTable, ddl), nil
 }
 
+type xuguCatalogTableName struct {
+	Schema string
+	Table  string
+}
+
 // resolveCatalogTableName returns SCHEMA_NAME/TABLE_NAME exactly as stored in
-// ALL_SCHEMAS/ALL_TABLES. Callers use those values when quoting identifiers in
-// exported DDL so case is preserved under double quotes.
+// ALL_SCHEMAS/ALL_TABLES. The lookup accepts a case-insensitive input only
+// when it has a single catalog candidate; otherwise it requires the exact
+// stored spelling rather than silently exporting a different quoted object.
 func (s *server) resolveCatalogTableName(schema, table string) (string, string, error) {
 	schema = strings.TrimSpace(schema)
 	table = strings.TrimSpace(table)
@@ -2048,27 +2064,79 @@ func (s *server) resolveCatalogTableName(schema, table string) (string, string, 
 	if table == "" {
 		return "", "", errors.New("table is required")
 	}
-	rows, err := s.queryRows(`
-SELECT s.SCHEMA_NAME, t.TABLE_NAME
-FROM ALL_TABLES t
-JOIN ALL_SCHEMAS s ON s.DB_ID = t.DB_ID AND s.SCHEMA_ID = t.SCHEMA_ID
-WHERE UPPER(s.SCHEMA_NAME) = UPPER(?)
-  AND UPPER(t.TABLE_NAME) = UPPER(?)`, []any{schema, table})
+	candidates, err := s.catalogTableNameCandidates(xuguCatalogTableNameQuery(schema, table, false))
 	if err != nil {
 		return "", "", err
 	}
-	defer s.closeRows(rows)
-	if !rows.Next() {
-		if err := rows.Err(); err != nil {
-			return "", "", err
-		}
-		return "", "", fmt.Errorf("table not found: %s.%s", schema, table)
+	if len(candidates) > 0 {
+		return selectXuguCatalogTableName(schema, table, candidates)
 	}
-	var catalogSchema, catalogTable string
-	if err := rows.Scan(&catalogSchema, &catalogTable); err != nil {
+
+	// This Xugu Go driver version does not bind mixed-case identifiers reliably
+	// inside catalog predicates. The query builder escapes literals and keeps the
+	// exact lookup above as the priority; this fallback is only for unquoted input.
+	candidates, err = s.catalogTableNameCandidates(xuguCatalogTableNameQuery(schema, table, true))
+	if err != nil {
 		return "", "", err
 	}
-	return catalogSchema, catalogTable, rows.Err()
+	return selectXuguCatalogTableName(schema, table, candidates)
+}
+
+func xuguCatalogTableNameQuery(schema, table string, caseInsensitive bool) string {
+	schemaExpr := quoteStringLiteral(schema)
+	tableExpr := quoteStringLiteral(table)
+	if caseInsensitive {
+		schemaExpr = quoteStringLiteral(strings.ToUpper(schema))
+		tableExpr = quoteStringLiteral(strings.ToUpper(table))
+		return xuguCatalogTableNameSelectSQL + "\nWHERE UPPER(s.SCHEMA_NAME) = " + schemaExpr +
+			"\n  AND UPPER(t.TABLE_NAME) = " + tableExpr
+	}
+	return xuguCatalogTableNameSelectSQL + "\nWHERE s.SCHEMA_NAME = " + schemaExpr +
+		"\n  AND t.TABLE_NAME = " + tableExpr
+}
+
+// xuguTableCatalogQuery substitutes the two schema/table placeholders used by
+// the table metadata templates. Xugu's Go driver does not reliably bind
+// mixed-case catalog identifiers, so values are escaped as SQL literals only
+// after resolveCatalogTableName has located the intended catalog object.
+func xuguTableCatalogQuery(query, schema, table string) string {
+	query = strings.Replace(query, "?", quoteStringLiteral(schema), 1)
+	return strings.Replace(query, "?", quoteStringLiteral(table), 1)
+}
+
+func (s *server) catalogTableNameCandidates(query string) ([]xuguCatalogTableName, error) {
+	rows, err := s.queryRows(strings.TrimSpace(query), nil)
+	if err != nil {
+		return nil, err
+	}
+	defer s.closeRows(rows)
+	var candidates []xuguCatalogTableName
+	for rows.Next() {
+		var candidate xuguCatalogTableName
+		if err := rows.Scan(&candidate.Schema, &candidate.Table); err != nil {
+			return nil, err
+		}
+		candidates = append(candidates, candidate)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return candidates, nil
+}
+
+func selectXuguCatalogTableName(schema, table string, candidates []xuguCatalogTableName) (string, string, error) {
+	for _, candidate := range candidates {
+		if candidate.Schema == schema && candidate.Table == table {
+			return candidate.Schema, candidate.Table, nil
+		}
+	}
+	if len(candidates) == 1 {
+		return candidates[0].Schema, candidates[0].Table, nil
+	}
+	if len(candidates) == 0 {
+		return "", "", fmt.Errorf("table not found: %s.%s", schema, table)
+	}
+	return "", "", fmt.Errorf("table name is ambiguous: %s.%s; specify the catalog's exact case", schema, table)
 }
 
 func (s *server) getExplainInfo(sqlText string) (string, error) {
@@ -2579,7 +2647,7 @@ func (s *server) buildTableDDL(schema, table string) (string, error) {
 }
 
 func (s *server) tableMetadata(schema, table string) (xuguTableMetadata, error) {
-	rows, err := s.queryRows(xuguTableMetadataSQL, []any{schema, table})
+	rows, err := s.queryRows(xuguTableCatalogQuery(xuguTableMetadataSQL, schema, table), nil)
 	if err != nil {
 		return xuguTableMetadata{}, err
 	}
@@ -2611,7 +2679,7 @@ func (s *server) tableMetadata(schema, table string) (xuguTableMetadata, error) 
 }
 
 func (s *server) tableIdentities(schema, table string) (map[string]xuguIdentityInfo, error) {
-	rows, err := s.queryRows(xuguTableIdentitySQL, []any{schema, table})
+	rows, err := s.queryRows(xuguTableCatalogQuery(xuguTableIdentitySQL, schema, table), nil)
 	if err != nil {
 		return nil, err
 	}
@@ -2623,7 +2691,7 @@ func (s *server) tableIdentities(schema, table string) (map[string]xuguIdentityI
 			return nil, err
 		}
 		item := xuguIdentityInfo{Column: xuguString(column), Start: int64(xuguInt(start)), Step: int64(xuguInt(step))}
-		result[strings.ToUpper(item.Column)] = item
+		result[item.Column] = item
 	}
 	return result, rows.Err()
 }
@@ -2637,7 +2705,7 @@ func (s *server) tableForeignKeys(schema, table string) ([]xuguConstraintInfo, e
 }
 
 func (s *server) readTableConstraints(query, schema, table string) ([]xuguConstraintInfo, error) {
-	rows, err := s.queryRows(query, []any{schema, table})
+	rows, err := s.queryRows(xuguTableCatalogQuery(query, schema, table), nil)
 	if err != nil {
 		return nil, err
 	}
@@ -2673,7 +2741,7 @@ func (s *server) tablePartitions(schema, table string, subpartition bool) ([]xug
 	if subpartition {
 		query = xuguTableSubpartitionsSQL
 	}
-	rows, err := s.queryRows(query, []any{schema, table})
+	rows, err := s.queryRows(xuguTableCatalogQuery(query, schema, table), nil)
 	if err != nil {
 		return nil, err
 	}
@@ -2694,7 +2762,7 @@ func (s *server) tablePartitions(schema, table string, subpartition bool) ([]xug
 }
 
 func (s *server) listPartitionMetadata(schema, table string) ([]partitionInfo, error) {
-	rows, err := s.queryRows(xuguTablePartitionsSQL, []any{schema, table})
+	rows, err := s.queryRows(xuguTableCatalogQuery(xuguTablePartitionsSQL, schema, table), nil)
 	if err != nil {
 		if isXuguMetadataAccessError(err) {
 			return []partitionInfo{}, nil
@@ -2726,7 +2794,7 @@ func (s *server) listPartitionMetadata(schema, table string) ([]partitionInfo, e
 }
 
 func (s *server) listSubpartitionMetadata(schema, table string) ([]subpartitionInfo, error) {
-	rows, err := s.queryRows(xuguTableSubpartitionsSQL, []any{schema, table})
+	rows, err := s.queryRows(xuguTableCatalogQuery(xuguTableSubpartitionsSQL, schema, table), nil)
 	if err != nil {
 		if isXuguMetadataAccessError(err) {
 			return []subpartitionInfo{}, nil
@@ -2770,7 +2838,7 @@ func renderXuguTableDDL(schema, table string, columns []columnInfo, metadata xug
 		item.WriteString(quoteIdentifier(column.Name))
 		item.WriteByte(' ')
 		item.WriteString(columnTypeDDL(column))
-		if identity, ok := identities[strings.ToUpper(column.Name)]; ok {
+		if identity, ok := identities[column.Name]; ok {
 			item.WriteString(fmt.Sprintf(" IDENTITY(%d,%d)", identity.Start, identity.Step))
 		}
 		if column.ColumnDefault != nil {
@@ -3202,19 +3270,19 @@ func shouldSkipIndexForTableDDL(index indexInfo, uniqueConstraintColumns [][]str
 		return false
 	}
 	for _, columns := range uniqueConstraintColumns {
-		if sameColumnListFold(index.Columns, columns) {
+		if sameColumnList(index.Columns, columns) {
 			return true
 		}
 	}
 	return false
 }
 
-func sameColumnListFold(left, right []string) bool {
+func sameColumnList(left, right []string) bool {
 	if len(left) != len(right) {
 		return false
 	}
 	for i := range left {
-		if !strings.EqualFold(strings.TrimSpace(left[i]), strings.TrimSpace(right[i])) {
+		if strings.TrimSpace(left[i]) != strings.TrimSpace(right[i]) {
 			return false
 		}
 	}
