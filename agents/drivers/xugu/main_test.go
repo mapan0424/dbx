@@ -944,8 +944,8 @@ func TestRenderXuguTableDDLSkipsImplicitIdentityUniqueConstraint(t *testing.T) {
 		},
 		xuguTableMetadata{},
 		map[string]xuguIdentityInfo{
-			"identityStandard": {Column: "identityStandard", Start: 1, Step: 1},
-			"identityCustom":   {Column: "identityCustom", Start: 100, Step: 10},
+			"identityStandard": {Column: "identityStandard", Start: 1, Step: 1, SystemGenerated: true},
+			"identityCustom":   {Column: "identityCustom", Start: 100, Step: 10, SystemGenerated: true},
 		},
 		[]xuguConstraintInfo{
 			{Name: "PK_S1", Type: "P", Definition: `"identityStandard"`},
@@ -959,6 +959,20 @@ func TestRenderXuguTableDDLSkipsImplicitIdentityUniqueConstraint(t *testing.T) {
 	}
 	if !strings.Contains(ddl, `CONSTRAINT "UK_OTHER" UNIQUE ("other")`) {
 		t.Fatalf("ordinary unique constraint must be preserved:\n%s", ddl)
+	}
+}
+
+func TestIdentityUniqueConstraintRequiresSystemGeneratedIdentityMetadata(t *testing.T) {
+	constraint := xuguConstraintInfo{Name: "UK_ID", Type: "U", Definition: `"id"`}
+	if shouldSkipXuguIdentityUniqueConstraint(constraint, map[string]xuguIdentityInfo{
+		"id": {Column: "id", SystemGenerated: false},
+	}) {
+		t.Fatal("a UNIQUE constraint on a non-system serial column must be preserved")
+	}
+	if !shouldSkipXuguIdentityUniqueConstraint(constraint, map[string]xuguIdentityInfo{
+		"id": {Column: "id", SystemGenerated: true},
+	}) {
+		t.Fatal("the catalog-backed IDENTITY unique constraint must be suppressed")
 	}
 }
 
@@ -1011,6 +1025,31 @@ func TestDDLMetadataLexerPreservesQuotedConstraintAndIndexColumns(t *testing.T) 
 	}
 	if !shouldSkipIndexForTableDDL(indexInfo{Name: "UK_BACKING", Columns: []string{"comma,name", "paren(name)"}, IsUnique: true}, uniqueKeyColumnSets(constraints)) {
 		t.Fatal("unique index with quoted comma/parenthesis columns should match its UNIQUE constraint")
+	}
+}
+
+func TestXuguIndexKeysPreserveOrderingAndExpressions(t *testing.T) {
+	keys := parseXuguIndexKeys(`"CODE" DESC, LOWER("CODE"), "ID" ASC, "plain"`)
+	if got, want := len(keys), 4; got != want {
+		t.Fatalf("index key count = %d, want %d", got, want)
+	}
+	got := make([]string, 0, len(keys))
+	for _, key := range keys {
+		got = append(got, renderXuguIndexKey(key))
+	}
+	if want := `"CODE" DESC, LOWER("CODE"), "ID" ASC, "plain"`; strings.Join(got, ", ") != want {
+		t.Fatalf("rendered index keys = %q, want %q", strings.Join(got, ", "), want)
+	}
+
+	constraintColumns := uniqueKeyColumnSets([]xuguConstraintInfo{{Name: "UK_CODE", Type: "U", Definition: `"CODE"`}})
+	if shouldSkipIndexForTableDDL(indexInfo{IsUnique: true, Columns: []string{"CODE"}, keys: parseXuguIndexKeys(`"CODE" DESC`)}, constraintColumns) {
+		t.Fatal("ordered unique index must not be treated as a UNIQUE constraint backing index")
+	}
+	if shouldSkipIndexForTableDDL(indexInfo{IsUnique: true, Columns: []string{"CODE"}, keys: parseXuguIndexKeys(`LOWER("CODE")`)}, constraintColumns) {
+		t.Fatal("expression unique index must not be treated as a UNIQUE constraint backing index")
+	}
+	if !shouldSkipIndexForTableDDL(indexInfo{IsUnique: true, Columns: []string{"CODE"}, keys: parseXuguIndexKeys(`"CODE"`)}, constraintColumns) {
+		t.Fatal("plain unique index matching a UNIQUE constraint must still be skipped")
 	}
 }
 

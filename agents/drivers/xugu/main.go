@@ -82,7 +82,7 @@ JOIN ALL_SCHEMAS s ON s.DB_ID = t.DB_ID AND s.SCHEMA_ID = t.SCHEMA_ID
 WHERE s.SCHEMA_NAME = ?
   AND t.TABLE_NAME = ?`
 const xuguTableIdentitySQL = `
-SELECT c.COL_NAME, q.MIN_VAL, q.STEP_VAL
+SELECT c.COL_NAME, q.MIN_VAL, q.STEP_VAL, q.IS_SYS
 FROM ALL_COLUMNS c
 JOIN ALL_TABLES t ON t.DB_ID = c.DB_ID AND t.TABLE_ID = c.TABLE_ID
 JOIN ALL_SCHEMAS s ON s.DB_ID = t.DB_ID AND s.SCHEMA_ID = t.SCHEMA_ID
@@ -320,6 +320,7 @@ type indexInfo struct {
 	IndexType       *string  `json:"index_type"`
 	IncludedColumns []string `json:"included_columns"`
 	Comment         *string  `json:"comment"`
+	keys            []xuguIndexKey
 }
 
 func (i indexInfo) MarshalJSON() ([]byte, error) {
@@ -402,9 +403,21 @@ type xuguTableMetadata struct {
 }
 
 type xuguIdentityInfo struct {
-	Column string
-	Start  int64
-	Step   int64
+	Column          string
+	Start           int64
+	Step            int64
+	SystemGenerated bool
+}
+
+// xuguIndexKey preserves the catalog spelling and SQL semantics of an index
+// key. In particular, an index key can be a normal identifier, an identifier
+// with ASC/DESC ordering, or an arbitrary expression such as LOWER("CODE").
+// Only the first form can be compared to a table constraint column list.
+type xuguIndexKey struct {
+	Raw         string
+	Column      string
+	Direction   string
+	PlainColumn bool
 }
 
 type xuguConstraintInfo struct {
@@ -1848,7 +1861,8 @@ func (s *server) listIndexes(schema, table string) ([]indexInfo, error) {
 		if err := rows.Scan(&item.Name, &keys, &unique, &primary, &indexType, &item.Filter); err != nil {
 			return nil, err
 		}
-		item.Columns = parseIndexKeys(keys)
+		item.keys = parseXuguIndexKeys(keys)
+		item.Columns = indexKeyDisplayNames(item.keys)
 		item.IsUnique = truthy(unique)
 		item.IsPrimary = truthy(primary)
 		item.IndexType = stringPtr(indexTypeName(indexType))
@@ -2686,11 +2700,16 @@ func (s *server) tableIdentities(schema, table string) (map[string]xuguIdentityI
 	defer s.closeRows(rows)
 	result := map[string]xuguIdentityInfo{}
 	for rows.Next() {
-		var column, start, step any
-		if err := rows.Scan(&column, &start, &step); err != nil {
+		var column, start, step, systemGenerated any
+		if err := rows.Scan(&column, &start, &step, &systemGenerated); err != nil {
 			return nil, err
 		}
-		item := xuguIdentityInfo{Column: xuguString(column), Start: int64(xuguInt(start)), Step: int64(xuguInt(step))}
+		item := xuguIdentityInfo{
+			Column:          xuguString(column),
+			Start:           int64(xuguInt(start)),
+			Step:            int64(xuguInt(step)),
+			SystemGenerated: truthy(systemGenerated),
+		}
 		result[item.Column] = item
 	}
 	return result, rows.Err()
@@ -2937,8 +2956,12 @@ func shouldSkipXuguIdentityUniqueConstraint(constraint xuguConstraintInfo, ident
 	if len(columns) != 1 {
 		return false
 	}
-	_, isIdentity := identities[columns[0]]
-	return isIdentity
+	identity, isIdentity := identities[columns[0]]
+	// A unique constraint is redundant only when its column is backed by the
+	// catalog's system-generated IDENTITY sequence. A serial-like column backed
+	// by a user sequence may still have a user-declared UNIQUE constraint, which
+	// must remain in the reconstructed DDL.
+	return isIdentity && identity.SystemGenerated
 }
 
 func renderXuguConstraintDDL(constraint xuguConstraintInfo) string {
@@ -3246,11 +3269,11 @@ func (s *server) appendTableIndexDDL(schema, table, ddl string) string {
 		builder.WriteByte('.')
 		builder.WriteString(quoteIdentifier(table))
 		builder.WriteByte('(')
-		for i, column := range index.Columns {
+		for i, key := range xuguIndexKeysForDDL(index) {
 			if i > 0 {
 				builder.WriteString(", ")
 			}
-			builder.WriteString(quoteIdentifier(column))
+			builder.WriteString(renderXuguIndexKey(key))
 		}
 		builder.WriteByte(')')
 		if index.IndexType != nil && strings.TrimSpace(*index.IndexType) != "" {
@@ -3291,8 +3314,12 @@ func shouldSkipIndexForTableDDL(index indexInfo, uniqueConstraintColumns [][]str
 	if !index.IsUnique {
 		return false
 	}
-	for _, columns := range uniqueConstraintColumns {
-		if sameColumnList(index.Columns, columns) {
+	indexColumns, plainColumns := xuguPlainIndexColumns(index)
+	if !plainColumns {
+		return false
+	}
+	for _, constraintColumns := range uniqueConstraintColumns {
+		if sameColumnList(indexColumns, constraintColumns) {
 			return true
 		}
 	}
@@ -3493,7 +3520,99 @@ func readXuguQuotedIdentifier(value string, start int) (string, int, bool) {
 }
 
 func parseIndexKeys(value string) []string {
-	return parseIdentifierList(value)
+	return indexKeyDisplayNames(parseXuguIndexKeys(value))
+}
+
+func parseXuguIndexKeys(value string) []xuguIndexKey {
+	parts := splitXuguTopLevel(value, ',')
+	keys := make([]xuguIndexKey, 0, len(parts))
+	for _, part := range parts {
+		if key, ok := parseXuguIndexKey(part); ok {
+			keys = append(keys, key)
+		}
+	}
+	return emptyIfNil(keys)
+}
+
+func parseXuguIndexKey(value string) (xuguIndexKey, bool) {
+	raw := strings.TrimSpace(value)
+	if raw == "" {
+		return xuguIndexKey{}, false
+	}
+	key := xuguIndexKey{Raw: raw}
+	if identifier, next, ok := readXuguQuotedIdentifier(raw, 0); ok {
+		remainder := strings.TrimSpace(raw[next:])
+		switch strings.ToUpper(remainder) {
+		case "":
+			key.Column = identifier
+			key.PlainColumn = true
+		case "ASC", "DESC":
+			key.Column = identifier
+			key.Direction = strings.ToUpper(remainder)
+			// Ordered keys are intentionally not constraint-equivalent: preserve
+			// their ordering when emitting CREATE INDEX.
+			key.PlainColumn = false
+		}
+	}
+	return key, true
+}
+
+func indexKeyDisplayNames(keys []xuguIndexKey) []string {
+	result := make([]string, 0, len(keys))
+	for _, key := range keys {
+		if key.PlainColumn {
+			result = append(result, key.Column)
+			continue
+		}
+		result = append(result, key.Raw)
+	}
+	return emptyIfNil(result)
+}
+
+func xuguIndexKeysForDDL(index indexInfo) []xuguIndexKey {
+	if len(index.keys) > 0 {
+		return index.keys
+	}
+	keys := make([]xuguIndexKey, 0, len(index.Columns))
+	for _, column := range index.Columns {
+		// indexInfo.Columns is the established metadata API: callers that build
+		// it directly already provide decoded column names, including names that
+		// contain commas or parentheses. Raw catalog keys are kept separately in
+		// indexInfo.keys and parsed above.
+		column = strings.TrimSpace(column)
+		if column != "" {
+			keys = append(keys, xuguIndexKey{Raw: column, Column: column, PlainColumn: true})
+		}
+	}
+	return keys
+}
+
+func xuguPlainIndexColumns(index indexInfo) ([]string, bool) {
+	keys := xuguIndexKeysForDDL(index)
+	if len(keys) == 0 {
+		return nil, false
+	}
+	columns := make([]string, 0, len(keys))
+	for _, key := range keys {
+		if !key.PlainColumn {
+			return nil, false
+		}
+		columns = append(columns, key.Column)
+	}
+	return columns, true
+}
+
+func renderXuguIndexKey(key xuguIndexKey) string {
+	if key.PlainColumn || key.Direction != "" {
+		result := quoteIdentifier(key.Column)
+		if key.Direction != "" {
+			result += " " + key.Direction
+		}
+		return result
+	}
+	// Function/expression keys are already database-produced SQL. Requoting the
+	// whole value would turn LOWER("CODE") or "CODE" DESC into an identifier.
+	return key.Raw
 }
 
 func parseForeignKeyColumns(define string) ([]string, []string) {
