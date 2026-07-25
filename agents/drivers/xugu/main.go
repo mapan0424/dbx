@@ -3379,20 +3379,33 @@ func isXuguProgrammableObjectDDL(sqlText string) bool {
 		return false
 	}
 
+	// Skip CREATE modifiers used by Xugu/Oracle-style programmable DDL:
+	// OR REPLACE, FORCE/NOFORCE, and EDITIONABLE/NONEDITIONABLE (any order).
 	index := 1
-	if len(fields) > index+1 && fields[index] == "OR" && fields[index+1] == "REPLACE" {
-		index += 2
+	for index < len(fields) {
+		if index+1 < len(fields) && fields[index] == "OR" && fields[index+1] == "REPLACE" {
+			index += 2
+			continue
+		}
+		switch fields[index] {
+		case "FORCE", "NOFORCE", "EDITIONABLE", "NONEDITIONABLE":
+			index++
+			continue
+		}
+		break
 	}
-	if len(fields) > index && (fields[index] == "EDITIONABLE" || fields[index] == "NONEDITIONABLE") {
-		index++
-	}
-	if len(fields) <= index {
+	if index >= len(fields) {
 		return false
 	}
 
 	switch fields[index] {
 	case "PROCEDURE", "FUNCTION", "TRIGGER", "PACKAGE":
+		// PACKAGE also covers PACKAGE BODY (next token is BODY).
 		return true
+	case "TYPE":
+		// Only TYPE BODY needs the trailing END; terminator.
+		// Plain CREATE TYPE ... AS OBJECT (...); is ordinary SQL.
+		return index+1 < len(fields) && fields[index+1] == "BODY"
 	default:
 		return false
 	}
