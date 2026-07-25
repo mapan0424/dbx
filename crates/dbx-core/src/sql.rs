@@ -2087,38 +2087,41 @@ impl OraclePlSqlBlock {
         // no BEGIN. Bodies also own an outer END beyond nested routine END
         // pairs so an inner END cannot finish the object.
         let object_kind = self.create_object_kind();
-        let mut depth = match object_kind {
-            Some(OraclePlSqlCreateObjectKind::Body | OraclePlSqlCreateObjectKind::Spec) => 1,
-            None => 0,
+        let mut scopes = match object_kind {
+            Some(OraclePlSqlCreateObjectKind::Body | OraclePlSqlCreateObjectKind::Spec) => {
+                vec![OraclePlSqlScope::Object]
+            }
+            None => Vec::new(),
         };
         let mut saw_begin = false;
         let mut complete = false;
-        let mut pending_end: Option<bool> = None;
 
-        for token in &self.tokens {
+        for (index, token) in self.tokens.iter().enumerate() {
             if token.is_semicolon() {
-                if let Some(is_block_end) = pending_end.take() {
-                    if is_block_end && depth > 0 {
-                        depth -= 1;
-                        complete = depth == 0;
-                    }
-                }
-                continue;
-            }
-
-            if let Some(is_block_end) = pending_end.as_mut() {
-                if token.is_any_word(&["IF", "LOOP", "CASE"]) {
-                    *is_block_end = false;
-                }
                 continue;
             }
 
             if token.is_word("BEGIN") {
-                depth += 1;
+                scopes.push(OraclePlSqlScope::Block);
                 saw_begin = true;
                 complete = false;
+            } else if token.is_word("CASE") {
+                // Both CASE expressions and CASE statements own an END.
+                // The CASE token that follows END CASE is a suffix, not a scope start.
+                if previous_word_token(&self.tokens, index) != Some("END") {
+                    scopes.push(OraclePlSqlScope::Case);
+                }
             } else if token.is_word("END") {
-                pending_end = Some(true);
+                let next = self.tokens.get(index + 1).and_then(OraclePlSqlToken::as_word);
+                if matches!(next, Some("IF" | "LOOP")) {
+                    continue;
+                }
+                if matches!(next, Some("CASE")) && !matches!(scopes.last(), Some(OraclePlSqlScope::Case)) {
+                    continue;
+                }
+                if scopes.pop().is_some() {
+                    complete = scopes.is_empty();
+                }
             }
         }
 
@@ -2184,6 +2187,13 @@ impl OraclePlSqlBlock {
 enum OraclePlSqlCreateObjectKind {
     Spec,
     Body,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OraclePlSqlScope {
+    Object,
+    Block,
+    Case,
 }
 
 impl OraclePlSqlToken {
@@ -3563,6 +3573,29 @@ SELECT 1;";
             ),
             vec!["CREATE TYPE address_t_without_replace AS OBJECT (id INT)", "SELECT 1"]
         );
+    }
+
+    #[test]
+    fn oracle_like_split_keeps_case_expressions_inside_routines() {
+        let function = "CREATE OR REPLACE FUNCTION dbx_case_expr RETURN NUMBER AS\nBEGIN\n  RETURN CASE WHEN 1 = 1 THEN CASE WHEN 2 = 2 THEN 1 ELSE 2 END ELSE 0 END;\nEND;\nSELECT 1;";
+        let procedure = "CREATE OR REPLACE PROCEDURE dbx_case_statement AS\nBEGIN\n  CASE WHEN 1 = 1 THEN NULL; ELSE NULL; END CASE;\nEND;\nSELECT 1;";
+
+        for database in [DatabaseType::Xugu, DatabaseType::Oracle] {
+            assert_eq!(
+                split_sql_statements_for_database(function, database),
+                vec![
+                    "CREATE OR REPLACE FUNCTION dbx_case_expr RETURN NUMBER AS\nBEGIN\n  RETURN CASE WHEN 1 = 1 THEN CASE WHEN 2 = 2 THEN 1 ELSE 2 END ELSE 0 END;\nEND;",
+                    "SELECT 1"
+                ]
+            );
+            assert_eq!(
+                split_sql_statements_for_database(procedure, database),
+                vec![
+                    "CREATE OR REPLACE PROCEDURE dbx_case_statement AS\nBEGIN\n  CASE WHEN 1 = 1 THEN NULL; ELSE NULL; END CASE;\nEND;",
+                    "SELECT 1"
+                ]
+            );
+        }
     }
 
     #[test]

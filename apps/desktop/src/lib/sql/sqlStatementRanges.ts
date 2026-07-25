@@ -1714,12 +1714,20 @@ function oraclePlSqlBlockIsComplete(sql: string): boolean {
       continue;
     }
     if (token.value === "CASE") {
+      // Both CASE statements and CASE expressions own an END. The CASE token
+      // following END CASE is ignored below, so it cannot start a new scope.
       if (previousWordToken(tokens, index) !== "END") stack.push("CASE");
       continue;
     }
     if (token.value === "END") {
-      const next = nextWordToken(tokens, index);
       const top = stack[stack.length - 1];
+      // CASE expressions close as END; while CASE statements close as END CASE;.
+      // In either form, this END belongs to CASE rather than the surrounding block.
+      if (top === "CASE") {
+        stack.pop();
+        continue;
+      }
+      const next = nextWordToken(tokens, index);
       const target = ORACLE_PL_SQL_TERMINATORS.has(next ?? "") ? next : top === "OBJECT_BODY" || top === "OBJECT_SPEC" ? top : "BLOCK";
       if (top === target || (target === "BLOCK" && top === "BLOCK")) stack.pop();
       continue;

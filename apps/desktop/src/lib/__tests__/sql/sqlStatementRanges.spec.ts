@@ -324,6 +324,22 @@ END pkg_utils_without_replace;`;
     expect(rangeSqlTexts(splitSqlStatementRanges("CREATE TYPE address_t_without_replace AS OBJECT (id INT);\nSELECT 1;", "xugu"))).toEqual(["CREATE TYPE address_t_without_replace AS OBJECT (id INT)", "SELECT 1"]);
   });
 
+  it("keeps Oracle-style CASE expressions inside Xugu and Oracle routines", () => {
+    const routine = `CREATE OR REPLACE FUNCTION dbx_case_expr RETURN NUMBER AS
+BEGIN
+  RETURN CASE WHEN 1 = 1 THEN CASE WHEN 2 = 2 THEN 1 ELSE 2 END ELSE 0 END;
+END;`;
+    const caseStatementRoutine = `CREATE OR REPLACE PROCEDURE dbx_case_statement AS
+BEGIN
+  CASE WHEN 1 = 1 THEN NULL; ELSE NULL; END CASE;
+END;`;
+
+    for (const database of ["xugu", "oracle"] as const) {
+      expect(rangeSqlTexts(splitSqlStatementRanges(`${routine}\nSELECT 1;`, database))).toEqual([routine, "SELECT 1"]);
+      expect(rangeSqlTexts(splitSqlStatementRanges(`${caseStatementRoutine}\nSELECT 1;`, database))).toEqual([caseStatementRoutine, "SELECT 1"]);
+    }
+  });
+
   it("keeps SAP HANA DO blocks together", () => {
     const ranges = splitSqlStatementRanges(sapHanaDoBlockFixture, "saphana");
 
