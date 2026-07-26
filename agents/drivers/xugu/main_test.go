@@ -949,7 +949,7 @@ func TestRenderXuguTableDDLSkipsImplicitIdentityUniqueConstraint(t *testing.T) {
 		},
 		[]xuguConstraintInfo{
 			{Name: "PK_S1", Type: "P", Definition: `"identityStandard"`},
-			{Name: "UK_S1", Type: "U", Definition: `"identityCustom"`},
+			{Name: "UK_S1", Type: "U", Definition: `"identityCustom"`, SystemGenerated: true},
 			{Name: "UK_OTHER", Type: "U", Definition: `"other"`},
 		},
 		nil, nil,
@@ -965,14 +965,41 @@ func TestRenderXuguTableDDLSkipsImplicitIdentityUniqueConstraint(t *testing.T) {
 func TestIdentityUniqueConstraintRequiresSystemGeneratedIdentityMetadata(t *testing.T) {
 	constraint := xuguConstraintInfo{Name: "UK_ID", Type: "U", Definition: `"id"`}
 	if shouldSkipXuguIdentityUniqueConstraint(constraint, map[string]xuguIdentityInfo{
+		"id": {Column: "id", SystemGenerated: true},
+	}) {
+		t.Fatal("a user UNIQUE constraint on an IDENTITY column must be preserved")
+	}
+	constraint.SystemGenerated = true
+	if shouldSkipXuguIdentityUniqueConstraint(constraint, map[string]xuguIdentityInfo{
 		"id": {Column: "id", SystemGenerated: false},
 	}) {
-		t.Fatal("a UNIQUE constraint on a non-system serial column must be preserved")
+		t.Fatal("a generated UNIQUE constraint on a user sequence must be preserved")
 	}
 	if !shouldSkipXuguIdentityUniqueConstraint(constraint, map[string]xuguIdentityInfo{
 		"id": {Column: "id", SystemGenerated: true},
 	}) {
-		t.Fatal("the catalog-backed IDENTITY unique constraint must be suppressed")
+		t.Fatal("the system-generated IDENTITY unique constraint must be suppressed")
+	}
+}
+
+func TestBuildTableDDLPreservesUserUniqueConstraintOnIdentityColumn(t *testing.T) {
+	db, err := sql.Open("xugu-test-table-ddl", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	s := newServer()
+	s.db = db
+	ddl, err := s.buildTableDDL("APP", "CHILD")
+	if err != nil {
+		t.Fatalf("build table DDL: %v", err)
+	}
+	if !strings.Contains(ddl, `CONSTRAINT "UK_CHILD_ID" UNIQUE ("ID")`) {
+		t.Fatalf("user UNIQUE constraint on IDENTITY column must be preserved:\n%s", ddl)
+	}
+	if strings.Contains(ddl, `CONSTRAINT "UK_SYS_ID" UNIQUE ("ID")`) {
+		t.Fatalf("system-generated IDENTITY unique constraint must be suppressed:\n%s", ddl)
 	}
 }
 
@@ -1416,18 +1443,25 @@ func (c *xuguTableDDLConn) Close() error              { return nil }
 func (c *xuguTableDDLConn) Begin() (driver.Tx, error) { return nil, errors.New("not supported") }
 func (c *xuguTableDDLConn) QueryContext(_ context.Context, query string, _ []driver.NamedValue) (driver.Rows, error) {
 	upper := strings.ToUpper(query)
-	constraintColumns := []string{"CONS_NAME", "CONS_TYPE", "DEFINE", "SCHEMA_NAME", "TABLE_NAME", "MATCH_TYPE", "UPDATE_ACTION", "DELETE_ACTION", "DEFERRABLE", "INITDEFERRED", "ENABLE", "VALID"}
+	constraintColumns := []string{"CONS_NAME", "CONS_TYPE", "DEFINE", "SCHEMA_NAME", "TABLE_NAME", "MATCH_TYPE", "UPDATE_ACTION", "DELETE_ACTION", "DEFERRABLE", "INITDEFERRED", "ENABLE", "VALID", "IS_SYS"}
 	switch {
 	case strings.Contains(upper, "SELECT S.SCHEMA_NAME, T.TABLE_NAME") && strings.Contains(upper, "FROM ALL_TABLES"):
 		return &xuguStaticRows{columns: []string{"SCHEMA_NAME", "TABLE_NAME"}, values: [][]driver.Value{{"APP", "CHILD"}}}, nil
 	case strings.Contains(upper, "C.CONS_TYPE = 'P'"):
 		return &xuguStaticRows{columns: []string{"DEFINE"}, values: [][]driver.Value{{`"ID"`}}}, nil
 	case strings.Contains(upper, "C.CONS_TYPE <> 'F'"):
-		return &xuguStaticRows{columns: constraintColumns, values: [][]driver.Value{{"PK_CHILD", "P", `"ID"`, nil, nil, nil, nil, nil, false, false, true, true}}}, nil
+		return &xuguStaticRows{columns: constraintColumns, values: [][]driver.Value{
+			{"PK_CHILD", "P", `"ID"`, nil, nil, nil, nil, nil, false, false, true, true, false},
+			{"UK_CHILD_ID", "U", `"ID"`, nil, nil, nil, nil, nil, false, false, true, true, false},
+			{"UK_SYS_ID", "U", `"ID"`, nil, nil, nil, nil, nil, false, false, true, true, true},
+		}}, nil
 	case strings.Contains(upper, "C.CONS_TYPE = 'F'"):
-		return &xuguStaticRows{columns: constraintColumns, values: [][]driver.Value{{"FK_CHILD_PARENT", "F", `("PARENT_ID")("ID")`, "APP", "PARENT", "U", "n", "c", false, false, true, true}}}, nil
+		return &xuguStaticRows{columns: constraintColumns, values: [][]driver.Value{{"FK_CHILD_PARENT", "F", `("PARENT_ID")("ID")`, "APP", "PARENT", "U", "n", "c", false, false, true, true, false}}}, nil
 	case strings.Contains(upper, "C.IS_SERIAL"):
-		return &xuguStaticRows{columns: []string{"COL_NAME", "MIN_VAL", "STEP_VAL"}}, nil
+		return &xuguStaticRows{
+			columns: []string{"COL_NAME", "MIN_VAL", "STEP_VAL", "IS_SYS"},
+			values:  [][]driver.Value{{"ID", int64(1), int64(1), true}},
+		}, nil
 	case strings.Contains(upper, "FROM ALL_COLUMNS"):
 		return &xuguStaticRows{
 			columns: []string{"COL_NAME", "TYPE_NAME", "NOT_NULL", "DEF_VAL", "ON_NULL", "COMMENTS", "SCALE", "VARYING"},
@@ -1470,8 +1504,8 @@ func (c *xuguTableObjectsConn) QueryContext(_ context.Context, query string, _ [
 			return nil, errors.New("generic constraints query must exclude foreign keys")
 		}
 		return &xuguStaticRows{
-			columns: []string{"CONS_NAME", "CONS_TYPE", "DEFINE", "SCHEMA_NAME", "TABLE_NAME", "MATCH_TYPE", "UPDATE_ACTION", "DELETE_ACTION", "DEFERRABLE", "INITDEFERRED", "ENABLE", "VALID"},
-			values:  [][]driver.Value{{"PK_ORDERS", "P", `("ORDER_ID")`, nil, nil, nil, nil, nil, false, false, true, true}},
+			columns: []string{"CONS_NAME", "CONS_TYPE", "DEFINE", "SCHEMA_NAME", "TABLE_NAME", "MATCH_TYPE", "UPDATE_ACTION", "DELETE_ACTION", "DEFERRABLE", "INITDEFERRED", "ENABLE", "VALID", "IS_SYS"},
+			values:  [][]driver.Value{{"PK_ORDERS", "P", `("ORDER_ID")`, nil, nil, nil, nil, nil, false, false, true, true, false}},
 		}, nil
 	case strings.Contains(upper, "FROM ALL_PARTIS"):
 		return &xuguStaticRows{

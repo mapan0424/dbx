@@ -94,7 +94,7 @@ const xuguTableConstraintsSQL = `
 SELECT c.CONS_NAME, c.CONS_TYPE, c.DEFINE,
        rs.SCHEMA_NAME, rt.TABLE_NAME,
        c.MATCH_TYPE, c.UPDATE_ACTION, c.DELETE_ACTION,
-       c.DEFERRABLE, c.INITDEFERRED, c.ENABLE, c.VALID
+       c.DEFERRABLE, c.INITDEFERRED, c.ENABLE, c.VALID, c.IS_SYS
 FROM ALL_CONSTRAINTS c
 JOIN ALL_TABLES t ON t.DB_ID = c.DB_ID AND t.TABLE_ID = c.TABLE_ID
 JOIN ALL_SCHEMAS s ON s.DB_ID = t.DB_ID AND s.SCHEMA_ID = t.SCHEMA_ID
@@ -112,7 +112,7 @@ const xuguTableForeignKeysSQL = `
 SELECT c.CONS_NAME, c.CONS_TYPE, c.DEFINE,
        rs.SCHEMA_NAME, rt.TABLE_NAME,
        c.MATCH_TYPE, c.UPDATE_ACTION, c.DELETE_ACTION,
-       c.DEFERRABLE, c.INITDEFERRED, c.ENABLE, c.VALID
+       c.DEFERRABLE, c.INITDEFERRED, c.ENABLE, c.VALID, c.IS_SYS
 FROM ALL_CONSTRAINTS c
 JOIN ALL_TABLES t ON t.DB_ID = c.DB_ID AND t.TABLE_ID = c.TABLE_ID
 JOIN ALL_SCHEMAS s ON s.DB_ID = t.DB_ID AND s.SCHEMA_ID = t.SCHEMA_ID
@@ -433,6 +433,7 @@ type xuguConstraintInfo struct {
 	InitiallyDeferred bool
 	Enabled           bool
 	Valid             bool
+	SystemGenerated   bool
 }
 
 type xuguPartitionInfo struct {
@@ -1957,9 +1958,9 @@ func (s *server) listConstraints(schema, table string) ([]constraintInfo, error)
 	var result []constraintInfo
 	for rows.Next() {
 		var name, kind, definition, refSchema, refTable any
-		var matchType, updateAction, deleteAction, deferrable, initiallyDeferred, enabled, valid any
+		var matchType, updateAction, deleteAction, deferrable, initiallyDeferred, enabled, valid, systemGenerated any
 		if err := rows.Scan(&name, &kind, &definition, &refSchema, &refTable, &matchType, &updateAction, &deleteAction,
-			&deferrable, &initiallyDeferred, &enabled, &valid); err != nil {
+			&deferrable, &initiallyDeferred, &enabled, &valid, &systemGenerated); err != nil {
 			return nil, err
 		}
 		item := constraintInfo{
@@ -2733,9 +2734,9 @@ func (s *server) readTableConstraints(query, schema, table string) ([]xuguConstr
 	for rows.Next() {
 		var item xuguConstraintInfo
 		var name, constraintType, definition, referenceSchema, referenceTable any
-		var matchType, updateAction, deleteAction, deferrable, initiallyDeferred, enabled, valid any
+		var matchType, updateAction, deleteAction, deferrable, initiallyDeferred, enabled, valid, systemGenerated any
 		if err := rows.Scan(&name, &constraintType, &definition, &referenceSchema, &referenceTable,
-			&matchType, &updateAction, &deleteAction, &deferrable, &initiallyDeferred, &enabled, &valid); err != nil {
+			&matchType, &updateAction, &deleteAction, &deferrable, &initiallyDeferred, &enabled, &valid, &systemGenerated); err != nil {
 			return nil, err
 		}
 		item.Name = xuguString(name)
@@ -2750,6 +2751,7 @@ func (s *server) readTableConstraints(query, schema, table string) ([]xuguConstr
 		item.InitiallyDeferred = truthy(initiallyDeferred)
 		item.Enabled = truthy(enabled)
 		item.Valid = truthy(valid)
+		item.SystemGenerated = truthy(systemGenerated)
 		result = append(result, item)
 	}
 	return emptyIfNil(result), rows.Err()
@@ -2957,11 +2959,9 @@ func shouldSkipXuguIdentityUniqueConstraint(constraint xuguConstraintInfo, ident
 		return false
 	}
 	identity, isIdentity := identities[columns[0]]
-	// A unique constraint is redundant only when its column is backed by the
-	// catalog's system-generated IDENTITY sequence. A serial-like column backed
-	// by a user sequence may still have a user-declared UNIQUE constraint, which
-	// must remain in the reconstructed DDL.
-	return isIdentity && identity.SystemGenerated
+	// Both catalog objects must be system-generated: an identity column can
+	// still have a separate, user-declared UNIQUE constraint on the same column.
+	return isIdentity && identity.SystemGenerated && constraint.SystemGenerated
 }
 
 func renderXuguConstraintDDL(constraint xuguConstraintInfo) string {
