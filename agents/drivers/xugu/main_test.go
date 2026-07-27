@@ -1511,17 +1511,67 @@ func TestXuguShowStatementsUseResultSetQueryPath(t *testing.T) {
 	}
 }
 
-func TestIsQuerySQLRecognizesXuguShowStatements(t *testing.T) {
+func TestXuguQueryKeywordBoundariesUseResultSetPath(t *testing.T) {
+	for _, test := range []struct {
+		name        string
+		sqlText     string
+		wantQuery   string
+		wantColumns []string
+		wantValue   any
+	}{
+		{name: "parenthesized select", sqlText: "SELECT(1);", wantQuery: "SELECT(1)", wantColumns: []string{"VALUE"}, wantValue: int64(1)},
+		{name: "select hint", sqlText: "SELECT/*+ index */1;", wantQuery: "SELECT/*+ index */1", wantColumns: []string{"VALUE"}, wantValue: int64(1)},
+		{name: "show comment", sqlText: "SHOW/* metadata */ DB_INFO;", wantQuery: "SHOW/* metadata */ DB_INFO", wantColumns: []string{"DB_NAME", "DB_ID", "DB_OWNER", "DB_CHARSET", "DB_TIMEZ"}, wantValue: "SYSTEM"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			resetXuguShowResultDriver()
+			db, err := sql.Open("xugu-test-show-result", "")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer db.Close()
+
+			s := newServer()
+			s.db = db
+			result, err := s.executeQuery(queryOptions{SQL: test.sqlText})
+			if err != nil {
+				t.Fatalf("executeQuery(%q): %v", test.sqlText, err)
+			}
+			if !equalStrings(result.Columns, test.wantColumns) {
+				t.Fatalf("columns = %v, want %v", result.Columns, test.wantColumns)
+			}
+			if len(result.Rows) != 1 || len(result.Rows[0]) == 0 || result.Rows[0][0] != test.wantValue {
+				t.Fatalf("rows = %#v, want first value %#v", result.Rows, test.wantValue)
+			}
+
+			queries, execs := recordedXuguShowStatements()
+			if !equalStrings(queries, []string{test.wantQuery}) {
+				t.Fatalf("queries = %v, want %v", queries, []string{test.wantQuery})
+			}
+			if len(execs) != 0 {
+				t.Fatalf("query statements must not use ExecContext, got %v", execs)
+			}
+		})
+	}
+}
+
+func TestIsQuerySQLRecognizesQueryKeywordBoundaries(t *testing.T) {
 	for _, test := range []struct {
 		sqlText string
 		want    bool
 	}{
 		{sqlText: "SELECT 1", want: true},
+		{sqlText: "SELECT(1)", want: true},
+		{sqlText: "SELECT/*+ index */1", want: true},
 		{sqlText: "WITH value AS (SELECT 1) SELECT * FROM value", want: true},
 		{sqlText: "SHOW DB_INFO", want: true},
 		{sqlText: "  show current_schema", want: true},
 		{sqlText: "/* Xugu metadata */ SHOW CHARSETS", want: true},
+		{sqlText: "SHOW/* metadata */ DB_INFO", want: true},
+		{sqlText: "-- leading comment\nSELECT(1)", want: true},
+		{sqlText: "SELECTIVE settings", want: false},
 		{sqlText: "SHOWCASE settings", want: false},
+		{sqlText: "SHOW_CURRENT_SCHEMA", want: false},
 		{sqlText: "CREATE TABLE items (id INTEGER)", want: false},
 	} {
 		t.Run(test.sqlText, func(t *testing.T) {
@@ -1602,13 +1652,17 @@ func (c *xuguShowResultConn) QueryContext(_ context.Context, query string, _ []d
 	xuguShowResultState.queries = append(xuguShowResultState.queries, query)
 	xuguShowResultState.Unlock()
 
-	if query != "SHOW DB_INFO" {
-		return nil, fmt.Errorf("unexpected SHOW query: %s", query)
+	switch query {
+	case "SELECT(1)", "SELECT/*+ index */1":
+		return &xuguStaticRows{columns: []string{"VALUE"}, values: [][]driver.Value{{int64(1)}}}, nil
+	case "SHOW DB_INFO", "SHOW/* metadata */ DB_INFO":
+		return &xuguStaticRows{
+			columns: []string{"DB_NAME", "DB_ID", "DB_OWNER", "DB_CHARSET", "DB_TIMEZ"},
+			values:  [][]driver.Value{{"SYSTEM", int64(1), "SYS", "UTF8.UTF8_GENERAL_CI", "GMT+08:00"}},
+		}, nil
+	default:
+		return nil, fmt.Errorf("unexpected query: %s", query)
 	}
-	return &xuguStaticRows{
-		columns: []string{"DB_NAME", "DB_ID", "DB_OWNER", "DB_CHARSET", "DB_TIMEZ"},
-		values:  [][]driver.Value{{"SYSTEM", int64(1), "SYS", "UTF8.UTF8_GENERAL_CI", "GMT+08:00"}},
-	}, nil
 }
 func (c *xuguShowResultConn) ExecContext(_ context.Context, query string, _ []driver.NamedValue) (driver.Result, error) {
 	xuguShowResultState.Lock()
