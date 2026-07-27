@@ -1472,6 +1472,66 @@ func TestExecuteQueryPreservesXuguTypeBodyTerminator(t *testing.T) {
 	}
 }
 
+func TestXuguShowStatementsUseResultSetQueryPath(t *testing.T) {
+	resetXuguShowResultDriver()
+	db, err := sql.Open("xugu-test-show-result", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	s := newServer()
+	s.db = db
+
+	result, err := s.executeQuery(queryOptions{SQL: "SHOW DB_INFO;"})
+	if err != nil {
+		t.Fatalf("executeQuery(SHOW DB_INFO): %v", err)
+	}
+	if got, want := result.Columns, []string{"DB_NAME", "DB_ID", "DB_OWNER", "DB_CHARSET", "DB_TIMEZ"}; !equalStrings(got, want) {
+		t.Fatalf("SHOW DB_INFO columns = %v, want %v", got, want)
+	}
+	if len(result.Rows) != 1 || result.Rows[0][0] != "SYSTEM" {
+		t.Fatalf("SHOW DB_INFO rows = %#v, want database row", result.Rows)
+	}
+
+	page, err := s.executeQueryPage(queryOptions{SQL: "SHOW DB_INFO"}, 10)
+	if err != nil {
+		t.Fatalf("executeQueryPage(SHOW DB_INFO): %v", err)
+	}
+	if len(page.Rows) != 1 || page.Rows[0][0] != "SYSTEM" {
+		t.Fatalf("SHOW DB_INFO page rows = %#v, want database row", page.Rows)
+	}
+
+	queries, execs := recordedXuguShowStatements()
+	if got, want := queries, []string{"SHOW DB_INFO", "SHOW DB_INFO"}; !equalStrings(got, want) {
+		t.Fatalf("SHOW statements queried = %v, want %v", got, want)
+	}
+	if len(execs) != 0 {
+		t.Fatalf("SHOW statements must not use ExecContext, got %v", execs)
+	}
+}
+
+func TestIsQuerySQLRecognizesXuguShowStatements(t *testing.T) {
+	for _, test := range []struct {
+		sqlText string
+		want    bool
+	}{
+		{sqlText: "SELECT 1", want: true},
+		{sqlText: "WITH value AS (SELECT 1) SELECT * FROM value", want: true},
+		{sqlText: "SHOW DB_INFO", want: true},
+		{sqlText: "  show current_schema", want: true},
+		{sqlText: "/* Xugu metadata */ SHOW CHARSETS", want: true},
+		{sqlText: "SHOWCASE settings", want: false},
+		{sqlText: "CREATE TABLE items (id INTEGER)", want: false},
+	} {
+		t.Run(test.sqlText, func(t *testing.T) {
+			if got := isQuerySQL(test.sqlText); got != test.want {
+				t.Fatalf("isQuerySQL(%q) = %t, want %t", test.sqlText, got, test.want)
+			}
+		})
+	}
+}
+
 func contains(values []string, target string) bool {
 	for _, value := range values {
 		if value == target {
@@ -1479,6 +1539,18 @@ func contains(values []string, target string) bool {
 		}
 	}
 	return false
+}
+
+func equalStrings(got, want []string) bool {
+	if len(got) != len(want) {
+		return false
+	}
+	for index := range got {
+		if got[index] != want[index] {
+			return false
+		}
+	}
+	return true
 }
 
 // -- fake drivers for agent tests --
@@ -1490,6 +1562,59 @@ func init() {
 	sql.Register("xugu-test-legacy-columns", &xuguLegacyColumnsDriver{})
 	sql.Register("xugu-test-table-objects", &xuguTableObjectsDriver{})
 	sql.Register("xugu-test-table-ddl", &xuguTableDDLDriver{})
+	sql.Register("xugu-test-show-result", &xuguShowResultDriver{})
+}
+
+type xuguShowResultDriver struct{}
+
+var xuguShowResultState struct {
+	sync.Mutex
+	queries []string
+	execs   []string
+}
+
+func resetXuguShowResultDriver() {
+	xuguShowResultState.Lock()
+	xuguShowResultState.queries = nil
+	xuguShowResultState.execs = nil
+	xuguShowResultState.Unlock()
+}
+
+func recordedXuguShowStatements() (queries []string, execs []string) {
+	xuguShowResultState.Lock()
+	defer xuguShowResultState.Unlock()
+	return append([]string(nil), xuguShowResultState.queries...), append([]string(nil), xuguShowResultState.execs...)
+}
+
+func (d *xuguShowResultDriver) Open(name string) (driver.Conn, error) {
+	return &xuguShowResultConn{}, nil
+}
+
+type xuguShowResultConn struct{}
+
+func (c *xuguShowResultConn) Prepare(query string) (driver.Stmt, error) {
+	return nil, errors.New("not supported")
+}
+func (c *xuguShowResultConn) Close() error              { return nil }
+func (c *xuguShowResultConn) Begin() (driver.Tx, error) { return nil, errors.New("not supported") }
+func (c *xuguShowResultConn) QueryContext(_ context.Context, query string, _ []driver.NamedValue) (driver.Rows, error) {
+	xuguShowResultState.Lock()
+	xuguShowResultState.queries = append(xuguShowResultState.queries, query)
+	xuguShowResultState.Unlock()
+
+	if query != "SHOW DB_INFO" {
+		return nil, fmt.Errorf("unexpected SHOW query: %s", query)
+	}
+	return &xuguStaticRows{
+		columns: []string{"DB_NAME", "DB_ID", "DB_OWNER", "DB_CHARSET", "DB_TIMEZ"},
+		values:  [][]driver.Value{{"SYSTEM", int64(1), "SYS", "UTF8.UTF8_GENERAL_CI", "GMT+08:00"}},
+	}, nil
+}
+func (c *xuguShowResultConn) ExecContext(_ context.Context, query string, _ []driver.NamedValue) (driver.Result, error) {
+	xuguShowResultState.Lock()
+	xuguShowResultState.execs = append(xuguShowResultState.execs, query)
+	xuguShowResultState.Unlock()
+	return nil, fmt.Errorf("SHOW statement was incorrectly sent to ExecContext: %s", query)
 }
 
 type xuguTableDDLDriver struct{}

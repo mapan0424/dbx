@@ -3953,8 +3953,18 @@ func stripLeadingSQLComments(sqlText string) string {
 }
 
 func isQuerySQL(sqlText string) bool {
-	lower := strings.ToLower(strings.TrimSpace(sqlText))
-	return strings.HasPrefix(lower, "select") || strings.HasPrefix(lower, "with")
+	fields := strings.Fields(strings.ToLower(stripLeadingSQLComments(sqlText)))
+	if len(fields) == 0 {
+		return false
+	}
+	switch fields[0] {
+	case "select", "with", "show":
+		// Xugu's SHOW statements return result sets (for example SHOW DB_INFO),
+		// so they must use QueryContext rather than ExecContext.
+		return true
+	default:
+		return false
+	}
 }
 
 func quoteIdentifier(value string) string {
