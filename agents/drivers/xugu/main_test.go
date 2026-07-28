@@ -775,6 +775,68 @@ func TestXuguListObjectsQueryIncludesProgrammableObjects(t *testing.T) {
 	assertArgs(t, query.Args, wantArgs)
 }
 
+func TestXuguListObjectsQueryExcludesSystemSequences(t *testing.T) {
+	query := xuguListObjectsQuery("APP", metadataListConstraints{
+		ObjectTypes: []string{"sequence"},
+	})
+
+	if !strings.Contains(query.SQL, "q.IS_SYS = FALSE") {
+		t.Fatalf("sequence lookup must exclude system-managed identity sequences:\n%s", query.SQL)
+	}
+}
+
+func TestGetSequenceSourceReconstructsExecutableDDL(t *testing.T) {
+	db, err := sql.Open("xugu-test-sequence-source", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	s := newServer()
+	s.db = db
+	source, err := s.getObjectSource("appsChema", "seqOrderNo", "SEQUENCE")
+	if err != nil {
+		t.Fatalf("get sequence source: %v", err)
+	}
+	if source["editable"] != false {
+		t.Fatalf("sequence source must remain read-only: %#v", source)
+	}
+	if source["schema"] != "AppSchema" || source["name"] != "seqOrderNo" {
+		t.Fatalf("sequence source must preserve catalog spelling: %#v", source)
+	}
+
+	ddl, _ := source["source"].(string)
+	for _, want := range []string{
+		`CREATE SEQUENCE "AppSchema"."seqOrderNo"`,
+		"INCREMENT BY 10",
+		"START WITH 500",
+		"MINVALUE -100",
+		"MAXVALUE 10000",
+		"CACHE 20",
+		"CYCLE",
+		"COMMENT 'order''s next number'",
+	} {
+		if !strings.Contains(ddl, want) {
+			t.Fatalf("sequence DDL is missing %q:\n%s", want, ddl)
+		}
+	}
+	if !strings.HasSuffix(strings.TrimSpace(ddl), ";") {
+		t.Fatalf("sequence DDL must end with a statement terminator:\n%s", ddl)
+	}
+}
+
+func TestRenderXuguSequenceDDLUsesNoCacheAndNoCycle(t *testing.T) {
+	ddl := renderXuguSequenceDDL(xuguSequenceMetadata{
+		Schema: "APP", Name: "SEQ_DEFAULTS", Current: int64(1), Minimum: int64(1),
+		Maximum: int64(9223372036854775807), Step: int64(1), Cache: int64(1), Cycle: false,
+	})
+	for _, want := range []string{"NOCACHE", "NO CYCLE"} {
+		if !strings.Contains(ddl, want) {
+			t.Fatalf("sequence DDL is missing %q:\n%s", want, ddl)
+		}
+	}
+}
+
 func TestXuguObjectSourceQuerySupportsSharedObjectKinds(t *testing.T) {
 	for _, objectType := range []string{"TRIGGER", "PACKAGE_BODY", "TYPE", "TYPE_BODY"} {
 		query, _, err := objectSourceQuery("APP", "demo", objectType)
@@ -1613,6 +1675,7 @@ func init() {
 	sql.Register("xugu-test-table-objects", &xuguTableObjectsDriver{})
 	sql.Register("xugu-test-table-ddl", &xuguTableDDLDriver{})
 	sql.Register("xugu-test-show-result", &xuguShowResultDriver{})
+	sql.Register("xugu-test-sequence-source", &xuguSequenceSourceDriver{})
 }
 
 type xuguShowResultDriver struct{}
@@ -1669,6 +1732,30 @@ func (c *xuguShowResultConn) ExecContext(_ context.Context, query string, _ []dr
 	xuguShowResultState.execs = append(xuguShowResultState.execs, query)
 	xuguShowResultState.Unlock()
 	return nil, fmt.Errorf("SHOW statement was incorrectly sent to ExecContext: %s", query)
+}
+
+type xuguSequenceSourceDriver struct{}
+
+func (d *xuguSequenceSourceDriver) Open(name string) (driver.Conn, error) {
+	return &xuguSequenceSourceConn{}, nil
+}
+
+type xuguSequenceSourceConn struct{}
+
+func (c *xuguSequenceSourceConn) Prepare(query string) (driver.Stmt, error) {
+	return nil, errors.New("not supported")
+}
+func (c *xuguSequenceSourceConn) Close() error              { return nil }
+func (c *xuguSequenceSourceConn) Begin() (driver.Tx, error) { return nil, errors.New("not supported") }
+func (c *xuguSequenceSourceConn) QueryContext(_ context.Context, query string, _ []driver.NamedValue) (driver.Rows, error) {
+	upper := strings.ToUpper(query)
+	if !strings.Contains(upper, "FROM ALL_SEQUENCES") || !strings.Contains(upper, "Q.IS_SYS = FALSE") {
+		return nil, fmt.Errorf("unexpected sequence source query: %s", query)
+	}
+	return &xuguStaticRows{
+		columns: []string{"SCHEMA_NAME", "SEQ_NAME", "CURR_VAL", "MIN_VAL", "MAX_VAL", "STEP_VAL", "CACHE_VAL", "IS_CYCLE", "COMMENTS"},
+		values:  [][]driver.Value{{"AppSchema", "seqOrderNo", int64(500), int64(-100), int64(10000), int64(10), int64(20), true, "order's next number"}},
+	}, nil
 }
 
 type xuguTableDDLDriver struct{}

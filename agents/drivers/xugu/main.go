@@ -411,6 +411,21 @@ type xuguIdentityInfo struct {
 	SystemGenerated bool
 }
 
+// xuguSequenceMetadata contains the ALL_SEQUENCES fields needed to reproduce
+// a user-managed sequence. IS_ORDER and VALID are runtime/catalog state and
+// do not have CREATE SEQUENCE clauses, so they are intentionally omitted.
+type xuguSequenceMetadata struct {
+	Schema  string
+	Name    string
+	Current any
+	Minimum any
+	Maximum any
+	Step    any
+	Cache   any
+	Cycle   any
+	Comment any
+}
+
 // xuguIndexKey preserves the catalog spelling and SQL semantics of an index
 // key. In particular, an index key can be a normal identifier, an identifier
 // with ASC/DESC ordering, or an arbitrary expression such as LOWER("CODE").
@@ -1617,6 +1632,7 @@ SELECT q.SEQ_NAME AS OBJECT_NAME, 'SEQUENCE' AS OBJECT_TYPE, NULL AS COMMENTS, N
 FROM ALL_SEQUENCES q
 JOIN ALL_SCHEMAS s ON s.DB_ID = q.DB_ID AND s.SCHEMA_ID = q.SCHEMA_ID
 WHERE UPPER(s.SCHEMA_NAME) = UPPER(?)
+  AND q.IS_SYS = FALSE
 UNION ALL
 SELECT u.TYPE_NAME AS OBJECT_NAME, 'TYPE' AS OBJECT_TYPE, u.COMMENTS, u.VALID
 FROM ALL_TYPES u
@@ -2007,6 +2023,9 @@ func (s *server) getObjectSource(schema, name, objectType string) (map[string]an
 	if err != nil {
 		return nil, err
 	}
+	if strings.EqualFold(strings.TrimSpace(objectType), "SEQUENCE") {
+		return s.getSequenceSource(schema, name)
+	}
 	sourceSQL, args, err := objectSourceQuery(schema, name, objectType)
 	if err != nil {
 		return nil, err
@@ -2031,6 +2050,93 @@ func (s *server) getObjectSource(schema, name, objectType string) (map[string]an
 		result["editable"] = false
 	}
 	return result, rows.Err()
+}
+
+// getSequenceSource reconstructs sequence DDL from ALL_SEQUENCES. Unlike
+// programmable objects, sequences have no stored DEFINE text. Reconstructing
+// the statement avoids DBMS_METADATA permissions and matches the approach used
+// by the Xugu DBeaver extension.
+func (s *server) getSequenceSource(schema, name string) (map[string]any, error) {
+	rows, err := s.queryRows(`
+SELECT s.SCHEMA_NAME, q.SEQ_NAME,
+       q.CURR_VAL, q.MIN_VAL, q.MAX_VAL, q.STEP_VAL,
+       q.CACHE_VAL, q.IS_CYCLE, q.COMMENTS
+FROM ALL_SEQUENCES q
+JOIN ALL_SCHEMAS s ON s.DB_ID = q.DB_ID AND s.SCHEMA_ID = q.SCHEMA_ID
+WHERE UPPER(s.SCHEMA_NAME) = UPPER(?)
+  AND UPPER(q.SEQ_NAME) = UPPER(?)
+  AND q.IS_SYS = FALSE`, []any{schema, name})
+	if err != nil {
+		return nil, err
+	}
+	defer s.closeRows(rows)
+
+	result := map[string]any{"name": name, "object_type": "SEQUENCE", "schema": schema, "source": "", "editable": false}
+	if !rows.Next() {
+		return result, rows.Err()
+	}
+	var sequence xuguSequenceMetadata
+	if err := rows.Scan(
+		&sequence.Schema, &sequence.Name,
+		&sequence.Current, &sequence.Minimum, &sequence.Maximum, &sequence.Step,
+		&sequence.Cache, &sequence.Cycle, &sequence.Comment,
+	); err != nil {
+		return nil, err
+	}
+	result["name"] = sequence.Name
+	result["schema"] = sequence.Schema
+	result["source"] = renderXuguSequenceDDL(sequence)
+	return result, rows.Err()
+}
+
+func renderXuguSequenceDDL(sequence xuguSequenceMetadata) string {
+	var builder strings.Builder
+	builder.WriteString("CREATE SEQUENCE ")
+	builder.WriteString(quoteIdentifier(sequence.Schema))
+	builder.WriteByte('.')
+	builder.WriteString(quoteIdentifier(sequence.Name))
+
+	if value := xuguSequenceNumber(sequence.Step); value != "" {
+		builder.WriteString("\n  INCREMENT BY ")
+		builder.WriteString(value)
+	}
+	if value := xuguSequenceNumber(sequence.Current); value != "" {
+		builder.WriteString("\n  START WITH ")
+		builder.WriteString(value)
+	}
+	if value := xuguSequenceNumber(sequence.Minimum); value != "" {
+		builder.WriteString("\n  MINVALUE ")
+		builder.WriteString(value)
+	} else {
+		builder.WriteString("\n  NOMINVALUE")
+	}
+	if value := xuguSequenceNumber(sequence.Maximum); value != "" {
+		builder.WriteString("\n  MAXVALUE ")
+		builder.WriteString(value)
+	} else {
+		builder.WriteString("\n  NOMAXVALUE")
+	}
+	if value := xuguSequenceNumber(sequence.Cache); value != "" && xuguInt(sequence.Cache) > 1 {
+		builder.WriteString("\n  CACHE ")
+		builder.WriteString(value)
+	} else {
+		builder.WriteString("\n  NOCACHE")
+	}
+	if truthy(sequence.Cycle) {
+		builder.WriteString("\n  CYCLE")
+	} else {
+		builder.WriteString("\n  NO CYCLE")
+	}
+	if comment := strings.TrimSpace(xuguString(sequence.Comment)); comment != "" {
+		builder.WriteString("\n  COMMENT ")
+		builder.WriteString(quoteStringLiteral(comment))
+	}
+	builder.WriteString(";")
+	return builder.String()
+}
+
+func xuguSequenceNumber(value any) string {
+	return strings.TrimSpace(xuguString(value))
 }
 
 func (s *server) getTableDDL(schema, table string) (string, error) {
