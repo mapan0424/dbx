@@ -2255,6 +2255,7 @@ export default {
     procedures: "Procedures",
     functions: "Functions",
     sequences: "Sequences",
+    synonyms: "Synonyms",
     packages: "Packages",
     types: "Types",
     gridfs: "GridFS",
