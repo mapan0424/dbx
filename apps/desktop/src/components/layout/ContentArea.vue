@@ -68,6 +68,7 @@ import { useQueryStore } from "@/stores/queryStore";
 import { useConnectionStore } from "@/stores/connectionStore";
 import { TABLE_FONT_SIZE_MAX, TABLE_FONT_SIZE_MIN, useSettingsStore, type DataGridSearchMode, type ResultRunDisplayMode } from "@/stores/settingsStore";
 import { useToast } from "@/composables/useToast";
+import { isTauriRuntime } from "@/lib/backend/tauriRuntime";
 import { canCancelQueryExecution, queryExecutionLabelKey } from "@/lib/sql/queryExecutionState";
 import { databaseDisplayNameForTab, executionSummaryItems, queryResultExecutionSql, resultGridCacheKey, resultRunItems, resultSourceRange, resultSqlForGrid, statementExecutionMarkers, tabularResultItems } from "@/lib/tabs/tabPresentation";
 import { defaultQueryResultArchiveFileName } from "@/lib/query/queryResultArchive";
@@ -76,6 +77,7 @@ import { isTableDataEditable } from "@/lib/table/tableEditing";
 import { tableMetaForDataTab } from "@/lib/table/tableDataTabMeta";
 import { dataTabExecutionDatabase } from "@/lib/table/dataTabExecutionDatabase";
 import { formatShortcut } from "@/lib/editor/shortcutRegistry";
+import type { CodeMirrorSqlDialectName } from "@/lib/editor/codemirrorSqlDialect";
 import { codeMirrorSqlDialect, codeMirrorSqlDialectForConnection, effectiveDatabaseTypeForConnection } from "@/lib/database/jdbcDialect";
 import { chartableColumnIndexes } from "@/lib/dataGrid/chartData";
 import { elasticsearchJsonResponseForResult } from "@/lib/elasticsearch/elasticsearchJsonResponse";
@@ -292,7 +294,7 @@ const activeTabDimension = computed(() => {
 const activeSqlFormatDialect = computed<SqlFormatDialect>(() => sqlFormatDialectForDbType(activeEffectiveDatabaseType.value));
 
 const editorDialect = computed<"mysql" | "postgres" | "sqlserver">(() => codeMirrorSqlDialect(activeEffectiveDatabaseType.value));
-const editorSyntaxDialect = computed<"mysql" | "postgres" | "sqlserver">(() => codeMirrorSqlDialectForConnection(props.activeConnection));
+const editorSyntaxDialect = computed<CodeMirrorSqlDialectName>(() => codeMirrorSqlDialectForConnection(props.activeConnection));
 
 const shortcutModifier = computed(() => (navigator.platform.toLowerCase().includes("mac") ? "Cmd" : "Ctrl"));
 
@@ -865,6 +867,20 @@ function requestQueryEditorExecuteInNewResultTab() {
   return queryEditorRef.value?.requestExecuteInNewResultTab();
 }
 
+async function handleExportQuery(payload: { sql: string; format: "csv" | "xlsx" | "txt"; columnComments?: (string | null)[] }) {
+  const tab = props.activeTab;
+  if (!tab || tab.mode !== "query") return;
+  let filePath = `query-result.${payload.format}`;
+  if (isTauriRuntime()) {
+    const { save } = await import("@tauri-apps/plugin-dialog");
+    const filterName = payload.format === "csv" ? "CSV" : payload.format === "xlsx" ? "Excel" : "Text";
+    const picked = await save({ defaultPath: filePath, filters: [{ name: filterName, extensions: [payload.format] }] });
+    if (!picked) return;
+    filePath = picked as string;
+  }
+  await queryStore.exportQuerySqlDirect(tab.id, payload.sql, payload.format, filePath, payload.columnComments);
+}
+
 function pasteClipboardAsSqlInCondition() {
   return queryEditorRef.value?.pasteClipboardAsSqlInCondition();
 }
@@ -932,6 +948,7 @@ defineExpose({ focusSearch, refreshData, refreshQueryEditorCompletionCache, hand
               @format-error="emit('formatError')"
               @execute="emit('execute', $event)"
               @execute-in-new-result-tab="emit('executeInNewResultTab', $event)"
+              @export-query="handleExportQuery"
               @save="emit('saveSql')"
               @click-table="onHandleClickTable"
               @view-table-data="onHandleViewTableData"
@@ -1755,7 +1772,7 @@ defineExpose({ focusSearch, refreshData, refreshQueryEditorCompletionCache, hand
     <!-- Redis mode: key browser -->
     <template v-else-if="activeTab.mode === 'redis'">
       <div class="flex-1 min-h-0">
-        <RedisKeyBrowser ref="redisKeyBrowserRef" :key="activeTab.id" :connection-id="activeTab.connectionId" :db="Number(activeTab.database)" :block-dangerous-redis-commands="props.blockDangerousRedisCommands" />
+        <RedisKeyBrowser ref="redisKeyBrowserRef" :key="`${activeTab.id}:${activeTab.connectionId}:${activeTab.database}`" :connection-id="activeTab.connectionId" :db="Number(activeTab.database)" :block-dangerous-redis-commands="props.blockDangerousRedisCommands" />
       </div>
     </template>
 
