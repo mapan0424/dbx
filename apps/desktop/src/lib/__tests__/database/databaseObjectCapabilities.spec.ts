@@ -27,4 +27,9 @@ describe("databaseObjectCapabilities", () => {
   it("normalizes space separated materialized view types", () => {
     expect(normalizeSidebarObjectKind("MATERIALIZED VIEW")).toBe("MATERIALIZED_VIEW");
   });
+
+  it("exposes synonyms for Xugu only", () => {
+    expect(sidebarObjectKindsForDatabase("xugu")).toContain("SYNONYM");
+    expect(sidebarObjectKindsForDatabase("postgres")).not.toContain("SYNONYM");
+  });
 });

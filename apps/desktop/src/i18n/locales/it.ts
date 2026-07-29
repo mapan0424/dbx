@@ -2104,6 +2104,7 @@ export default withEnglishFallback({
     procedures: "Procedure",
     functions: "Funzioni",
     sequences: "Sequenze",
+    synonyms: "Sinonimi",
     packages: "Pacchetti",
     partitions: "Partizioni",
     subpartitions: "Sottopartizioni",
