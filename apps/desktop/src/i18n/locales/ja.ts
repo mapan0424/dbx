@@ -2195,6 +2195,7 @@ export default withEnglishFallback({
     procedures: "プロシージャ",
     functions: "関数",
     sequences: "シーケンス",
+    synonyms: "シノニム",
     packages: "パッケージ",
     partitions: "パーティション",
     subpartitions: "サブパーティション",
