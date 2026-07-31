@@ -156,6 +156,89 @@ func TestNewXuguDatabaseSessionFindsOnlyNewSession(t *testing.T) {
 	}
 }
 
+func TestControlSessionFromSnapshotDegradesWhenAmbiguous(t *testing.T) {
+	existing := xuguDatabaseSession{nodeID: 1, sessionID: 10}
+	createdA := xuguDatabaseSession{nodeID: 1, sessionID: 11}
+	createdB := xuguDatabaseSession{nodeID: 1, sessionID: 12}
+
+	if _, n, ok := controlSessionFromSnapshot(
+		map[xuguDatabaseSession]struct{}{existing: {}},
+		map[xuguDatabaseSession]struct{}{existing: {}, createdA: {}, createdB: {}},
+	); ok || n != 2 {
+		t.Fatalf("expected ambiguous session set to degrade with n=2, got ok=%v n=%d", ok, n)
+	}
+	if _, n, ok := controlSessionFromSnapshot(
+		map[xuguDatabaseSession]struct{}{existing: {}},
+		map[xuguDatabaseSession]struct{}{existing: {}},
+	); ok || n != 0 {
+		t.Fatalf("expected empty delta to degrade with n=0, got ok=%v n=%d", ok, n)
+	}
+	if _, err := newXuguDatabaseSession(
+		map[xuguDatabaseSession]struct{}{existing: {}},
+		map[xuguDatabaseSession]struct{}{existing: {}, createdA: {}, createdB: {}},
+	); err == nil {
+		t.Fatal("expected error when session identity is ambiguous")
+	}
+
+	// Unique new session still attaches.
+	if got, n, ok := controlSessionFromSnapshot(
+		map[xuguDatabaseSession]struct{}{existing: {}},
+		map[xuguDatabaseSession]struct{}{existing: {}, createdA: {}},
+	); !ok || n != 1 || got != createdA {
+		t.Fatalf("expected unique session %v, got %v ok=%v n=%d", createdA, got, ok, n)
+	}
+}
+
+func TestCancelActiveQueryWithoutKillSessionIsSafe(t *testing.T) {
+	s := newServer()
+	// Degraded sessions leave killSession nil; cancel must not panic.
+	s.killSession = nil
+	s.cancelActiveQuery()
+
+	ctx, cancel := s.beginActiveOperationWithTimeout(1)
+	defer s.endActiveOperation(cancel)
+	if ctx == nil {
+		t.Fatal("expected active context")
+	}
+	s.cancelActiveQuery()
+}
+
+func TestServerDisconnectClearsDegradedControlState(t *testing.T) {
+	s := newServer()
+	s.params = connectParams{Database: "SHOP_DEMO", Username: "DBX_LOCAL_TEST"}
+	s.nodeID = 0
+	s.databaseSessionID = 0
+	s.killSession = nil
+	s.cancelDB = nil
+	s.ownsCancelDB = false
+	if err := s.disconnect(); err != nil {
+		t.Fatal(err)
+	}
+	if s.db != nil || s.cancelDB != nil || s.killSession != nil {
+		t.Fatalf("expected cleared session state, got db=%v cancelDB=%v killSessionSet=%v", s.db, s.cancelDB, s.killSession != nil)
+	}
+}
+
+func TestXuguControlParamsForcesSystemDatabase(t *testing.T) {
+	params := connectParams{
+		Host:     "127.0.0.1",
+		Port:     5138,
+		Database: "SHOP_DEMO",
+		Username: "DBX_LOCAL_TEST",
+		Password: "secret",
+	}
+	control := xuguControlParams(params)
+	if control.Database != "SYSTEM" {
+		t.Fatalf("control database = %q, want SYSTEM", control.Database)
+	}
+	if control.ConnectionString != "" {
+		t.Fatalf("control connection string should be cleared, got %q", control.ConnectionString)
+	}
+	if params.Database != "SHOP_DEMO" {
+		t.Fatal("xuguControlParams must not mutate caller's database")
+	}
+}
+
 func TestXuguSessionAppNameIsStableAndDoesNotExposeSessionID(t *testing.T) {
 	name := xuguSessionAppName("tab-session-secret")
 	if name != xuguSessionAppName("tab-session-secret") {
