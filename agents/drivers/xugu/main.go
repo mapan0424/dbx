@@ -619,9 +619,7 @@ func (r *runtimeServer) dispatch(method string, params map[string]json.RawMessag
 		if err := session.server.validateConnection(); err == nil {
 			return map[string]bool{"ok": true}, false, nil
 		}
-		r.connectMu.Lock()
-		_, err = session.server.connectWithControl(session.server.params, session.server.cancelDB, false)
-		r.connectMu.Unlock()
+		err = r.reconnectSession(session)
 		return map[string]bool{"ok": true}, false, err
 	case "cancel_session":
 		session, err := r.session(stringParam(params, "agentSessionId"))
@@ -715,6 +713,24 @@ func (r *runtimeServer) openSession(agentSessionID string, params connectParams)
 	return nil
 }
 
+func (r *runtimeServer) reconnectSession(session *agentSession) error {
+	return r.reconnectSessionWith(session, (*server).connectWithControl)
+}
+
+func (r *runtimeServer) reconnectSessionWith(
+	session *agentSession,
+	connect func(*server, connectParams, *sql.DB, bool) (bool, error),
+) error {
+	r.connectMu.Lock()
+	controlAttached, err := connect(session.server, session.server.params, session.server.cancelDB, false)
+	r.connectMu.Unlock()
+	if !controlAttached {
+		r.releaseControl(session.controlKey)
+		session.controlKey = ""
+	}
+	return err
+}
+
 func (r *runtimeServer) replaceSession(agentSessionID string, params connectParams) error {
 	_ = r.closeSession(agentSessionID)
 	return r.openSession(agentSessionID, params)
@@ -746,6 +762,13 @@ func (r *runtimeServer) closeSession(agentSessionID string) error {
 }
 
 func (r *runtimeServer) acquireControl(params connectParams) (string, *sql.DB, error) {
+	return r.acquireControlWith(params, openDB)
+}
+
+func (r *runtimeServer) acquireControlWith(
+	params connectParams,
+	openControl func(connectParams) (*sql.DB, error),
+) (string, *sql.DB, error) {
 	r.controlMu.Lock()
 	defer r.controlMu.Unlock()
 	cancelParams := xuguControlParams(params)
@@ -754,7 +777,7 @@ func (r *runtimeServer) acquireControl(params connectParams) (string, *sql.DB, e
 		control.refs++
 		return key, control.db, nil
 	}
-	db, err := openDB(cancelParams)
+	db, err := openControl(cancelParams)
 	if err != nil {
 		return "", nil, err
 	}

@@ -141,6 +141,85 @@ func TestRuntimeRejectsSessionsBeyondLimit(t *testing.T) {
 	}
 }
 
+func TestRuntimeReconnectReleasesDetachedControlAndAllowsReplacement(t *testing.T) {
+	runtime := newRuntimeServer()
+	params := connectParams{
+		Host:     "127.0.0.1",
+		Port:     5138,
+		Database: "SHOP_DEMO",
+		Username: "DBX_LOCAL_TEST",
+		Password: "secret",
+	}
+	controlKey := buildDSN(xuguControlParams(params))
+	oldControl, err := sql.Open("xugu-test-fast", "old-control")
+	if err != nil {
+		t.Fatal(err)
+	}
+	businessDB, err := sql.Open("xugu-test-fast", "business")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer businessDB.Close()
+
+	session := &agentSession{
+		server:     newServer(),
+		controlKey: controlKey,
+	}
+	session.server.params = params
+	session.server.cancelDB = oldControl
+	runtime.controls[controlKey] = &sharedControl{db: oldControl, refs: 1}
+
+	err = runtime.reconnectSessionWith(
+		session,
+		func(server *server, _ connectParams, cancelDB *sql.DB, _ bool) (bool, error) {
+			if cancelDB != oldControl {
+				t.Fatalf("reconnect control = %p, want %p", cancelDB, oldControl)
+			}
+			server.db = businessDB
+			server.cancelDB = nil
+			return false, nil
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if session.controlKey != "" {
+		t.Fatalf("detached control key = %q, want empty", session.controlKey)
+	}
+	if _, exists := runtime.controls[controlKey]; exists {
+		t.Fatal("detached shared control should be removed")
+	}
+	if err := businessDB.Ping(); err != nil {
+		t.Fatalf("business reconnect should remain usable: %v", err)
+	}
+	if err := oldControl.Ping(); err == nil {
+		t.Fatal("detached shared control should be closed")
+	}
+
+	replacementControl, err := sql.Open("xugu-test-fast", "replacement-control")
+	if err != nil {
+		t.Fatal(err)
+	}
+	opened := 0
+	replacementKey, replacementDB, err := runtime.acquireControlWith(
+		params,
+		func(connectParams) (*sql.DB, error) {
+			opened++
+			return replacementControl, nil
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if opened != 1 || replacementKey != controlKey || replacementDB != replacementControl {
+		t.Fatalf("unexpected replacement control: opened=%d key=%q db=%p", opened, replacementKey, replacementDB)
+	}
+	if control := runtime.controls[controlKey]; control == nil || control.refs != 1 || control.db != replacementControl {
+		t.Fatalf("replacement control not registered: %#v", control)
+	}
+	runtime.releaseControl(replacementKey)
+}
+
 func TestNewXuguDatabaseSessionFindsOnlyNewSession(t *testing.T) {
 	existing := xuguDatabaseSession{nodeID: 1, sessionID: 10}
 	created := xuguDatabaseSession{nodeID: 1, sessionID: 11}
