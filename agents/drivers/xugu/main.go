@@ -1515,15 +1515,34 @@ func configuredDatabaseName(params connectParams) string {
 }
 
 func isXuguMetadataAccessError(err error) bool {
-	message := strings.ToUpper(err.Error())
-	if strings.Contains(message, "E18012") || strings.Contains(message, "权限不够") {
-		return true
+	if err == nil {
+		return false
 	}
+	message := strings.ToUpper(strings.TrimSpace(strings.TrimRight(err.Error(), "\x00")))
+	for _, marker := range []string{
+		"E18012", "权限不够", "PERMISSION DENIED", "ACCESS DENIED", "INSUFFICIENT PRIVILEGE", "NOT AUTHORIZED",
+	} {
+		if strings.Contains(message, marker) {
+			return true
+		}
+	}
+	catalogObject := false
 	for _, object := range []string{
 		"DATABASES", "SCHEMAS", "TABLES", "VIEWS", "COLUMNS", "CONSTRAINTS", "INDEXES",
 		"TRIGGERS", "PARTIS", "SUBPARTIS", "SEQUENCES", "SYNONYMS", "PROCEDURES", "PACKAGES", "TYPES",
 	} {
 		if strings.Contains(message, "ALL_"+object) || strings.Contains(message, "SYS_"+object) {
+			catalogObject = true
+			break
+		}
+	}
+	if !catalogObject {
+		return false
+	}
+	for _, marker := range []string{
+		"不存在", "DOES NOT EXIST", "NOT EXIST", "UNKNOWN TABLE", "UNKNOWN VIEW", "UNDEFINED TABLE", "INVALID OBJECT NAME",
+	} {
+		if strings.Contains(message, marker) {
 			return true
 		}
 	}
@@ -1615,10 +1634,14 @@ func (s *server) listTables(schema string, constraints metadataListConstraints) 
 	rows, err := s.queryRows(query.SQL, query.Args)
 	if err != nil {
 		if isXuguMetadataAccessError(err) {
-			if fallback, fallbackErr := s.listOwnTables(schema, constraints); fallbackErr == nil {
+			fallback, fallbackErr := s.listOwnTables(schema, constraints)
+			if fallbackErr == nil {
 				return fallback, nil
 			}
-			return []tableInfo{}, nil
+			if isXuguMetadataAccessError(fallbackErr) {
+				return []tableInfo{}, nil
+			}
+			return nil, fallbackErr
 		}
 		return nil, err
 	}
@@ -1682,7 +1705,7 @@ func (s *server) listObjects(schema string, constraints metadataListConstraints)
 			// objects are omitted rather than guessed from unavailable metadata.
 			tables, tableErr := s.listTables(schema, constraints)
 			if tableErr != nil {
-				return []objectInfo{}, nil
+				return nil, tableErr
 			}
 			result := make([]objectInfo, 0, len(tables))
 			for _, table := range tables {
@@ -2593,10 +2616,10 @@ func (s *server) getTableDDL(schema, table string) (string, error) {
 			if directErr == nil {
 				return ddl, nil
 			}
-			if isXuguMetadataAccessError(err) {
+			if isXuguMetadataAccessError(directErr) {
 				return xuguUnavailableTableDDL(fallbackSchema, fallbackTable), nil
 			}
-			return "", err
+			return "", directErr
 		}
 		return "", err
 	}
