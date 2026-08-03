@@ -1850,25 +1850,61 @@ func (s *server) listObjects(schema string, constraints metadataListConstraints)
 			// combined object catalog is denied. Programmable object catalogs are
 			// then queried independently so one denied ALL_* view does not hide
 			// the remaining accessible groups.
-			tables, tableErr := s.listTables(schema, constraints)
-			if tableErr == nil && len(tables) > 0 {
-				result := make([]objectInfo, 0, len(tables))
-				for _, table := range tables {
-					result = append(result, objectInfo{Name: table.Name, ObjectType: table.TableType, Schema: schema, Comment: table.Comment})
+			fallbackConstraints := constraints
+			fallbackConstraints.Limit = 0
+			fallbackConstraints.Offset = 0
+			result := make([]objectInfo, 0)
+			seen := make(map[string]bool)
+			appendObject := func(item objectInfo) {
+				key := item.Schema + "\x00" + item.ObjectType + "\x00" + item.Name
+				if !seen[key] {
+					seen[key] = true
+					result = append(result, item)
 				}
-				return result, nil
 			}
-			if tableErr != nil && !isXuguMetadataUnavailableError(tableErr) {
-				return nil, tableErr
+			requested := availableXuguObjectTypes(constraints.ObjectTypes)
+			wantTableFallback := len(constraints.ObjectTypes) == 0
+			for _, objectType := range requested {
+				if objectType == "TABLE" || objectType == "VIEW" {
+					wantTableFallback = true
+					break
+				}
 			}
-			available, availableErr := s.listObjectsByAvailableSources(schema, constraints)
-			if availableErr == nil {
-				return available, nil
+			if wantTableFallback {
+				tables, tableErr := s.listTables(schema, fallbackConstraints)
+				if tableErr != nil && !isXuguMetadataUnavailableError(tableErr) {
+					return nil, tableErr
+				}
+				for _, table := range tables {
+					appendObject(objectInfo{Name: table.Name, ObjectType: table.TableType, Schema: schema, Comment: table.Comment})
+				}
 			}
-			if tableErr != nil && isXuguMetadataUnavailableError(tableErr) {
+			available, availableErr := s.listObjectsByAvailableSources(schema, fallbackConstraints)
+			if availableErr != nil {
+				return nil, availableErr
+			}
+			for _, item := range available {
+				appendObject(item)
+			}
+			sort.SliceStable(result, func(i, j int) bool {
+				if result[i].ObjectType != result[j].ObjectType {
+					return result[i].ObjectType < result[j].ObjectType
+				}
+				return result[i].Name < result[j].Name
+			})
+			if constraints.Offset > 0 {
+				if constraints.Offset >= len(result) {
+					return []objectInfo{}, nil
+				}
+				result = result[constraints.Offset:]
+			}
+			if constraints.Limit > 0 && len(result) > constraints.Limit {
+				result = result[:constraints.Limit]
+			}
+			if len(result) == 0 {
 				return []objectInfo{}, nil
 			}
-			return nil, availableErr
+			return result, nil
 		}
 		return nil, err
 	}
@@ -1899,7 +1935,7 @@ func readXuguObjectRows(rows *sql.Rows, schema string) ([]objectInfo, error) {
 // querying each object family independently lets accessible groups remain
 // visible instead of turning the entire schema tree into a connection error.
 func (s *server) listObjectsByAvailableSources(schema string, constraints metadataListConstraints) ([]objectInfo, error) {
-	objectTypes := []string{"TABLE", "VIEW", "PROCEDURE", "FUNCTION", "PACKAGE", "PACKAGE_BODY", "TRIGGER", "SEQUENCE", "TYPE", "TYPE_BODY"}
+	objectTypes := availableXuguObjectTypes(constraints.ObjectTypes)
 	result := make([]objectInfo, 0)
 	for _, objectType := range objectTypes {
 		scoped := constraints
@@ -1937,6 +1973,25 @@ func (s *server) listObjectsByAvailableSources(schema string, constraints metada
 		result = result[:constraints.Limit]
 	}
 	return emptyIfNil(result), nil
+}
+
+func availableXuguObjectTypes(requested []string) []string {
+	available := []string{"TABLE", "VIEW", "PROCEDURE", "FUNCTION", "PACKAGE", "PACKAGE_BODY", "TRIGGER", "SEQUENCE", "SYNONYM", "TYPE", "TYPE_BODY"}
+	if len(requested) == 0 {
+		return available
+	}
+	selected := normalizedXuguObjectTypes(requested)
+	selectedSet := make(map[string]bool, len(selected))
+	for _, objectType := range selected {
+		selectedSet[objectType] = true
+	}
+	result := make([]string, 0, len(selected))
+	for _, objectType := range available {
+		if selectedSet[objectType] {
+			result = append(result, objectType)
+		}
+	}
+	return result
 }
 
 func metadataListConstraintsFromParams(params map[string]json.RawMessage) metadataListConstraints {
@@ -3030,7 +3085,7 @@ func (s *server) getExplainInfo(sqlText string) (string, error) {
 	if strings.TrimSpace(sqlText) == "" {
 		return "", errors.New("sql is required")
 	}
-	rows, err := s.queryRows("EXPLAIN "+trimStatementSQL(sqlText), nil)
+	rows, err := s.queryRowsWithTimeoutOnce("EXPLAIN "+trimStatementSQL(sqlText), nil, 0)
 	if err != nil {
 		return "", err
 	}
@@ -3126,7 +3181,7 @@ func (s *server) executeQueryPage(opts queryOptions, pageSize int) (queryPageRes
 			HasMore:         false,
 		}, err
 	}
-	rows, err := s.queryRowsWithTimeout(sqlText, nil, opts.TimeoutSecs)
+	rows, err := s.queryRowsWithTimeoutOnce(sqlText, nil, opts.TimeoutSecs)
 	if err != nil {
 		return queryPageResult{}, err
 	}
@@ -3270,7 +3325,7 @@ func (s *server) executeQuery(opts queryOptions) (queryResult, error) {
 }
 
 func (s *server) executeSelect(sqlText string, maxRows int, timeoutSecs int) (queryResult, error) {
-	rows, err := s.queryRowsWithTimeout(sqlText, nil, timeoutSecs)
+	rows, err := s.queryRowsWithTimeoutOnce(sqlText, nil, timeoutSecs)
 	if err != nil {
 		return queryResult{}, err
 	}
@@ -3378,8 +3433,18 @@ func (s *server) reconnectBusinessSession() error {
 	if strings.TrimSpace(params.Host) == "" && strings.TrimSpace(params.ConnectionString) == "" {
 		return errors.New("cannot reconnect Xugu session without connection parameters")
 	}
-	_, err := s.connectWithControl(params, nil, false)
-	return err
+	currentDatabase := s.currentDatabase
+	if _, err := s.connectWithControl(params, nil, false); err != nil {
+		return err
+	}
+	return s.restoreBusinessSessionDatabase(currentDatabase)
+}
+
+func (s *server) restoreBusinessSessionDatabase(database string) error {
+	if strings.TrimSpace(database) == "" {
+		return nil
+	}
+	return s.useDatabase(database)
 }
 
 func (s *server) execWithReconnect(statement string) error {

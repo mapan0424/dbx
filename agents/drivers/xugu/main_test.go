@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -967,6 +968,41 @@ func TestXuguListObjectsQueryKeepsPublicSynonymsOutOfSchemaGroups(t *testing.T) 
 	assertArgs(t, query.Args, []any{"SYSDBA", "SYNONYM"})
 }
 
+func TestAvailableXuguObjectTypesRespectsConstraints(t *testing.T) {
+	tests := []struct {
+		name      string
+		requested []string
+		want      []string
+	}{
+		{
+			name: "unconstrained includes synonyms",
+			want: []string{"TABLE", "VIEW", "PROCEDURE", "FUNCTION", "PACKAGE", "PACKAGE_BODY", "TRIGGER", "SEQUENCE", "SYNONYM", "TYPE", "TYPE_BODY"},
+		},
+		{
+			name:      "requested families only",
+			requested: []string{"synonym", "function"},
+			want:      []string{"FUNCTION", "SYNONYM"},
+		},
+		{
+			name:      "aliases are normalized",
+			requested: []string{"base table"},
+			want:      []string{"TABLE"},
+		},
+		{
+			name:      "unsupported types stay empty",
+			requested: []string{"MATERIALIZED_VIEW"},
+			want:      []string{},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := availableXuguObjectTypes(test.requested); !reflect.DeepEqual(got, test.want) {
+				t.Fatalf("availableXuguObjectTypes(%v) = %v, want %v", test.requested, got, test.want)
+			}
+		})
+	}
+}
+
 func TestXuguListObjectsQueryExcludesSystemSequences(t *testing.T) {
 	query := xuguListObjectsQuery("APP", metadataListConstraints{
 		ObjectTypes: []string{"sequence"},
@@ -1834,6 +1870,29 @@ func TestExecuteQueryPreservesXuguTypeBodyTerminator(t *testing.T) {
 	}
 }
 
+func TestRestoreBusinessSessionDatabaseReplaysUse(t *testing.T) {
+	resetXuguRecordingDriver()
+	db, err := sql.Open("xugu-test-recording", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	s := newServer()
+	s.db = db
+	s.params.Database = "SHOP_DEMO"
+	s.currentDatabase = "SHOP_DEMO"
+	if err := s.restoreBusinessSessionDatabase("SHOP_ARCHIVE"); err != nil {
+		t.Fatalf("restoreBusinessSessionDatabase() error: %v", err)
+	}
+	if got := recordedXuguSQL(); got != `USE "SHOP_ARCHIVE"` {
+		t.Fatalf("restoreBusinessSessionDatabase() executed %q", got)
+	}
+	if s.currentDatabase != "SHOP_ARCHIVE" {
+		t.Fatalf("currentDatabase = %q, want SHOP_ARCHIVE", s.currentDatabase)
+	}
+}
+
 func TestXuguShowStatementsUseResultSetQueryPath(t *testing.T) {
 	resetXuguShowResultDriver()
 	db, err := sql.Open("xugu-test-show-result", "")
@@ -2047,8 +2106,15 @@ func TestMetadataPermissionFallbackDoesNotReturnRPCError(t *testing.T) {
 		t.Fatalf("listTables permission fallback = %#v, %v; want USER_TABLES result", tables, err)
 	}
 	objects, err := s.listObjects("APP", metadataListConstraints{})
-	if err != nil || len(objects) != 1 || objects[0].Name != "PUBLIC_TABLE" {
-		t.Fatalf("listObjects permission fallback = %#v, %v; want USER_TABLES result", objects, err)
+	if err != nil || len(objects) != 2 {
+		t.Fatalf("listObjects permission fallback = %#v, %v; want table and accessible synonym", objects, err)
+	}
+	objectNames := map[string]string{}
+	for _, object := range objects {
+		objectNames[object.ObjectType] = object.Name
+	}
+	if objectNames["TABLE"] != "PUBLIC_TABLE" || objectNames["SYNONYM"] != "PRIVATE_SYNONYM" {
+		t.Fatalf("listObjects permission fallback = %#v", objects)
 	}
 	indexes, err := s.listIndexes("APP", "PUBLIC_TABLE")
 	if err != nil || len(indexes) != 0 {
@@ -2256,6 +2322,12 @@ func (c *xuguPermissionMetadataConn) QueryContext(_ context.Context, query strin
 	}
 	if strings.Contains(upper, "FROM USER_VIEWS") {
 		return &xuguStaticRows{columns: []string{"VIEW_NAME", "TABLE_TYPE", "COMMENTS"}}, nil
+	}
+	if strings.Contains(upper, "FROM ALL_SYNONYMS") && strings.Contains(upper, "AS OBJECT_TYPE") && !strings.Contains(upper, "FROM ALL_TABLES") {
+		return &xuguStaticRows{
+			columns: []string{"OBJECT_NAME", "OBJECT_TYPE", "COMMENTS", "VALID"},
+			values:  [][]driver.Value{{"PRIVATE_SYNONYM", "SYNONYM", nil, true}},
+		}, nil
 	}
 	if strings.Contains(upper, "ALL_") || strings.Contains(upper, "SYS_") {
 		return nil, errors.New("[E18012] 权限不够")
