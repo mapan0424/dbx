@@ -889,6 +889,12 @@ func TestXuguMetadataAccessErrorDetection(t *testing.T) {
 		{name: "catalog name after missing endpoint", message: "network endpoint not found while querying SYS_TABLES", want: false},
 		{name: "unrelated network error", message: "network timeout", want: false},
 	}
+	if !isXuguConnectionClosedError(io.EOF) {
+		t.Fatal("expected EOF to be treated as a closed Xugu connection")
+	}
+	if !isXuguMetadataUnavailableError(errors.New("接收数据库连接失败: EOF")) {
+		t.Fatal("expected Xugu connection EOF to be treated as unavailable metadata")
+	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			if got := isXuguMetadataAccessError(errors.New(test.message)); got != test.want {
@@ -947,7 +953,7 @@ func TestXuguListObjectsQueryIncludesProgrammableObjects(t *testing.T) {
 		}
 	}
 
-	wantArgs := []any{"APP", "APP", "APP", "APP", "APP", "APP", "APP", "APP", "APP", "APP", "FUNCTION", "PACKAGE", "PACKAGE_BODY", "PROCEDURE", "SEQUENCE", "SYNONYM", "TRIGGER", "TYPE", "TYPE_BODY"}
+	wantArgs := []any{"APP", "APP", "APP", "APP", "APP", "APP", "APP", "APP", "FUNCTION", "PACKAGE", "PACKAGE_BODY", "PROCEDURE", "SEQUENCE", "SYNONYM", "TRIGGER", "TYPE", "TYPE_BODY"}
 	assertArgs(t, query.Args, wantArgs)
 }
 
@@ -958,7 +964,7 @@ func TestXuguListObjectsQueryKeepsPublicSynonymsOutOfSchemaGroups(t *testing.T) 
 			t.Fatalf("expected SQL to contain %q:\n%s", want, query.SQL)
 		}
 	}
-	assertArgs(t, query.Args, []any{"SYSDBA", "SYSDBA", "SYSDBA", "SYSDBA", "SYSDBA", "SYSDBA", "SYSDBA", "SYSDBA", "SYSDBA", "SYSDBA", "SYNONYM"})
+	assertArgs(t, query.Args, []any{"SYSDBA", "SYNONYM"})
 }
 
 func TestXuguListObjectsQueryExcludesSystemSequences(t *testing.T) {
@@ -1973,6 +1979,56 @@ func init() {
 	sql.Register("xugu-test-synonym-source", &xuguSynonymSourceDriver{})
 	sql.Register("xugu-test-permission-metadata", &xuguPermissionMetadataDriver{})
 	sql.Register("xugu-test-fallback-errors", &xuguFallbackErrorDriver{})
+	sql.Register("xugu-test-eof", &xuguEOFDriver{})
+}
+
+type xuguEOFDriver struct{}
+
+func (d *xuguEOFDriver) Open(name string) (driver.Conn, error) {
+	return &xuguEOFConn{}, nil
+}
+
+type xuguEOFConn struct{}
+
+func (c *xuguEOFConn) Prepare(query string) (driver.Stmt, error) {
+	return nil, errors.New("not supported")
+}
+func (c *xuguEOFConn) Close() error              { return nil }
+func (c *xuguEOFConn) Begin() (driver.Tx, error) { return nil, errors.New("not supported") }
+func (c *xuguEOFConn) QueryContext(_ context.Context, _ string, _ []driver.NamedValue) (driver.Rows, error) {
+	return nil, io.EOF
+}
+
+func TestXuguMetadataRootsDegradeAfterCatalogConnectionClose(t *testing.T) {
+	db, err := sql.Open("xugu-test-eof", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	s := newServer()
+	s.db = db
+	s.params = connectParams{Database: "SHOP_DEMO", Username: "APP_TEST"}
+	s.currentDatabase = "SHOP_DEMO"
+
+	requests := []func() error{
+		func() error { _, err := s.listDatabases(); return err },
+		func() error { _, err := s.listSchemas(); return err },
+		func() error { _, err := s.listTables("APP_TEST", metadataListConstraints{}); return err },
+		func() error { _, err := s.listObjects("APP_TEST", metadataListConstraints{}); return err },
+		func() error { _, err := s.getColumns("APP_TEST", "T_CUSTOMERS"); return err },
+		func() error { _, err := s.listIndexes("APP_TEST", "T_CUSTOMERS"); return err },
+		func() error { _, err := s.listForeignKeys("APP_TEST", "T_CUSTOMERS"); return err },
+		func() error { _, err := s.listConstraints("APP_TEST", "T_CUSTOMERS"); return err },
+		func() error { _, err := s.listTriggers("APP_TEST", "T_CUSTOMERS"); return err },
+		func() error { _, err := s.listPartitions("APP_TEST", "T_CUSTOMERS"); return err },
+		func() error { _, err := s.listSubpartitions("APP_TEST", "T_CUSTOMERS"); return err },
+	}
+	for index, request := range requests {
+		if err := request(); err != nil {
+			t.Fatalf("metadata root %d should degrade without RPC error: %v", index, err)
+		}
+	}
 }
 
 func TestMetadataPermissionFallbackDoesNotReturnRPCError(t *testing.T) {
