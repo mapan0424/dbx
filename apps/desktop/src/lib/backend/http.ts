@@ -4,6 +4,7 @@ import type {
   DatabaseConnectionInfo,
   DatabaseInfo,
   DatabaseStorageInfo,
+  SqlServerCompletionContext,
   SchemaInfo,
   LinkedServerInfo,
   CatalogInfo,
@@ -44,6 +45,7 @@ import type {
   TunnelProfile,
 } from "@/types/database";
 import { normalizeRustMongoCommand, type MongoCommand } from "@/lib/mongo/mongoShellCommand";
+import { BackendErrorException, type BackendError } from "@/lib/backend/errorUtils";
 import type { CollectionInfo } from "@/types/database";
 import type { SchemaDiffPreparation, SchemaDiffPreparationOptions, TableDiff, FunctionDiff, SequenceDiff, RuleDiff, OwnerDiff } from "@/lib/schema/schemaDiff";
 import type { SidebarObjectKind } from "@/lib/database/databaseObjectCapabilities";
@@ -70,6 +72,7 @@ import type {
   RedisDatabaseInfo,
   RedisStreamConsumer,
   RedisStreamGroup,
+  RedisStreamPage,
   RedisStreamPendingPage,
   RedisValue,
   RedisScanResult,
@@ -88,9 +91,15 @@ import type {
   KvDeleteResponse,
   KvHistoryResponse,
   KvStatusResponse,
+  EtcdDefragResponse,
+  EtcdWatchStartRequest,
+  EtcdWatchStartResponse,
+  EtcdWatchPollResponse,
+  EtcdLeaseListResponse,
   DocumentQueryResult,
   MongoDocumentResult,
   MongoCollectionStatsResult,
+  MongoDropIndexesResult,
   MongoGridFsBucketInfo,
   HistoryEntry,
   HistorySearchRequest,
@@ -216,19 +225,19 @@ async function post<T>(url: string, body: unknown): Promise<T> {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
   });
-  if (!res.ok) throw new Error(await res.text());
+  if (!res.ok) throw await backendResponseError(res);
   return res.json();
 }
 
 async function get<T>(url: string): Promise<T> {
   const res = await fetch(apiUrl(url));
-  if (!res.ok) throw new Error(await res.text());
+  if (!res.ok) throw await backendResponseError(res);
   return res.json();
 }
 
 async function del<T>(url: string): Promise<T> {
   const res = await fetch(apiUrl(url), { method: "DELETE" });
-  if (!res.ok) throw new Error(await res.text());
+  if (!res.ok) throw await backendResponseError(res);
   return res.json();
 }
 
@@ -238,8 +247,19 @@ async function put<T>(url: string, body: unknown): Promise<T> {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
   });
-  if (!res.ok) throw new Error(await res.text());
+  if (!res.ok) throw await backendResponseError(res);
   return res.json();
+}
+
+async function backendResponseError(response: Response): Promise<BackendErrorException> {
+  const text = await response.text();
+  let payload: unknown = text;
+  try {
+    payload = JSON.parse(text);
+  } catch {
+    // Preserve legacy plain-text responses at the same compatibility boundary.
+  }
+  return new BackendErrorException(payload);
 }
 
 function qs(params: Record<string, string | number | boolean | undefined>): string {
@@ -483,8 +503,8 @@ export async function upgradeAllAgents(_source?: UpdateDownloadSource, operation
   return post("/api/agents/upgrade-all", { operationId });
 }
 
-export async function checkAgentUpdateBlockers(_dbTypes: string[]): Promise<AgentUpdateBlocker[]> {
-  return [];
+export async function checkAgentUpdateBlockers(dbTypes: string[]): Promise<AgentUpdateBlocker[]> {
+  return post("/api/agents/update-blockers", { dbTypes });
 }
 
 export async function uninstallAgent(dbType: string): Promise<void> {
@@ -505,7 +525,7 @@ export async function invalidateAgentRegistryCache(): Promise<void> {
 
 export async function importAgentsFromZip(fileOrPath: string | File, operationId?: string): Promise<number> {
   if (typeof fileOrPath === "string") {
-    throw new Error("Offline ZIP import in web mode requires a File object, not a file path");
+    throw new Error("Offline package import in web mode requires a File object, not a file path");
   }
   const formData = new FormData();
   if (operationId) formData.append("operationId", operationId);
@@ -628,6 +648,10 @@ export async function listDatabaseStorage(connectionId: string, databases: strin
   });
 }
 
+export async function getSqlServerCompletionContext(connectionId: string, database: string): Promise<SqlServerCompletionContext> {
+  return get(`/api/schema/sqlserver/completion-context?${qs({ connection_id: connectionId, database })}`);
+}
+
 export async function listDorisCatalogs(connectionId: string): Promise<CatalogInfo[]> {
   return get(`/api/schema/doris/catalogs?${qs({ connection_id: connectionId })}`);
 }
@@ -681,7 +705,7 @@ export async function getTableComment(_connectionId: string, _database: string, 
   throw new Error("Table comment lookup is not available in the web backend");
 }
 
-export async function listObjects(connectionId: string, database: string, schema: string, objectTypes?: SidebarObjectKind[], filter?: string, limit?: number, offset?: number, catalog?: string): Promise<ObjectInfo[]> {
+export async function listObjects(connectionId: string, database: string, schema: string, objectTypes?: (SidebarObjectKind | "EVENT")[], filter?: string, limit?: number, offset?: number, catalog?: string): Promise<ObjectInfo[]> {
   return get(
     `/api/schema/objects?${qs({
       connection_id: connectionId,
@@ -819,7 +843,7 @@ export async function executeQuery(
     resultSessionId?: string;
     clientSessionId?: string;
     timeoutSecs?: number;
-    executionMode?: "simple";
+    executionMode?: "simple" | "postgres_read_only_transaction";
   },
 ): Promise<QueryResult> {
   return post("/api/query/execute", {
@@ -863,9 +887,13 @@ export async function executeMulti(
 
 export interface ExecuteMultiProgress {
   executionId: string;
+  statementIndex: number;
   completed: number;
   total: number;
   success: boolean;
+  executionTimeMs: number;
+  affectedRows: number;
+  error?: BackendError;
 }
 
 export async function executeMultiWithProgress(
@@ -885,15 +913,26 @@ export async function executeMultiWithProgress(
     useTransaction?: boolean;
     continueOnError?: boolean;
     executionMode?: "simple";
+    executionId?: string;
   },
 ): Promise<QueryResult[]> {
-  const executionId = crypto.randomUUID();
-  const results = await executeMulti(connectionId, database, sql, schema, executionId, options);
-  onProgress({
-    executionId,
-    completed: results.length,
-    total: results.length,
-    success: !results.some((result) => result.execution_error === true),
+  const executionId = options?.executionId ?? crypto.randomUUID();
+  const { executionId: _executionId, ...executeOptions } = options ?? {};
+  const results = await executeMulti(connectionId, database, sql, schema, executionId, executeOptions);
+  const total = results.length;
+  results.forEach((result, index) => {
+    const statementIndex = result.statement_index ?? index;
+    const success = result.execution_error !== true;
+    onProgress({
+      executionId,
+      statementIndex,
+      completed: index + 1,
+      total,
+      success,
+      executionTimeMs: result.execution_time_ms,
+      affectedRows: result.affected_rows,
+      error: success ? undefined : result.error,
+    });
   });
   return results;
 }
@@ -1310,6 +1349,7 @@ export async function aiAgentStream(
   request: AiCompletionRequest,
   connectionId: string,
   database: string,
+  schema: string | undefined,
   dbType: string,
   onEvent: (event: import("@/lib/backend/tauri").AgentEvent) => void,
   mode?: string,
@@ -1317,6 +1357,7 @@ export async function aiAgentStream(
   confirmedWriteSql?: string,
   confirmedConnectionId?: string,
   confirmedDatabase?: string,
+  confirmedSchema?: string,
   signal?: AbortSignal,
 ): Promise<string> {
   const res = await fetch(apiUrl("/api/ai/agent-stream"), {
@@ -1327,12 +1368,14 @@ export async function aiAgentStream(
       request,
       connectionId,
       database,
+      schema,
       dbType,
       mode: mode || "ask",
       allowWriteSql,
       confirmedWriteSql,
       confirmedConnectionId,
       confirmedDatabase,
+      confirmedSchema,
     }),
     signal,
   });
@@ -1587,6 +1630,12 @@ export interface SnippetSyncConfig {
   provider: SnippetProvider;
   token?: string;
   snippetId?: string;
+  replaceLegacySnippet?: boolean;
+}
+
+export interface SnippetSyncSettings {
+  snippetId?: string;
+  legacyCleanupRequiredId?: string;
 }
 
 export interface SnippetSyncSummary {
@@ -1595,6 +1644,7 @@ export interface SnippetSyncSummary {
   bytes: number;
   exportedAt?: string;
   appVersion?: string;
+  legacyCleanupRequiredId?: string;
 }
 
 export interface SnippetDownloadResult {
@@ -1667,17 +1717,33 @@ export async function forgetSnippetSavedToken(config: SnippetSyncConfig): Promis
   await post("/api/cloud-sync/snippet/forget-token", { config });
 }
 
-export async function snippetSyncUpload(config: SnippetSyncConfig, editorSettings?: unknown, secretsPassphrase?: string): Promise<SnippetSyncSummary> {
+export async function snippetSyncSettings(provider: SnippetProvider): Promise<SnippetSyncSettings> {
+  return post("/api/cloud-sync/snippet/settings", { provider });
+}
+
+export async function saveSnippetSyncId(provider: SnippetProvider, snippetId?: string): Promise<void> {
+  await post("/api/cloud-sync/snippet/save-id", { provider, snippetId });
+}
+
+export async function retrySnippetLegacyCleanup(config: SnippetSyncConfig): Promise<SnippetSyncSettings> {
+  return post("/api/cloud-sync/snippet/retry-legacy-cleanup", { config });
+}
+
+export async function snippetSyncUpload(config: SnippetSyncConfig, editorSettings?: unknown, snippetPassphrase?: string, includeSecrets = false, secretsPassphrase?: string): Promise<SnippetSyncSummary> {
   return post("/api/cloud-sync/snippet/upload", {
     config,
     editorSettings,
+    snippetPassphrase,
+    includeSecrets,
     secretsPassphrase,
   });
 }
 
-export async function snippetSyncDownload(config: SnippetSyncConfig, secretsPassphrase?: string): Promise<SnippetDownloadResult> {
+export async function snippetSyncDownload(config: SnippetSyncConfig, snippetPassphrase?: string, restoreSecrets = false, secretsPassphrase?: string): Promise<SnippetDownloadResult> {
   return post("/api/cloud-sync/snippet/download", {
     config,
+    snippetPassphrase,
+    restoreSecrets,
     secretsPassphrase,
   });
 }
@@ -2238,6 +2304,14 @@ export async function redisGetValue(connectionId: string, db: number, keyRaw: st
   return post("/api/redis/get-value", { connectionId, db, keyRaw });
 }
 
+export async function redisGetTtl(connectionId: string, db: number, keyRaw: string): Promise<number> {
+  return post("/api/redis/get-ttl", { connectionId, db, keyRaw });
+}
+
+export async function redisGetStreamEntries(connectionId: string, db: number, keyRaw: string, cursor?: string): Promise<RedisStreamPage> {
+  return post("/api/redis/get-stream-entries", { connectionId, db, keyRaw, cursor });
+}
+
 export async function redisGetStreamGroups(connectionId: string, db: number, keyRaw: string): Promise<RedisStreamGroup[]> {
   return post("/api/redis/get-stream-groups", { connectionId, db, keyRaw });
 }
@@ -2500,6 +2574,33 @@ export async function etcdHistory(
 
 export async function etcdStatus(connectionId: string): Promise<KvStatusResponse> {
   return post("/api/etcd/status", { connectionId });
+}
+export async function etcdPreflight(connectionId: string, action: string, params: Record<string, unknown>): Promise<import("./tauri").EtcdPreflightResponse> {
+  return post("/api/etcd/preflight", { connectionId, request: { action, params } });
+}
+export async function etcdCompact(connectionId: string, revision: KvInt64, approval: import("./tauri").EtcdDangerousApproval): Promise<{ revision: KvInt64 }> {
+  return post("/api/etcd/compact", { connectionId, revision, ...approval });
+}
+export async function etcdDefrag(connectionId: string, endpoints: string[], approval: import("./tauri").EtcdDangerousApproval): Promise<EtcdDefragResponse> {
+  return post("/api/etcd/defrag", { connectionId, endpoints, ...approval });
+}
+export async function etcdWatchStart(connectionId: string, request: EtcdWatchStartRequest): Promise<EtcdWatchStartResponse> {
+  return post("/api/etcd/watch/start", { connectionId, request });
+}
+export async function etcdWatchPoll(connectionId: string, watchId: string): Promise<EtcdWatchPollResponse> {
+  return post("/api/etcd/watch/poll", { connectionId, watchId });
+}
+export async function etcdWatchStop(connectionId: string, watchId: string): Promise<{ stopped: boolean }> {
+  return post("/api/etcd/watch/stop", { connectionId, watchId });
+}
+export async function etcdLeaseList(connectionId: string, limit = 100, continuation?: string | null): Promise<EtcdLeaseListResponse> {
+  return post("/api/etcd/lease/list", { connectionId, limit, continuation: continuation ?? null });
+}
+export async function etcdLeaseCall<T = unknown>(connectionId: string, operation: "get" | "grant" | "keepalive" | "revoke", params: Record<string, unknown>, approval?: import("./tauri").EtcdDangerousApproval): Promise<T> {
+  return post("/api/etcd/lease/call", { connectionId, operation, params, ...approval });
+}
+export async function etcdAuthCall<T = unknown>(connectionId: string, operation: string, params: Record<string, unknown>, approval?: import("./tauri").EtcdDangerousApproval): Promise<T> {
+  return post("/api/etcd/auth/call", { connectionId, operation, params, ...approval });
 }
 
 // ---------------------------------------------------------------------------
@@ -3005,7 +3106,7 @@ export async function mongoCreateIndex(connectionId: string, database: string, c
   });
 }
 
-export async function mongoDropIndexes(connectionId: string, database: string, collection: string, indexesJson?: string, single = false): Promise<{ dropped_names: string[]; affected_rows: number }> {
+export async function mongoDropIndexes(connectionId: string, database: string, collection: string, indexesJson?: string, single = false): Promise<MongoDropIndexesResult> {
   return post("/api/mongo/drop-indexes", {
     connectionId,
     database,
@@ -3069,13 +3170,14 @@ export async function mongoDeleteDocument(connectionId: string, database: string
   return documentDeleteDocument(connectionId, database, collection, id, routing);
 }
 
-export async function documentDeleteDocument(connectionId: string, database: string, collection: string, id: string, routing?: string): Promise<number> {
+export async function documentDeleteDocument(connectionId: string, database: string, collection: string, id: string, routing?: string, documentType?: string): Promise<number> {
   return post("/api/document-store/delete-document", {
     connectionId,
     database,
     collection,
     id,
     routing,
+    documentType,
   });
 }
 
@@ -3187,6 +3289,7 @@ export async function checkMcpServerStatus(): Promise<import("@/lib/backend/taur
     bin_path: null,
     native_bin_path: null,
     script_path: null,
+    data_dir: null,
     install_command: "npm install -g @dbx-app/mcp-server@latest --registry=https://registry.npmjs.org",
     update_command: "npm install -g @dbx-app/mcp-server@latest --registry=https://registry.npmjs.org",
     error: "MCP Server status is only available in the desktop app.",
@@ -3204,6 +3307,8 @@ export async function getSystemProxyUrl(): Promise<string | null> {
 export async function downloadUpdate(_source: UpdateDownloadSource, _latestVersion?: string): Promise<void> {
   throw new Error("In-app update downloads are only available in the desktop app.");
 }
+
+export async function cancelUpdateDownload(): Promise<void> {}
 
 export async function installDownloadedUpdate(): Promise<void> {
   throw new Error("In-app update installation is only available in the desktop app.");

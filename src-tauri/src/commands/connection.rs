@@ -8,8 +8,9 @@ pub use dbx_core::agent_connection::{
 };
 pub use dbx_core::connection::{
     agent_connect_timeout, connect_bare_metadata_pool, connect_mysql_metadata_pool, connection_url_for_endpoint,
-    metadata_connection_config, prestosql_jdbc_config_for_endpoint, probe_connection_endpoint,
-    redacted_connection_url_for_endpoint, AppState, MysqlMode, PoolKind,
+    gaussdb_m_jdbc_config_for_endpoint, gaussdb_uses_m_jdbc_driver, metadata_connection_config,
+    prestosql_jdbc_config_for_endpoint, probe_connection_endpoint, redacted_connection_url_for_endpoint, AppState,
+    MysqlMode, PoolKind,
 };
 use dbx_core::database_capabilities;
 use dbx_core::db;
@@ -22,6 +23,10 @@ pub use dbx_core::path_utils::expand_tilde;
 
 const MONGO_LEGACY_DRIVER_PROFILE: &str = "mongodb-legacy";
 const MONGO_LEGACY_DRIVER_LABEL: &str = "MongoDB (Legacy)";
+
+fn gaussdb_m_jdbc_command_config(config: &ConnectionConfig, host: &str, port: u16) -> Option<ConnectionConfig> {
+    gaussdb_uses_m_jdbc_driver(config).then(|| gaussdb_m_jdbc_config_for_endpoint(config, host, port))
+}
 
 fn mongo_legacy_connect_params(config: &ConnectionConfig, host: &str, port: u16) -> serde_json::Value {
     serde_json::json!({
@@ -40,20 +45,18 @@ fn mark_mongo_legacy_driver(config: &mut ConnectionConfig) -> bool {
     changed
 }
 
-async fn persist_mongo_legacy_driver_profile(state: &AppState, config: &ConnectionConfig) -> Result<(), String> {
+async fn persist_mongo_legacy_driver_profile(state: &AppState, config: &ConnectionConfig) -> Result<bool, String> {
     if config.one_time {
-        return Ok(());
+        return Ok(true);
     }
-
-    let mut configs: Vec<ConnectionConfig> =
-        state.storage.load_connections().await?.into_iter().map(|config| config.canonicalized()).collect();
-    let Some(saved_config) = configs.iter_mut().find(|saved_config| saved_config.id == config.id) else {
-        return Ok(());
-    };
-    if !mark_mongo_legacy_driver(saved_config) {
-        return Ok(());
-    }
-    save_connection_configs(state, &configs).await
+    state
+        .storage
+        .save_connection_driver_profile(
+            config,
+            Some(MONGO_LEGACY_DRIVER_PROFILE.to_string()),
+            Some(MONGO_LEGACY_DRIVER_LABEL.to_string()),
+        )
+        .await
 }
 
 async fn test_agent_connection(
@@ -157,7 +160,7 @@ async fn connect_agent_pool(
         }
     }
 
-    Ok(PoolKind::Agent(Arc::new(tokio::sync::Mutex::new(client))))
+    Ok(PoolKind::agent(client))
 }
 
 #[cfg(test)]
@@ -165,7 +168,8 @@ mod tests {
     #[cfg(feature = "mq-admin")]
     use super::load_connection_configs;
     use super::{
-        connect_sqlite_from_config, mark_mongo_legacy_driver, mongo_legacy_connect_params, save_connection_configs,
+        connect_sqlite_from_config, gaussdb_m_jdbc_command_config, mark_mongo_legacy_driver,
+        mongo_legacy_connect_params, persist_mongo_legacy_driver_profile, save_connection_configs,
         MONGO_LEGACY_DRIVER_LABEL, MONGO_LEGACY_DRIVER_PROFILE,
     };
     use dbx_core::connection::{AppState, PoolKind};
@@ -358,6 +362,28 @@ mod tests {
     }
 
     #[test]
+    fn gaussdb_m_commands_select_vendor_jdbc_config() {
+        let mut config = mongodb_config();
+        config.db_type = DatabaseType::Gaussdb;
+        config.driver_profile = Some("gaussdb-m".to_string());
+        config.host = "gaussdb.internal".to_string();
+        config.port = 8000;
+        config.database = Some("app".to_string());
+        config.url_params = None;
+        config.connection_string = None;
+
+        let jdbc = gaussdb_m_jdbc_command_config(&config, "127.0.0.1", 18000).unwrap();
+        assert_eq!(
+            jdbc.connection_string.as_deref(),
+            Some("jdbc:gaussdb://127.0.0.1:18000/app?sslmode=prefer&ssl=true")
+        );
+        assert_eq!(jdbc.jdbc_driver_class.as_deref(), Some("com.huawei.gaussdb.jdbc.Driver"));
+
+        config.driver_profile = Some("gaussdb".to_string());
+        assert!(gaussdb_m_jdbc_command_config(&config, "127.0.0.1", 18000).is_none());
+    }
+
+    #[test]
     fn mongo_legacy_connect_params_preserve_auth_options() {
         let config = mongodb_config();
 
@@ -379,6 +405,29 @@ mod tests {
         assert_eq!(config.driver_profile.as_deref(), Some(MONGO_LEGACY_DRIVER_PROFILE));
         assert_eq!(config.driver_label.as_deref(), Some(MONGO_LEGACY_DRIVER_LABEL));
         assert!(!mark_mongo_legacy_driver(&mut config));
+    }
+
+    #[tokio::test]
+    async fn persist_mongo_legacy_driver_profile_updates_only_the_target_connection() {
+        let dir = std::env::temp_dir().join(format!("dbx-tauri-mongo-profile-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let storage = Storage::open(&dir.join("storage.db")).await.unwrap();
+        let state = AppState::new_with_plugin_dir(storage, dir.join("plugins"));
+        let mongo = mongodb_config();
+        let mut other = mongodb_config();
+        other.id = "other".to_string();
+        other.name = "Other MongoDB".to_string();
+        state.storage.save_connections(&[mongo.clone(), other.clone()]).await.unwrap();
+
+        persist_mongo_legacy_driver_profile(&state, &mongo).await.unwrap();
+
+        let saved = state.storage.load_connections().await.unwrap();
+        let updated = saved.iter().find(|config| config.id == mongo.id).unwrap();
+        assert_eq!(updated.driver_profile.as_deref(), Some(MONGO_LEGACY_DRIVER_PROFILE));
+        assert_eq!(updated.driver_label.as_deref(), Some(MONGO_LEGACY_DRIVER_LABEL));
+        assert_eq!(saved.iter().find(|config| config.id == other.id), Some(&other));
+
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[cfg(feature = "sqlite-sqlcipher")]
@@ -741,6 +790,7 @@ async fn test_connection_with_info_inner(
     let target = redacted_connection_url_for_endpoint(&config, &host, port);
     let connect_timeout = std::time::Duration::from_secs(config.effective_connect_timeout_secs());
     let idle_timeout = std::time::Duration::from_secs(config.idle_timeout_secs);
+    let gaussdb_m_jdbc_config = gaussdb_m_jdbc_command_config(&config, &host, port);
     log::info!("[test_connection] db_type={:?} target={}", config.db_type, target);
     let mut database_info = None;
     let result = match probe_result {
@@ -818,6 +868,18 @@ async fn test_connection_with_info_inner(
                     Err(e) => Err(e),
                 }
             }
+            DatabaseType::Gaussdb if gaussdb_m_jdbc_config.is_some() => {
+                match state
+                    .test_external_driver_with_info("jdbc", gaussdb_m_jdbc_config.as_ref().expect("checked above"))
+                    .await
+                {
+                    Ok(details) => {
+                        database_info = details.database_info;
+                        Ok(details.message)
+                    }
+                    Err(err) => Err(err),
+                }
+            }
             DatabaseType::Postgres
             | DatabaseType::Redshift
             | DatabaseType::Gaussdb
@@ -839,13 +901,13 @@ async fn test_connection_with_info_inner(
                 // are reset after both successful and failed Redis tests.
                 test_redis_connection(state, &tunnel_id, &config, &host, port, connect_timeout).await
             }
-            #[cfg(feature = "duckdb-bundled")]
+            #[cfg(feature = "duckdb-sidecar")]
             DatabaseType::DuckDb => {
                 state.test_duckdb_connection_config(&config).await?;
                 Ok("Connection successful".to_string())
             }
-            #[cfg(not(feature = "duckdb-bundled"))]
-            DatabaseType::DuckDb => Err("DuckDB support not compiled (enable duckdb-bundled feature)".to_string()),
+            #[cfg(not(feature = "duckdb-sidecar"))]
+            DatabaseType::DuckDb => Err("DuckDB support is not compiled in this build".to_string()),
             DatabaseType::MongoDb => {
                 if mongo_uses_legacy_driver(&config) {
                     let am = &state.agent_manager;
@@ -919,6 +981,20 @@ async fn test_connection_with_info_inner(
                     connect_timeout,
                 );
                 db::elasticsearch_driver::test_connection(&mut client, connect_timeout)
+                    .await
+                    .map(|_| "Connection successful".to_string())
+            }
+            DatabaseType::Easysearch => {
+                let mut client = db::easysearch_driver::EasysearchClient::from_config(
+                    &url,
+                    Some(&config.username),
+                    Some(&config.password),
+                    config.ssl,
+                    config.url_params.as_deref(),
+                    config.external_config.as_ref(),
+                    connect_timeout,
+                );
+                db::easysearch_driver::test_connection(&mut client, connect_timeout)
                     .await
                     .map(|_| "Connection successful".to_string())
             }
@@ -1110,6 +1186,7 @@ pub async fn connect_db(
     let url = connection_url_for_endpoint(&db_config, &host, port);
     let connect_timeout = std::time::Duration::from_secs(db_config.effective_connect_timeout_secs());
     let idle_timeout = std::time::Duration::from_secs(db_config.idle_timeout_secs);
+    let gaussdb_m_jdbc_config = gaussdb_m_jdbc_command_config(&db_config, &host, port);
 
     let pool = match db_config.db_type {
         DatabaseType::Mysql => {
@@ -1121,6 +1198,9 @@ pub async fn connect_db(
             connect_bare_metadata_pool(&db_config, &host, port, connect_timeout, 3).await?,
             MysqlMode::Bare,
         ),
+        DatabaseType::Gaussdb if gaussdb_m_jdbc_config.is_some() => {
+            state.external_driver_pool("jdbc", gaussdb_m_jdbc_config.as_ref().expect("checked above")).await?
+        }
         DatabaseType::Postgres
         | DatabaseType::Redshift
         | DatabaseType::Gaussdb
@@ -1144,22 +1224,10 @@ pub async fn connect_db(
             };
             con
         }
-        #[cfg(feature = "duckdb-bundled")]
-        DatabaseType::DuckDb => {
-            let con = db::duckdb_driver::connect_path(&expand_tilde(&db_config.host))?;
-            {
-                let locked = con.lock().map_err(|e| e.to_string())?;
-                for attached in &db_config.attached_databases {
-                    dbx_core::schema::duckdb_attach_database(&locked, &attached.name, &expand_tilde(&attached.path))?;
-                }
-                if let Some(script) = db_config.init_script.as_deref() {
-                    db::duckdb_driver::run_init_script(&locked, script)?;
-                }
-            }
-            PoolKind::DuckDb(con)
-        }
-        #[cfg(not(feature = "duckdb-bundled"))]
-        DatabaseType::DuckDb => return Err("DuckDB support not compiled (enable duckdb-bundled feature)".to_string()),
+        #[cfg(feature = "duckdb-sidecar")]
+        DatabaseType::DuckDb => state.create_duckdb_pool(&db_config).await?,
+        #[cfg(not(feature = "duckdb-sidecar"))]
+        DatabaseType::DuckDb => return Err("DuckDB support is not compiled in this build".to_string()),
         DatabaseType::MongoDb => {
             if mongo_uses_legacy_driver(&db_config) {
                 let mut client =
@@ -1170,7 +1238,7 @@ pub async fn connect_db(
                     .await
                     .map_err(|err| mongo_legacy_error_with_auth_hint(&err))?;
                 state.ensure_current_connection_attempt(&id, Some(attempt)).await?;
-                PoolKind::Agent(std::sync::Arc::new(tokio::sync::Mutex::new(client)))
+                PoolKind::agent(client)
             } else {
                 let native_err = match db::mongo_driver::connect(&url, connect_timeout, idle_timeout).await {
                     Ok(client) => {
@@ -1217,10 +1285,10 @@ pub async fn connect_db(
                         )
                     })?;
                     state.ensure_current_connection_attempt(&id, Some(attempt)).await?;
+                    persist_mongo_legacy_driver_profile(state.inner(), &connected_config).await?;
                     mark_mongo_legacy_driver(&mut connected_config);
                     connected_db_config = metadata_connection_config(&connected_config);
-                    persist_mongo_legacy_driver_profile(state.inner(), &connected_config).await?;
-                    PoolKind::Agent(std::sync::Arc::new(tokio::sync::Mutex::new(client)))
+                    PoolKind::agent(client)
                 } else {
                     return Err(native_err);
                 }
@@ -1254,6 +1322,19 @@ pub async fn connect_db(
             );
             db::elasticsearch_driver::test_connection(&mut client, connect_timeout).await?;
             PoolKind::Elasticsearch(client)
+        }
+        DatabaseType::Easysearch => {
+            let mut client = db::easysearch_driver::EasysearchClient::from_config(
+                &url,
+                Some(&db_config.username),
+                Some(&db_config.password),
+                db_config.ssl,
+                db_config.url_params.as_deref(),
+                db_config.external_config.as_ref(),
+                connect_timeout,
+            );
+            db::easysearch_driver::test_connection(&mut client, connect_timeout).await?;
+            PoolKind::Easysearch(client)
         }
         DatabaseType::Hbase => {
             let client = db::hbase_driver::HBaseClient::new(

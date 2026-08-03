@@ -23,6 +23,7 @@ export interface ExportTask {
   errorMessage: string | null;
   objectIndex?: number;
   totalObjects?: number;
+  overallPercent?: number;
   statementIndex?: number;
   successCount?: number;
   failureCount?: number;
@@ -35,6 +36,7 @@ export interface ExportTask {
   totalTables?: number;
   currentTable?: string;
   targetConnectionId?: string;
+  targetCatalog?: string;
   targetDatabase?: string;
   targetSchema?: string;
   targetTables?: string[];
@@ -201,6 +203,7 @@ function findActiveOverlappingTransfer(request: api.TransferRequest): string[] {
     if (task.kind !== "data-transfer") continue;
     if (task.status !== "Running" && task.status !== "Writing") continue;
     if (task.targetConnectionId !== request.targetConnectionId) continue;
+    if ((task.targetCatalog ?? "") !== (request.targetCatalog ?? "")) continue;
     if (task.targetDatabase !== request.targetDatabase) continue;
     if (task.targetSchema !== request.targetSchema) continue;
 
@@ -321,6 +324,7 @@ export function useExportTracker() {
     const task = existingTask ?? addDataTransferTask(request.transferId, label, request.tables.length);
     task.startedAt ??= Date.now();
     task.targetConnectionId = request.targetConnectionId;
+    task.targetCatalog = request.targetCatalog;
     task.targetDatabase = request.targetDatabase;
     task.targetSchema = request.targetSchema;
     task.targetTables = request.tables.map((table) => targetTableName(table, request.targetTableNameCase));
@@ -378,7 +382,7 @@ export function useExportTracker() {
     task.errorMessage = progress.errorMessage || null;
   }
 
-  function updateDatabaseExportTask(exportId: string, progress: api.ExportProgress) {
+  function updateDatabaseExportTask(exportId: string, progress: api.ExportProgress & { overallPercent?: number }) {
     const task = taskMap.get(exportId);
     if (!task) return;
     // Keep the database label during metadata prefetch; only follow object names while writing.
@@ -391,6 +395,9 @@ export function useExportTracker() {
     task.errorMessage = progress.error || null;
     task.objectIndex = progress.objectIndex;
     task.totalObjects = progress.totalObjects;
+    if (progress.overallPercent !== undefined) {
+      task.overallPercent = Math.max(0, Math.min(100, Math.round(progress.overallPercent)));
+    }
   }
 
   function updateSqlFileTask(executionId: string, progress: api.SqlFileProgress) {

@@ -14,6 +14,7 @@ import {
   TableProperties,
   Key,
   Link,
+  Link2,
   Zap,
   ListTree,
   FileCode,
@@ -29,6 +30,7 @@ import {
   UsersRound,
   CalendarClock,
   Gauge,
+  ShieldCheck,
   Lock,
   Archive,
   Square,
@@ -52,6 +54,7 @@ import { clearActiveTableReferencePayload, createTableReferencePayload, createTa
 import { formatSidebarObjectStorage } from "@/lib/sidebar/sidebarDatabaseStorage";
 import { dataTabOpenModeFromTreeClick } from "@/lib/sidebar/dataTabOpenPolicy";
 import { effectiveDatabaseTypeForConnection } from "@/lib/database/jdbcDialect";
+import { connectionDisplayUrlScheme } from "@/lib/connection/connectionPresentation";
 import { hexToRgba } from "@/lib/common/color";
 import { sidebarDisplayTableName } from "@/lib/sidebar/sidebarTableNameDisplay";
 import { shouldMeasureSidebarLabelOverflow } from "@/lib/sidebar/sidebarLabelTooltip";
@@ -153,7 +156,8 @@ const useWindowsSidebarCommentFont = isWindows();
 const props = defineProps<{
   node: TreeNode;
   depth: number;
-  dragDisabled?: boolean;
+  reorderDisabled?: boolean;
+  referenceDragDisabled?: boolean;
   pendingRename?: boolean;
   highlighted?: boolean;
   commentLabelWidth?: number;
@@ -256,6 +260,8 @@ function getIconInfo(node: TreeNode): { icon: any; colorClass: string } | null {
       return { icon: Database, colorClass: "text-sky-500" };
     case "etcd-dashboard":
       return { icon: Gauge, colorClass: "text-sky-500" };
+    case "etcd-access-control":
+      return { icon: ShieldCheck, colorClass: "text-sky-500" };
     case "zookeeper-root":
       return { icon: Database, colorClass: "text-blue-500" };
     case "mongo-db":
@@ -277,6 +283,8 @@ function getIconInfo(node: TreeNode): { icon: any; colorClass: string } | null {
       return { icon: Braces, colorClass: "text-amber-500" };
     case "sequence":
       return { icon: ListTree, colorClass: "text-emerald-500" };
+    case "synonym":
+      return { icon: Link2, colorClass: "text-sky-500" };
     case "package":
       return { icon: Package, colorClass: "text-cyan-500" };
     case "package-body":
@@ -297,6 +305,8 @@ function getIconInfo(node: TreeNode): { icon: any; colorClass: string } | null {
       return { icon: Braces, colorClass: "text-amber-500" };
     case "group-sequences":
       return { icon: ListTree, colorClass: "text-emerald-500" };
+    case "group-synonyms":
+      return { icon: Link2, colorClass: "text-sky-500" };
     case "group-packages":
       return { icon: Package, colorClass: "text-cyan-500" };
     case "group-types":
@@ -365,35 +375,6 @@ function redactedConnectionString(value: string): string {
   return value.replace(/(:\/\/[^/\s:@?#;]+):([^@\s/?#;]+)@/g, "$1:***@").replace(/([?&;](?:password|pwd|pass|token|secret|key)=)[^&;]*/gi, "$1***");
 }
 
-function connectionTooltipScheme(config: Pick<ConnectionConfig, "db_type" | "ssl">): string {
-  switch (config.db_type) {
-    case "postgres":
-    case "gaussdb":
-    case "kwdb":
-    case "yashandb":
-    case "redshift":
-    case "questdb":
-      return "postgresql";
-    case "sqlserver":
-      return "mssql";
-    case "elasticsearch":
-    case "qdrant":
-    case "milvus":
-    case "weaviate":
-    case "chromadb":
-    case "rqlite":
-    case "turso":
-    case "mq":
-      return config.ssl ? "https" : "http";
-    case "cloudflare-d1":
-      return "https";
-    case "dameng":
-      return "dm";
-    default:
-      return config.db_type;
-  }
-}
-
 function hostForDisplay(host: string): string {
   if (!host.includes(":") || host.startsWith("[") || host.includes("://")) return host;
   return `[${host}]`;
@@ -412,7 +393,7 @@ function connectionTooltipUrl(config: ConnectionConfig): string {
     return `${config.db_type}://${host}`;
   }
 
-  const scheme = connectionTooltipScheme(config);
+  const scheme = connectionDisplayUrlScheme(config);
   const port = Number(config.port) > 0 ? `:${config.port}` : "";
   const user = cleanTooltipValue(config.username);
   const userInfo = user ? `${encodeURIComponent(user)}@` : "";
@@ -788,7 +769,7 @@ function pinnedSortKey(): string {
 }
 
 function canDragPinnedOrder(): boolean {
-  return isPinned.value && !isNodeDefaultDatabase.value && !props.dragDisabled;
+  return isPinned.value && !isNodeDefaultDatabase.value && !props.reorderDisabled;
 }
 
 const {
@@ -809,8 +790,8 @@ const {
   connectionStore.reorderSidebarEntries(draggedIds, targetId, position);
 });
 
-const isDraggable = computed(() => {
-  if (props.dragDisabled) return false;
+const canReorderTreeNode = computed(() => {
+  if (props.reorderDisabled) return false;
   return activeNode.value.type === "connection" || activeNode.value.type === "connection-group";
 });
 
@@ -860,7 +841,7 @@ const TABLE_REFERENCE_DRAG_THRESHOLD = 5;
 const TABLE_REFERENCE_DRAGGING_CLASS = "dbx-table-reference-dragging";
 
 const canDragTableReference = computed(() => {
-  if (props.dragDisabled || !activeNode.value.connectionId) return false;
+  if (props.referenceDragDisabled || !activeNode.value.connectionId) return false;
   if (activeNode.value.type === "database") return typeof activeNode.value.database === "string" && activeNode.value.database.trim().length > 0;
   if (activeNode.value.database == null) return false;
   if (activeNode.value.type === "table" || activeNode.value.type === "view" || activeNode.value.type === "materialized_view") return true;
@@ -977,7 +958,7 @@ function startTableReferenceMouseDrag(event: MouseEvent) {
 }
 
 function onRowMouseDown(event: MouseEvent) {
-  if (isDraggable.value) {
+  if (canReorderTreeNode.value) {
     startDrag(event, activeNode.value.id, activeNode.value.type);
   } else if (canDragTableReference.value) {
     startTableReferenceMouseDrag(event);
@@ -1052,7 +1033,7 @@ function onClick(event: MouseEvent) {
   }
   selectSingleTreeNode(props.node);
   rowRef.value?.focus({ preventScroll: true });
-  if (settingsStore.editorSettings.sidebarActivation === "double") return;
+  if (settingsStore.editorSettings.sidebarActivation === "double" && props.node.type !== "load-more") return;
   treeRuntime.handleRowClick(props.node, event.detail);
 }
 
@@ -1161,7 +1142,7 @@ function onKeydown(event: KeyboardEvent) {
               @keydown.escape.prevent="isRenamingGroup = false"
               @click.stop
             />
-            <span v-else ref="labelRef" :class="labelWidthClass">{{ visibleLabel(node) }}</span>
+            <span v-else ref="labelRef" :class="[labelWidthClass, { 'flex-1': node.type === 'connection' }]">{{ visibleLabel(node) }}</span>
             <button
               v-if="canDragPinnedOrder()"
               type="button"
@@ -1178,7 +1159,15 @@ function onKeydown(event: KeyboardEvent) {
             <ProductionContextBadge v-if="showProductionBadge" compact />
             <span
               v-if="
-                (node.type === 'group-tables' || node.type === 'group-views' || node.type === 'group-materialized-views' || node.type === 'group-procedures' || node.type === 'group-functions' || node.type === 'group-sequences' || node.type === 'group-packages' || node.type === 'group-partitions') &&
+                (node.type === 'group-tables' ||
+                  node.type === 'group-views' ||
+                  node.type === 'group-materialized-views' ||
+                  node.type === 'group-procedures' ||
+                  node.type === 'group-functions' ||
+                  node.type === 'group-sequences' ||
+                  node.type === 'group-synonyms' ||
+                  node.type === 'group-packages' ||
+                  node.type === 'group-partitions') &&
                 node.objectCount != null
               "
               class="text-muted-foreground text-[10px] shrink-0"

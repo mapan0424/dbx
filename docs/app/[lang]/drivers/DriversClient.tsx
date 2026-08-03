@@ -17,11 +17,11 @@ const i18n = {
     bundles: "Offline Bundles",
     bundlesDesc: "Platform-specific ZIP packages that include the agent registry, database drivers, native agents, and the matching JRE.",
     drivers: "Database Drivers",
-    driversDesc: "Single-driver offline ZIPs for Java agents. Install the matching JRE separately when it is not already available.",
+    driversDesc: "Single-driver .tar.zst packages for Java agents. Install the matching JRE separately when it is not already available.",
     nativeAgents: "Native Agents",
-    nativeAgentsDesc: "Platform-specific offline ZIPs for Oracle, KingBase, and XuguDB. Import the ZIP directly in Driver Manager.",
+    nativeAgentsDesc: "Platform-specific .tar.zst packages for DuckDB, Oracle, KingBase, and XuguDB. Import the package directly in Driver Manager.",
     jre: "Java Runtime (JRE)",
-    jreDesc: "JRE packages used by agent-based database drivers. Required for Oracle, SQL Server, and other agent-managed connections.",
+    jreDesc: "JRE packages used by Java agent-based database drivers such as SQL Server and Dameng.",
     download: "Download",
     installMethod: "Install",
     version: "Version",
@@ -53,11 +53,11 @@ const i18n = {
     bundles: "整包下载",
     bundlesDesc: "按平台提供的 ZIP 离线包，包含 Agent registry、数据库驱动、原生 Agent 和匹配的 JRE。",
     drivers: "数据库驱动",
-    driversDesc: "Java Agent 的单驱动离线 ZIP；目标机器尚未安装 JRE 时需要另外安装一次对应 JRE。",
+    driversDesc: "Java Agent 的单驱动 .tar.zst 包；目标机器尚未安装 JRE 时需要另外安装一次对应 JRE。",
     nativeAgents: "原生 Agent",
-    nativeAgentsDesc: "Oracle、人大金仓和虚谷的按平台单驱动离线包，可直接在驱动管理中导入 ZIP。",
+    nativeAgentsDesc: "DuckDB、Oracle、人大金仓和虚谷的按平台 .tar.zst 单驱动包，可直接在驱动管理中导入。",
     jre: "Java 运行时 (JRE)",
-    jreDesc: "Agent 驱动所需的 JRE 环境，Oracle、SQL Server 等数据库通过 Agent 连接时需要。",
+    jreDesc: "Java Agent 驱动所需的 JRE 环境，例如 SQL Server、达梦等连接会使用。",
     download: "下载",
     installMethod: "安装方式",
     version: "版本",
@@ -208,6 +208,7 @@ export function DriversClient({ initialCatalog }: { initialCatalog: AgentDownloa
       <section className="pt-[100px] pb-8 max-[760px]:pt-[80px] max-[760px]:pb-6">
         <div className="max-w-[1180px] mx-auto px-7 max-[760px]:px-[18px]">
           <div className="grid justify-items-center max-w-[900px] mx-auto text-center">
+            <h1 className="text-[clamp(30px,4vw,46px)] font-[820] leading-[1.08] tracking-tight text-landing-ink">{t.title}</h1>
             <p className="min-w-0 mx-auto text-[15px] font-[460] leading-[1.7] text-landing-muted max-w-[760px] max-[760px]:text-[13px] max-[760px]:whitespace-normal max-[760px]:max-w-[300px]">{t.subtitle}</p>
           </div>
         </div>

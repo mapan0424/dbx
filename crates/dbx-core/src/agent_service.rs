@@ -5,10 +5,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use futures::{stream, StreamExt};
+use sha2::{Digest, Sha256};
 
 use crate::agent_catalog;
 use crate::agent_manager::{
-    AgentDriverInfo, AgentManager, AgentRegistry, InstalledDriver, JavaRuntimeMode, DEFAULT_JRE_KEY,
+    AgentDriverInfo, AgentManager, AgentRegistry, ArtifactFormat, InstalledDriver, JavaRuntimeMode, DEFAULT_JRE_KEY,
 };
 use crate::DownloadSource;
 
@@ -577,7 +578,7 @@ pub async fn reinstall_agent_jre_from(
         .platforms
         .get(platform)
         .ok_or_else(|| format!("No JRE {jre_key} available for platform: {platform}"))?;
-    let jre_archive = am.base_dir().join("jre-download.tar.gz");
+    let jre_archive = jre_archive_download_path(am, jre_key, platform_jre.format);
     download_with_progress(
         am,
         &progress,
@@ -587,6 +588,7 @@ pub async fn reinstall_agent_jre_from(
         &r2_path_with_cache_buster(&github_url_to_r2_path(&platform_jre.url, "jre"), &jre_info.version),
         &jre_archive,
         platform_jre.size,
+        platform_jre.sha256.as_deref(),
         Some(CacheIdentity::Jre { key: jre_key, version: &jre_info.version }),
         None,
         None,
@@ -600,7 +602,7 @@ pub async fn reinstall_agent_jre_from(
     am.stop_daemons().await;
     let stash = replace_old_jre_dir(&jre_dir)?;
     persist_pending_jre_cleanup(am, stash.as_ref()).await?;
-    extract_tar_gz(&jre_archive, &jre_dir)?;
+    extract_jre_archive(&jre_archive, &jre_dir, platform_jre.format)?;
     std::fs::remove_file(&jre_archive).ok();
     am.mutate_state(|state| state.jre_versions.insert(jre_key.to_string(), jre_info.version.clone()))?;
     cleanup_jre_download_cache_after_success(am, jre_key);
@@ -625,6 +627,41 @@ pub async fn import_agents_from_zip(
         });
     })
     .await
+}
+
+pub fn inspect_offline_package(package_path: &Path) -> Result<OfflineImportPlan, String> {
+    if is_tar_zstd_package(package_path) {
+        inspect_tar_zstd_driver_package(package_path)
+    } else {
+        inspect_offline_zip(package_path)
+    }
+}
+
+pub async fn import_agents_from_package(
+    am: &AgentManager,
+    package_path: &Path,
+    progress: impl Fn(AgentProgressEvent),
+) -> Result<OfflineImportResult, String> {
+    if is_tar_zstd_package(package_path) {
+        import_tar_zstd_driver_package(am, package_path, |event| {
+            progress(AgentProgressEvent {
+                operation_id: None,
+                step: event.step,
+                downloaded: Some(event.current as u64),
+                total: Some(event.total as u64),
+                db_type: event.db_type,
+                current: Some(event.current),
+                total_drivers: Some(event.total),
+            });
+        })
+        .await
+    } else {
+        import_agents_from_zip(am, package_path, progress).await
+    }
+}
+
+fn is_tar_zstd_package(path: &Path) -> bool {
+    path.file_name().and_then(|name| name.to_str()).is_some_and(|name| name.to_ascii_lowercase().ends_with(".tar.zst"))
 }
 
 async fn install_agent_driver_with_batch(
@@ -734,7 +771,7 @@ async fn ensure_jre_from_registry(
         .platforms
         .get(platform)
         .ok_or_else(|| format!("No JRE {jre_key} available for platform: {platform}"))?;
-    let jre_archive = am.base_dir().join(format!("jre-{}-download.tar.gz", jre_key));
+    let jre_archive = jre_archive_download_path(am, jre_key, platform_jre.format);
     progress(AgentProgressEvent::transfer("jre", 0, platform_jre.size).with_batch(
         Some(db_type),
         current,
@@ -749,6 +786,7 @@ async fn ensure_jre_from_registry(
         &r2_path_with_cache_buster(&github_url_to_r2_path(&platform_jre.url, "jre"), &jre_info.version),
         &jre_archive,
         platform_jre.size,
+        platform_jre.sha256.as_deref(),
         Some(CacheIdentity::Jre { key: jre_key, version: &jre_info.version }),
         Some(db_type),
         current,
@@ -764,11 +802,11 @@ async fn ensure_jre_from_registry(
     let stash = replace_old_jre_dir(&jre_dir)?;
 
     // Persist the stash path *before* extraction so that a crash during
-    // extract_tar_gz (or a process kill) doesn't leave the renamed-stash
+    // archive extraction (or a process kill) doesn't leave the renamed-stash
     // directory as an orphan that never gets cleaned up.
     persist_pending_jre_cleanup(am, stash.as_ref()).await?;
 
-    extract_tar_gz(&jre_archive, &jre_dir)?;
+    extract_jre_archive(&jre_archive, &jre_dir, platform_jre.format)?;
     std::fs::remove_file(&jre_archive).ok();
     cleanup_jre_download_cache_after_success(am, jre_key);
 
@@ -893,6 +931,8 @@ async fn install_agent_driver_from_registry(
     if let Some(parent) = target_path.parent() {
         std::fs::create_dir_all(parent).map_err(|err| format!("Failed to create driver directory: {err}"))?;
     }
+    let artifact_kind = if is_native_artifact { DriverArtifactKind::Native } else { DriverArtifactKind::Jar };
+    let download_path = driver_artifact_download_path(&target_path, artifact.format);
     progress(AgentProgressEvent::transfer("driver", 0, artifact.size).with_batch(
         Some(db_type),
         current,
@@ -905,24 +945,33 @@ async fn install_agent_driver_from_registry(
         source,
         &artifact.url,
         &r2_path_with_cache_buster(&github_url_to_r2_path(&artifact.url, "driver"), &driver.version),
-        &target_path,
+        &download_path,
         artifact.size,
+        artifact.sha256.as_deref(),
         Some(CacheIdentity::Driver { db_type, version: &driver.version }),
         Some(db_type),
         current,
         total_drivers,
     )
     .await?;
+    install_downloaded_driver_artifact(
+        &download_path,
+        &target_path,
+        artifact.format,
+        artifact_kind,
+        db_type,
+        &driver.version,
+    )?;
     // Some drivers publish both a native agent and a legacy JAR fallback. Only
     // validate the artifact type that was actually installed.
-    if !is_native_artifact && !am.is_driver_jar_valid(db_type) {
-        std::fs::remove_file(&target_path).ok();
-        return Err(format!("Downloaded driver jar is invalid or corrupt: {}", target_path.display()));
-    }
     if is_native_artifact {
         mark_executable(&target_path)?;
         std::fs::remove_file(am.driver_jar_path(db_type)).ok();
     } else {
+        if !am.is_driver_jar_valid(db_type) {
+            std::fs::remove_file(&target_path).ok();
+            return Err(format!("Downloaded driver jar is invalid or corrupt: {}", target_path.display()));
+        }
         std::fs::remove_file(am.driver_native_path(db_type)).ok();
     }
 
@@ -947,6 +996,169 @@ async fn install_agent_driver_from_registry(
     Ok(())
 }
 
+fn driver_artifact_download_path(target_path: &Path, format: Option<ArtifactFormat>) -> PathBuf {
+    match format {
+        Some(ArtifactFormat::TarZstd) => {
+            let file_name = target_path.file_name().and_then(|name| name.to_str()).unwrap_or("agent");
+            target_path.with_file_name(format!(".{file_name}.tar.zst"))
+        }
+        None => target_path.to_path_buf(),
+    }
+}
+
+fn install_downloaded_driver_artifact(
+    download_path: &Path,
+    target_path: &Path,
+    format: Option<ArtifactFormat>,
+    artifact_kind: DriverArtifactKind,
+    db_type: &str,
+    expected_version: &str,
+) -> Result<(), String> {
+    let Some(format) = format else {
+        return Ok(());
+    };
+    let result = match format {
+        ArtifactFormat::TarZstd => {
+            install_driver_from_tar_zstd_package(download_path, target_path, artifact_kind, db_type, expected_version)
+        }
+    };
+    if result.is_ok() {
+        std::fs::remove_file(download_path).ok();
+    }
+    result
+}
+
+fn install_driver_from_tar_zstd_package(
+    package_path: &Path,
+    target_path: &Path,
+    expected_kind: DriverArtifactKind,
+    db_type: &str,
+    expected_version: &str,
+) -> Result<(), String> {
+    let info = tar_zstd_driver_package_info(package_path)?;
+    if info.db_type != db_type {
+        return Err(format!("Driver package contains {}, expected {db_type}", info.db_type));
+    }
+    if info.version != expected_version {
+        return Err(format!(
+            "Driver package version mismatch for {db_type}: expected {expected_version}, got {}",
+            info.version
+        ));
+    }
+    if info.kind != expected_kind {
+        return Err(format!(
+            "Driver package artifact type mismatch for {db_type}: expected {}, got {}",
+            expected_kind.label(),
+            info.kind.label()
+        ));
+    }
+    let parent = target_path.parent().ok_or_else(|| format!("Invalid driver path: {}", target_path.display()))?;
+    std::fs::create_dir_all(parent).map_err(|error| format!("Failed to create driver directory: {error}"))?;
+    let staging_path = parent.join(format!(".agent-package-{}", uuid::Uuid::new_v4()));
+    let result = extract_tar_zstd_file(package_path, &info.entry_name, &staging_path, info.size).and_then(|_| {
+        match info.kind {
+            DriverArtifactKind::Jar if !is_valid_agent_jar(&staging_path) => {
+                return Err(format!("Packaged driver jar is invalid or corrupt: {}", info.entry_name));
+            }
+            DriverArtifactKind::Native => {
+                validate_native_agent_binary(&staging_path)?;
+                mark_executable(&staging_path)?;
+            }
+            DriverArtifactKind::Jar => {}
+        }
+        replace_download(&staging_path, target_path)
+    });
+    if result.is_err() {
+        std::fs::remove_file(&staging_path).ok();
+    }
+    result
+}
+
+fn read_registry_from_tar_zstd(package_path: &Path) -> Result<AgentRegistry, String> {
+    const MAX_REGISTRY_BYTES: u64 = 1024 * 1024;
+
+    let file = std::fs::File::open(package_path).map_err(|error| format!("Failed to open driver package: {error}"))?;
+    let decoder = zstd::stream::read::Decoder::new(file)
+        .map_err(|error| format!("Failed to open zstd driver package: {error}"))?;
+    let mut archive = tar::Archive::new(decoder);
+    let entries = archive.entries().map_err(|error| format!("Invalid tar.zst driver package: {error}"))?;
+    for entry in entries {
+        let mut entry = entry.map_err(|error| format!("Invalid tar.zst driver package entry: {error}"))?;
+        let path = entry.path().map_err(|error| format!("Invalid driver package path: {error}"))?;
+        let name = safe_archive_entry_name(&path)?;
+        if name != "agent-registry.json" {
+            continue;
+        }
+        if !entry.header().entry_type().is_file() {
+            return Err("Driver package registry is not a regular file".to_string());
+        }
+        if entry.size() > MAX_REGISTRY_BYTES {
+            return Err("Driver package registry is too large".to_string());
+        }
+        let mut json = String::new();
+        entry.read_to_string(&mut json).map_err(|error| format!("Failed to read driver package registry: {error}"))?;
+        return serde_json::from_str(&json).map_err(|error| format!("Invalid driver package registry: {error}"));
+    }
+    Err("agent-registry.json not found in the driver package".to_string())
+}
+
+fn extract_tar_zstd_file(
+    package_path: &Path,
+    expected_entry: &str,
+    destination: &Path,
+    expected_size: u64,
+) -> Result<(), String> {
+    let file = std::fs::File::open(package_path).map_err(|error| format!("Failed to open driver package: {error}"))?;
+    let decoder = zstd::stream::read::Decoder::new(file)
+        .map_err(|error| format!("Failed to open zstd driver package: {error}"))?;
+    let mut archive = tar::Archive::new(decoder);
+    let entries = archive.entries().map_err(|error| format!("Invalid tar.zst driver package: {error}"))?;
+    let mut extracted = false;
+    for entry in entries {
+        let mut entry = entry.map_err(|error| format!("Invalid tar.zst driver package entry: {error}"))?;
+        let path = entry.path().map_err(|error| format!("Invalid driver package path: {error}"))?;
+        let name = safe_archive_entry_name(&path)?;
+        if name == "agent-registry.json" || entry.header().entry_type().is_dir() {
+            continue;
+        }
+        if name != expected_entry {
+            return Err(format!("Unexpected file in driver package: {name}"));
+        }
+        if extracted || !entry.header().entry_type().is_file() {
+            return Err(format!("Invalid driver package entry: {name}"));
+        }
+        let mut output =
+            std::fs::File::create(destination).map_err(|error| format!("Failed to create staged driver: {error}"))?;
+        let copied = std::io::copy(&mut entry, &mut output)
+            .map_err(|error| format!("Failed to extract driver package: {error}"))?;
+        std::io::Write::flush(&mut output).map_err(|error| format!("Failed to flush staged driver: {error}"))?;
+        if expected_size > 0 && copied != expected_size {
+            return Err(format!("Packaged driver size mismatch: expected {expected_size} bytes, got {copied} bytes"));
+        }
+        extracted = true;
+    }
+    if extracted {
+        Ok(())
+    } else {
+        Err(format!("Driver package entry not found: {expected_entry}"))
+    }
+}
+
+fn safe_archive_entry_name(path: &Path) -> Result<String, String> {
+    let mut parts = Vec::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::Normal(value) => parts.push(value.to_string_lossy().into_owned()),
+            std::path::Component::CurDir => {}
+            _ => return Err(format!("Unsafe driver package path: {}", path.display())),
+        }
+    }
+    if parts.is_empty() {
+        return Err("Driver package contains an empty path".to_string());
+    }
+    Ok(parts.join("/"))
+}
+
 fn agent_registry_driver<'a>(
     registry: &'a AgentRegistry,
     db_type: &str,
@@ -964,21 +1176,23 @@ async fn download_with_progress(
     r2_path: &str,
     dest: &std::path::Path,
     total_size: u64,
+    expected_sha256: Option<&str>,
     cache_identity: Option<CacheIdentity<'_>>,
     db_type: Option<&str>,
     current: Option<u32>,
     total_drivers: Option<u32>,
 ) -> Result<(), String> {
     const DOWNLOAD_ATTEMPTS: usize = 4;
+    let expected_sha256 = normalized_sha256(expected_sha256)?;
 
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent).map_err(|err| err.to_string())?;
     }
     let tmp = download_temp_path(dest);
     let tmp_source = download_source_path(&tmp);
-    let cache_path = cached_download_path(am, url, total_size, cache_identity, dest);
+    let cache_path = cached_download_path(am, url, total_size, expected_sha256, cache_identity, dest);
     prune_download_cache(am).ok();
-    if cached_download_is_valid(am, &cache_path, total_size) {
+    if cached_download_is_valid(am, &cache_path, total_size, expected_sha256) {
         std::fs::copy(&cache_path, &tmp).map_err(|err| format!("Failed to copy cached download: {err}"))?;
         progress(AgentProgressEvent::transfer(step, total_size, total_size).with_batch(
             db_type,
@@ -994,6 +1208,7 @@ async fn download_with_progress(
         .map_err(|err| format!("Failed to create HTTP client: {err}"))?;
     let mut last_err = None;
     let mut completed = false;
+    let mut rejected_sources = std::collections::HashSet::new();
     for attempt in 1..=DOWNLOAD_ATTEMPTS {
         let mut resume_from = std::fs::metadata(&tmp).map(|meta| meta.len()).unwrap_or(0);
         let resume_source = std::fs::read_to_string(&tmp_source).ok().map(|value| value.trim().to_string());
@@ -1007,13 +1222,26 @@ async fn download_with_progress(
             resume_from = 0;
         }
         if total_size > 0 && resume_from == total_size {
-            progress(AgentProgressEvent::transfer(step, total_size, total_size).with_batch(
-                db_type,
-                current,
-                total_drivers,
-            ));
-            completed = true;
-            break;
+            match validate_artifact_integrity(&tmp, total_size, expected_sha256) {
+                Ok(()) => {
+                    progress(AgentProgressEvent::transfer(step, total_size, total_size).with_batch(
+                        db_type,
+                        current,
+                        total_drivers,
+                    ));
+                    completed = true;
+                    break;
+                }
+                Err(err) => {
+                    if let Some(source_url) = resume_source {
+                        rejected_sources.insert(source_url);
+                    }
+                    std::fs::remove_file(&tmp).ok();
+                    std::fs::remove_file(&tmp_source).ok();
+                    last_err = Some(err);
+                    continue;
+                }
+            }
         }
 
         let (mut resp, resumed, source_url) = match open_agent_download_response(
@@ -1025,6 +1253,7 @@ async fn download_with_progress(
             resume_from,
             total_size,
             resume_source.as_deref(),
+            &rejected_sources,
         )
         .await
         {
@@ -1072,8 +1301,19 @@ async fn download_with_progress(
 
         let actual_size = std::fs::metadata(&tmp).map(|meta| meta.len()).unwrap_or(0);
         if total_size == 0 || actual_size == total_size {
-            completed = true;
-            break;
+            match validate_artifact_integrity(&tmp, total_size, expected_sha256) {
+                Ok(()) => {
+                    completed = true;
+                    break;
+                }
+                Err(err) => {
+                    rejected_sources.insert(source_url.clone());
+                    std::fs::remove_file(&tmp).ok();
+                    std::fs::remove_file(&tmp_source).ok();
+                    last_err = Some(format!("{err} (attempt {attempt}/{DOWNLOAD_ATTEMPTS}, source {source_url})"));
+                    continue;
+                }
+            }
         }
         if actual_size > total_size {
             std::fs::remove_file(&tmp).ok();
@@ -1109,9 +1349,14 @@ async fn open_agent_download_response(
     resume_from: u64,
     expected_size: u64,
     resume_source: Option<&str>,
+    rejected_sources: &std::collections::HashSet<String>,
 ) -> Result<(reqwest::Response, bool, String), String> {
     let mut errors = Vec::new();
     for candidate_url in source.download_candidate_urls(github_url, r2_path)? {
+        if rejected_sources.contains(&candidate_url) {
+            errors.push(format!("{candidate_url}: skipped after SHA-256 mismatch"));
+            continue;
+        }
         if resume_from > 0 && resume_source.is_some_and(|source| source != candidate_url) {
             continue;
         }
@@ -1197,12 +1442,14 @@ fn cached_download_path(
     am: &AgentManager,
     url: &str,
     total_size: u64,
+    expected_sha256: Option<&str>,
     cache_identity: Option<CacheIdentity<'_>>,
     dest: &std::path::Path,
 ) -> std::path::PathBuf {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     url.hash(&mut hasher);
     total_size.hash(&mut hasher);
+    expected_sha256.hash(&mut hasher);
     let identity_hash_key = cache_identity.map(CacheIdentity::hash_key);
     identity_hash_key.hash(&mut hasher);
     let hash = hasher.finish();
@@ -1211,7 +1458,12 @@ fn cached_download_path(
     am.download_cache_dir().join(format!("{prefix}-{hash:016x}-{file_name}"))
 }
 
-fn cached_download_is_valid(am: &AgentManager, path: &std::path::Path, expected_size: u64) -> bool {
+fn cached_download_is_valid(
+    am: &AgentManager,
+    path: &std::path::Path,
+    expected_size: u64,
+    expected_sha256: Option<&str>,
+) -> bool {
     let Ok(meta) = std::fs::metadata(path) else {
         return false;
     };
@@ -1227,7 +1479,53 @@ fn cached_download_is_valid(am: &AgentManager, path: &std::path::Path, expected_
         let _ = std::fs::remove_file(path);
         return false;
     }
+    if validate_artifact_integrity(path, expected_size, expected_sha256).is_err() {
+        let _ = std::fs::remove_file(path);
+        return false;
+    }
     true
+}
+
+fn normalized_sha256(expected_sha256: Option<&str>) -> Result<Option<&str>, String> {
+    let Some(expected_sha256) = expected_sha256.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    if expected_sha256.len() != 64 || !expected_sha256.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err("Invalid SHA-256 metadata for agent artifact".to_string());
+    }
+    Ok(Some(expected_sha256))
+}
+
+fn validate_artifact_integrity(path: &Path, expected_size: u64, expected_sha256: Option<&str>) -> Result<(), String> {
+    let metadata = std::fs::metadata(path).map_err(|err| format!("Failed to inspect downloaded artifact: {err}"))?;
+    if expected_size > 0 && metadata.len() != expected_size {
+        return Err(format!(
+            "Downloaded artifact size mismatch: expected {expected_size} bytes, got {} bytes",
+            metadata.len()
+        ));
+    }
+    let Some(expected_sha256) = expected_sha256 else {
+        return Ok(());
+    };
+    let actual_sha256 = file_sha256(path)?;
+    if actual_sha256.eq_ignore_ascii_case(expected_sha256) {
+        return Ok(());
+    }
+    Err(format!("Downloaded artifact SHA-256 mismatch: expected {expected_sha256}, got {actual_sha256}"))
+}
+
+fn file_sha256(path: &Path) -> Result<String, String> {
+    let mut file = std::fs::File::open(path).map_err(|err| format!("Failed to hash downloaded artifact: {err}"))?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer).map_err(|err| format!("Failed to hash downloaded artifact: {err}"))?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
 }
 
 fn prune_download_cache(am: &AgentManager) -> Result<(), String> {
@@ -1416,9 +1714,180 @@ pub struct OfflineImportPlan {
     pub includes_jre: bool,
 }
 
-type OfflineJreEntry = (String, String);
+type OfflineJreEntry = (String, String, Option<ArtifactFormat>);
 type OfflineDriverEntry = (String, String, bool);
 type OfflineArchiveEntries = (Vec<OfflineJreEntry>, Vec<OfflineDriverEntry>);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DriverArtifactKind {
+    Jar,
+    Native,
+}
+
+impl DriverArtifactKind {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Jar => "jar",
+            Self::Native => "native",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct TarZstdDriverPackageInfo {
+    db_type: String,
+    version: String,
+    jre: String,
+    kind: DriverArtifactKind,
+    entry_name: String,
+    size: u64,
+}
+
+fn inspect_tar_zstd_driver_package(package_path: &Path) -> Result<OfflineImportPlan, String> {
+    let info = tar_zstd_driver_package_info(package_path)?;
+    Ok(OfflineImportPlan { driver_keys: vec![info.db_type], includes_jre: false })
+}
+
+async fn import_tar_zstd_driver_package(
+    am: &AgentManager,
+    package_path: &Path,
+    progress: impl Fn(OfflineImportProgress),
+) -> Result<OfflineImportResult, String> {
+    let _installation_guard = am.installation_operation_lock.write().await;
+    let info = tar_zstd_driver_package_info(package_path)?;
+    let mut result =
+        OfflineImportResult { jre_installed: Vec::new(), drivers_installed: Vec::new(), drivers_skipped: Vec::new() };
+    if let Some(installed) = am.load_state().installed_drivers.get(&info.db_type) {
+        if installed.version != "0.1.0-local"
+            && installed.version != "local"
+            && !crate::update::is_newer_version(&info.version, &installed.version)
+        {
+            result.drivers_skipped.push(info.db_type);
+            return Ok(result);
+        }
+    }
+
+    progress(OfflineImportProgress {
+        step: "driver".to_string(),
+        current: 1,
+        total: 1,
+        label: agent_catalog::label_for_key(&info.db_type).unwrap_or(&info.db_type).to_string(),
+        db_type: Some(info.db_type.clone()),
+    });
+    let target_path = match info.kind {
+        DriverArtifactKind::Jar => am.driver_jar_path(&info.db_type),
+        DriverArtifactKind::Native => am.driver_native_path(&info.db_type),
+    };
+    install_driver_from_tar_zstd_package(package_path, &target_path, info.kind, &info.db_type, &info.version)?;
+    match info.kind {
+        DriverArtifactKind::Jar => {
+            std::fs::remove_file(am.driver_native_path(&info.db_type)).ok();
+        }
+        DriverArtifactKind::Native => {
+            std::fs::remove_file(am.driver_jar_path(&info.db_type)).ok();
+        }
+    }
+    am.mutate_state(|state| {
+        state.installed_drivers.insert(
+            info.db_type.clone(),
+            InstalledDriver {
+                version: info.version.clone(),
+                installed_at: chrono::Utc::now().to_rfc3339(),
+                jre: info.jre.clone(),
+            },
+        );
+    })?;
+    am.stop_daemon_by_key(&info.db_type).await;
+    result.drivers_installed.push(info.db_type);
+    Ok(result)
+}
+
+fn tar_zstd_driver_package_info(package_path: &Path) -> Result<TarZstdDriverPackageInfo, String> {
+    let registry = read_registry_from_tar_zstd(package_path)?;
+    if registry.drivers.len() != 1 {
+        return Err("A tar.zst driver package must contain exactly one driver".to_string());
+    }
+    let (db_type, driver) = registry.drivers.iter().next().expect("checked one driver");
+    validate_offline_driver_key(db_type)?;
+    let platform = AgentManager::current_platform();
+    let native_artifact = driver.native.get(platform);
+    let jar_artifact = driver.jar.as_ref();
+    let (kind, artifact) = match (native_artifact, jar_artifact) {
+        (Some(_), Some(_)) => {
+            return Err("A tar.zst driver package must contain exactly one driver artifact".to_string());
+        }
+        (Some(artifact), None) => (DriverArtifactKind::Native, artifact),
+        (None, Some(artifact)) => (DriverArtifactKind::Jar, artifact),
+        (None, None) if !driver.native.is_empty() => {
+            return Err(format!("Driver package does not support platform: {platform}"));
+        }
+        (None, None) => return Err("A tar.zst driver package contains no driver artifact".to_string()),
+    };
+    if artifact.format.is_some() {
+        return Err("Nested driver packages are not supported".to_string());
+    }
+    let artifact_filename = artifact
+        .url
+        .rsplit('/')
+        .next()
+        .filter(|name| !name.is_empty())
+        .ok_or_else(|| format!("Invalid packaged driver URL: {}", artifact.url))?;
+    let entry_name = format!("drivers/{artifact_filename}");
+    validate_tar_zstd_package_entries(package_path, &entry_name, artifact.size)?;
+    Ok(TarZstdDriverPackageInfo {
+        db_type: db_type.clone(),
+        version: driver.version.clone(),
+        jre: driver.jre.clone(),
+        kind,
+        entry_name,
+        size: artifact.size,
+    })
+}
+
+fn validate_tar_zstd_package_entries(
+    package_path: &Path,
+    expected_entry: &str,
+    expected_size: u64,
+) -> Result<(), String> {
+    let file = std::fs::File::open(package_path).map_err(|error| format!("Failed to open driver package: {error}"))?;
+    let decoder = zstd::stream::read::Decoder::new(file)
+        .map_err(|error| format!("Failed to open zstd driver package: {error}"))?;
+    let mut archive = tar::Archive::new(decoder);
+    let entries = archive.entries().map_err(|error| format!("Invalid tar.zst driver package: {error}"))?;
+    let mut registry_seen = false;
+    let mut driver_seen = false;
+    for entry in entries {
+        let entry = entry.map_err(|error| format!("Invalid tar.zst driver package entry: {error}"))?;
+        let path = entry.path().map_err(|error| format!("Invalid driver package path: {error}"))?;
+        let name = safe_archive_entry_name(&path)?;
+        if entry.header().entry_type().is_dir() {
+            continue;
+        }
+        if !entry.header().entry_type().is_file() {
+            return Err(format!("Driver package contains a non-regular entry: {name}"));
+        }
+        match name.as_str() {
+            "agent-registry.json" if !registry_seen => registry_seen = true,
+            value if value == expected_entry && !driver_seen => {
+                if expected_size > 0 && entry.size() != expected_size {
+                    return Err(format!(
+                        "Packaged driver size mismatch: expected {expected_size} bytes, got {} bytes",
+                        entry.size()
+                    ));
+                }
+                driver_seen = true;
+            }
+            _ => return Err(format!("Unexpected file in driver package: {name}")),
+        }
+    }
+    if !registry_seen {
+        return Err("agent-registry.json not found in the driver package".to_string());
+    }
+    if !driver_seen {
+        return Err(format!("Driver package entry not found: {expected_entry}"));
+    }
+    Ok(())
+}
 
 pub fn inspect_offline_zip(zip_path: &Path) -> Result<OfflineImportPlan, String> {
     let file = std::fs::File::open(zip_path).map_err(|e| format!("Failed to open ZIP file: {e}"))?;
@@ -1461,7 +1930,7 @@ pub async fn import_offline_zip(
     validate_offline_driver_entries(am, &mut archive, &driver_entries)?;
     let mut current: u32 = 0;
 
-    for (jre_key, entry_name) in &jre_entries {
+    for (jre_key, entry_name, format) in &jre_entries {
         current += 1;
         let jre_version = registry.resolve_jre(jre_key).map(|j| j.version.clone());
         let existing_version = local_state.jre_versions.get(jre_key);
@@ -1478,7 +1947,7 @@ pub async fn import_offline_zip(
         });
 
         let mut entry = archive.by_name(entry_name).map_err(|e| format!("Failed to read {entry_name}: {e}"))?;
-        let tmp_archive = am.base_dir().join(format!("jre-offline-{jre_key}.tar.gz"));
+        let tmp_archive = am.base_dir().join(format!("jre-offline-{jre_key}{}", jre_archive_suffix(*format)));
         {
             let mut out =
                 std::fs::File::create(&tmp_archive).map_err(|e| format!("Failed to create temp file: {e}"))?;
@@ -1487,7 +1956,7 @@ pub async fn import_offline_zip(
 
         let jre_dir = am.jre_dir(jre_key);
         let staging_dir = am.base_dir().join(format!(".jre-offline-import-{}", uuid::Uuid::new_v4()));
-        if let Err(error) = extract_tar_gz(&tmp_archive, &staging_dir) {
+        if let Err(error) = extract_jre_archive(&tmp_archive, &staging_dir, *format) {
             std::fs::remove_dir_all(&staging_dir).ok();
             std::fs::remove_file(&tmp_archive).ok();
             return Err(error);
@@ -1599,7 +2068,7 @@ fn collect_offline_entries(
     registry: &AgentRegistry,
 ) -> Result<OfflineArchiveEntries, String> {
     let platform = AgentManager::current_platform();
-    let mut jre_entries = Vec::new();
+    let mut jres = std::collections::BTreeMap::<String, (String, Option<ArtifactFormat>)>::new();
     let mut drivers = std::collections::BTreeMap::<String, (String, bool)>::new();
 
     for index in 0..archive.len() {
@@ -1608,11 +2077,21 @@ fn collect_offline_entries(
             return Err(format!("Offline package contains an unsafe path: {}", entry.name()));
         };
         let name = path.to_string_lossy().replace('\\', "/");
-        if name.starts_with("jre/") && name.ends_with(".tar.gz") && name.contains(platform) {
+        if name.starts_with("jre/") && name.contains(platform) {
+            let jre_format = if name.ends_with(".tar.zst") {
+                Some(ArtifactFormat::TarZstd)
+            } else if name.ends_with(".tar.gz") {
+                None
+            } else {
+                continue;
+            };
             let jre_key = extract_jre_key_from_filename(&name)
                 .ok_or_else(|| format!("Invalid JRE filename in offline package: {name}"))?;
             validate_offline_identifier(&jre_key, "JRE")?;
-            jre_entries.push((jre_key, name));
+            let replace = !jres.contains_key(&jre_key) || jre_format == Some(ArtifactFormat::TarZstd);
+            if replace {
+                jres.insert(jre_key, (name, jre_format));
+            }
         } else if name.starts_with("drivers/") && name.ends_with(".jar") {
             let db_type = db_type_for_jar_offline_entry(registry, &name)
                 .or_else(|| extract_db_type_from_filename(&name))
@@ -1629,7 +2108,10 @@ fn collect_offline_entries(
         }
     }
 
-    Ok((jre_entries, drivers.into_iter().map(|(db_type, (name, is_native))| (db_type, name, is_native)).collect()))
+    Ok((
+        jres.into_iter().map(|(jre_key, (name, format))| (jre_key, name, format)).collect(),
+        drivers.into_iter().map(|(db_type, (name, is_native))| (db_type, name, is_native)).collect(),
+    ))
 }
 
 fn validate_offline_driver_entries(
@@ -1723,7 +2205,36 @@ fn db_type_for_jar_offline_entry(registry: &AgentRegistry, name: &str) -> Option
     })
 }
 
+fn jre_archive_suffix(format: Option<ArtifactFormat>) -> &'static str {
+    match format {
+        Some(ArtifactFormat::TarZstd) => ".tar.zst",
+        None => ".tar.gz",
+    }
+}
+
+fn jre_archive_download_path(am: &AgentManager, jre_key: &str, format: Option<ArtifactFormat>) -> PathBuf {
+    am.base_dir().join(format!("jre-{jre_key}-download{}", jre_archive_suffix(format)))
+}
+
+fn extract_jre_archive(archive: &Path, dest: &Path, format: Option<ArtifactFormat>) -> Result<(), String> {
+    match format {
+        Some(ArtifactFormat::TarZstd) => {
+            let file = std::fs::File::open(archive).map_err(|e| format!("Failed to open JRE archive: {e}"))?;
+            let decoder =
+                zstd::stream::read::Decoder::new(file).map_err(|e| format!("Failed to open zstd JRE archive: {e}"))?;
+            extract_jre_tar(tar::Archive::new(decoder), dest)
+        }
+        None => extract_tar_gz(archive, dest),
+    }
+}
+
 fn extract_tar_gz(archive: &Path, dest: &Path) -> Result<(), String> {
+    let file = std::fs::File::open(archive).map_err(|e| format!("Failed to open JRE archive: {e}"))?;
+    let decoder = flate2::read::GzDecoder::new(file);
+    extract_jre_tar(tar::Archive::new(decoder), dest)
+}
+
+fn extract_jre_tar<R: Read>(mut archive: tar::Archive<R>, dest: &Path) -> Result<(), String> {
     let parent = dest.parent().ok_or_else(|| format!("Invalid JRE destination: {}", dest.display()))?;
     std::fs::create_dir_all(parent).map_err(|e| format!("Failed to create JRE directory: {e}"))?;
 
@@ -1731,9 +2242,7 @@ fn extract_tar_gz(archive: &Path, dest: &Path) -> Result<(), String> {
         .prefix(".jre-extract-")
         .tempdir_in(parent)
         .map_err(|e| format!("Failed to create JRE extraction directory: {e}"))?;
-    let file = std::fs::File::open(archive).map_err(|e| format!("Failed to open JRE archive: {e}"))?;
-    let decoder = flate2::read::GzDecoder::new(file);
-    tar::Archive::new(decoder).unpack(staging.path()).map_err(|e| format!("Failed to extract JRE archive: {e}"))?;
+    archive.unpack(staging.path()).map_err(|e| format!("Failed to extract JRE archive: {e}"))?;
 
     let mut roots = std::fs::read_dir(staging.path())
         .map_err(|e| format!("Failed to inspect extracted JRE archive: {e}"))?
@@ -2090,7 +2599,7 @@ mod agent_download_url_tests {
 #[cfg(test)]
 mod agent_registry_install_tests {
     use super::*;
-    use crate::agent_manager::{ArtifactInfo, DriverInfo, InstalledDriver, JavaRuntimeConfig, JreInfo};
+    use crate::agent_manager::{ArtifactFormat, ArtifactInfo, DriverInfo, InstalledDriver, JavaRuntimeConfig, JreInfo};
 
     fn test_manager(name: &str) -> AgentManager {
         let dir = std::env::temp_dir().join(format!("dbx-agent-registry-install-{name}-{}", uuid::Uuid::new_v4()));
@@ -2123,11 +2632,13 @@ mod agent_registry_install_tests {
                 jre: DEFAULT_JRE_KEY.to_string(),
                 jar: Some(ArtifactInfo {
                     url: format!("https://example.com/dbx-agent-{db_type}-legacy-placeholder.jar"),
+                    sha256: None,
                     size: 0,
+                    format: None,
                 }),
                 native: [(
                     AgentManager::current_platform().to_string(),
-                    ArtifactInfo { url: native_url.to_string(), size: native_size },
+                    ArtifactInfo { url: native_url.to_string(), sha256: None, size: native_size, format: None },
                 )]
                 .into_iter()
                 .collect(),
@@ -2145,7 +2656,7 @@ mod agent_registry_install_tests {
                 label: db_type.to_string(),
                 min_app_version: "0.1.0".to_string(),
                 jre: DEFAULT_JRE_KEY.to_string(),
-                jar: Some(ArtifactInfo { url: url.to_string(), size }),
+                jar: Some(ArtifactInfo { url: url.to_string(), sha256: None, size, format: None }),
                 native: std::collections::HashMap::new(),
             },
         );
@@ -2173,11 +2684,121 @@ mod agent_registry_install_tests {
         dest: &Path,
         bytes: &[u8],
     ) -> PathBuf {
-        let cache_path =
-            cached_download_path(am, url, bytes.len() as u64, Some(CacheIdentity::Driver { db_type, version }), dest);
+        let cache_path = cached_download_path(
+            am,
+            url,
+            bytes.len() as u64,
+            None,
+            Some(CacheIdentity::Driver { db_type, version }),
+            dest,
+        );
         std::fs::create_dir_all(cache_path.parent().unwrap()).unwrap();
         std::fs::write(&cache_path, bytes).unwrap();
         cache_path
+    }
+
+    fn current_platform_native_binary() -> Vec<u8> {
+        if cfg!(windows) {
+            let mut bytes = vec![0_u8; 0x48];
+            bytes[..2].copy_from_slice(b"MZ");
+            bytes[0x3c..0x40].copy_from_slice(&(0x40_u32).to_le_bytes());
+            bytes[0x40..0x44].copy_from_slice(b"PE\0\0");
+            let machine = if cfg!(target_arch = "aarch64") { 0xaa64_u16 } else { 0x8664_u16 };
+            bytes[0x44..0x46].copy_from_slice(&machine.to_le_bytes());
+            bytes
+        } else if cfg!(target_os = "linux") {
+            let mut bytes = vec![0_u8; 20];
+            bytes[..4].copy_from_slice(b"\x7fELF");
+            bytes[4] = 2;
+            bytes[5] = 1;
+            let machine = if cfg!(target_arch = "aarch64") { 183_u16 } else { 62_u16 };
+            bytes[18..20].copy_from_slice(&machine.to_le_bytes());
+            bytes
+        } else if cfg!(target_os = "macos") {
+            let mut bytes = vec![0xcf, 0xfa, 0xed, 0xfe];
+            let cpu_type = if cfg!(target_arch = "aarch64") { 0x0100_000c_u32 } else { 0x0100_0007_u32 };
+            bytes.extend_from_slice(&cpu_type.to_le_bytes());
+            bytes
+        } else {
+            Vec::new()
+        }
+    }
+
+    fn test_agent_jar() -> Vec<u8> {
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        {
+            use std::io::Write;
+            let mut archive = zip::ZipWriter::new(&mut bytes);
+            archive.start_file("META-INF/MANIFEST.MF", zip::write::SimpleFileOptions::default()).unwrap();
+            archive.write_all(b"Manifest-Version: 1.0\nMain-Class: com.dbx.Agent\n").unwrap();
+            archive.finish().unwrap();
+        }
+        bytes.into_inner()
+    }
+
+    fn build_tar_zstd_driver_package(
+        db_type: &str,
+        version: &str,
+        kind: DriverArtifactKind,
+        driver_bytes: &[u8],
+    ) -> Vec<u8> {
+        let platform = AgentManager::current_platform();
+        let (filename, artifact) = match kind {
+            DriverArtifactKind::Jar => (
+                format!("dbx-agent-{db_type}-{version}.jar"),
+                serde_json::json!({
+                    "jar": {
+                        "url": format!("dbx-agent-{db_type}-{version}.jar"),
+                        "size": driver_bytes.len()
+                    }
+                }),
+            ),
+            DriverArtifactKind::Native => {
+                let extension = if platform.starts_with("windows-") { ".exe" } else { "" };
+                let filename = format!("dbx-agent-{db_type}-{version}-{platform}{extension}");
+                (
+                    filename.clone(),
+                    serde_json::json!({
+                        "native": {
+                            platform: {
+                                "url": filename,
+                                "size": driver_bytes.len()
+                            }
+                        }
+                    }),
+                )
+            }
+        };
+        let mut driver = serde_json::json!({
+            "version": version,
+            "label": db_type,
+            "min_app_version": "0.6.0",
+            "jre": DEFAULT_JRE_KEY
+        });
+        driver.as_object_mut().unwrap().extend(artifact.as_object().unwrap().clone());
+        let registry = serde_json::json!({
+            "jres": {},
+            "drivers": {
+                db_type: driver
+            }
+        });
+        let registry_bytes = registry.to_string().into_bytes();
+        let encoder = zstd::stream::write::Encoder::new(Vec::new(), 3).unwrap();
+        let mut archive = tar::Builder::new(encoder);
+
+        let mut registry_header = tar::Header::new_gnu();
+        registry_header.set_size(registry_bytes.len() as u64);
+        registry_header.set_mode(0o644);
+        registry_header.set_cksum();
+        archive.append_data(&mut registry_header, "agent-registry.json", registry_bytes.as_slice()).unwrap();
+
+        let mut driver_header = tar::Header::new_gnu();
+        driver_header.set_size(driver_bytes.len() as u64);
+        driver_header.set_mode(if kind == DriverArtifactKind::Native { 0o755 } else { 0o644 });
+        driver_header.set_cksum();
+        archive.append_data(&mut driver_header, format!("drivers/{filename}"), driver_bytes).unwrap();
+
+        archive.into_inner().unwrap().finish().unwrap()
     }
 
     #[test]
@@ -2208,7 +2829,7 @@ mod agent_registry_install_tests {
                     version: version.to_string(),
                     platforms: [(
                         AgentManager::current_platform().to_string(),
-                        ArtifactInfo { url: url.to_string(), size },
+                        ArtifactInfo { url: url.to_string(), sha256: None, size, format: None },
                     )]
                     .into_iter()
                     .collect(),
@@ -2234,17 +2855,78 @@ mod agent_registry_install_tests {
         builder.into_inner().unwrap().finish().unwrap()
     }
 
-    fn write_cached_jre_download(am: &AgentManager, jre_key: &str, version: &str, url: &str, archive: &[u8]) {
-        let dest = am.base_dir().join(format!("jre-{jre_key}-download.tar.gz"));
+    fn build_zstd_jre_archive(am: &AgentManager, jre_key: &str) -> Vec<u8> {
+        let archive_root = am.base_dir().join("jre-zstd-test-archive");
+        let payload = archive_root.join("payload");
+        let java_path = am.jre_java_path(jre_key);
+        let relative_java_path = java_path.strip_prefix(am.jre_dir(jre_key)).unwrap();
+        let java_path = payload.join(relative_java_path);
+        std::fs::create_dir_all(java_path.parent().unwrap()).unwrap();
+        std::fs::write(java_path, b"java").unwrap();
+        let encoder = zstd::stream::write::Encoder::new(Vec::new(), 3).unwrap();
+        let mut builder = tar::Builder::new(encoder);
+        builder.append_dir_all("payload", &payload).unwrap();
+        builder.into_inner().unwrap().finish().unwrap()
+    }
+
+    fn write_cached_jre_download(
+        am: &AgentManager,
+        jre_key: &str,
+        version: &str,
+        url: &str,
+        format: Option<ArtifactFormat>,
+        expected_sha256: Option<&str>,
+        archive: &[u8],
+    ) {
+        let dest = jre_archive_download_path(am, jre_key, format);
         let cache_path = cached_download_path(
             am,
             url,
             archive.len() as u64,
+            expected_sha256,
             Some(CacheIdentity::Jre { key: jre_key, version }),
             &dest,
         );
         std::fs::create_dir_all(cache_path.parent().unwrap()).unwrap();
         std::fs::write(cache_path, archive).unwrap();
+    }
+
+    #[test]
+    fn artifact_info_deserializes_sha256_metadata() {
+        let expected_sha256 = "a".repeat(64);
+        let artifact: ArtifactInfo = serde_json::from_value(serde_json::json!({
+            "url": "https://example.com/artifact.tar.zst",
+            "sha256": expected_sha256,
+            "size": 4,
+            "format": "tar_zstd"
+        }))
+        .unwrap();
+
+        assert_eq!(artifact.sha256.as_deref(), Some(expected_sha256.as_str()));
+    }
+
+    #[test]
+    fn cached_download_rejects_same_size_sha256_mismatch() {
+        let manager = test_manager("cache-sha256-mismatch");
+        let cache_path = manager.download_cache_dir().join("artifact.bin");
+        std::fs::create_dir_all(cache_path.parent().unwrap()).unwrap();
+        std::fs::write(&cache_path, b"bad!").unwrap();
+        let expected_sha256 = format!("{:x}", Sha256::digest(b"good"));
+
+        assert!(!cached_download_is_valid(&manager, &cache_path, 4, Some(&expected_sha256)));
+        assert!(!cache_path.exists());
+    }
+
+    #[test]
+    fn cached_download_accepts_matching_sha256() {
+        let manager = test_manager("cache-sha256-match");
+        let cache_path = manager.download_cache_dir().join("artifact.bin");
+        std::fs::create_dir_all(cache_path.parent().unwrap()).unwrap();
+        std::fs::write(&cache_path, b"good").unwrap();
+        let expected_sha256 = format!("{:x}", Sha256::digest(b"good"));
+
+        assert!(cached_download_is_valid(&manager, &cache_path, 4, Some(&expected_sha256)));
+        assert!(cache_path.exists());
     }
 
     #[tokio::test]
@@ -2282,6 +2964,81 @@ mod agent_registry_install_tests {
             .unwrap()
             .iter()
             .any(|event| event.step == "done" && event.db_type.as_deref() == Some(db_type)));
+    }
+
+    #[tokio::test]
+    async fn registry_install_extracts_tar_zstd_native_driver_package() {
+        let manager = test_manager("tar-zstd-native-package");
+        let db_type = "duckdb";
+        let version = "0.1.0";
+        let package_url = "https://example.com/dbx-agent-duckdb.tar.zst";
+        let native_bytes = current_platform_native_binary();
+        let package_bytes = build_tar_zstd_driver_package(db_type, version, DriverArtifactKind::Native, &native_bytes);
+        let mut registry =
+            registry_with_native_and_legacy_jar(db_type, version, package_url, package_bytes.len() as u64);
+        registry.drivers.get_mut(db_type).unwrap().native.get_mut(AgentManager::current_platform()).unwrap().format =
+            Some(ArtifactFormat::TarZstd);
+        let native_path = manager.driver_native_path(db_type);
+        let package_path = driver_artifact_download_path(&native_path, Some(ArtifactFormat::TarZstd));
+        let cache_path =
+            write_cached_driver_download(&manager, db_type, version, package_url, &package_path, &package_bytes);
+        let progress = |_| {};
+
+        install_agent_driver_from_registry(
+            &manager,
+            &registry,
+            DownloadSource::Official,
+            db_type,
+            &progress,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(std::fs::read(&native_path).unwrap(), native_bytes);
+        assert!(!package_path.exists());
+        assert!(!cache_path.exists());
+        assert_eq!(manager.load_state().installed_drivers[db_type].version, version);
+    }
+
+    #[tokio::test]
+    async fn registry_install_extracts_tar_zstd_java_driver_package() {
+        let manager = test_manager("tar-zstd-java-package");
+        let db_type = "dameng";
+        let version = "0.2.0";
+        let package_url = "https://example.com/dbx-agent-dameng.tar.zst";
+        let jar_bytes = test_agent_jar();
+        let package_bytes = build_tar_zstd_driver_package(db_type, version, DriverArtifactKind::Jar, &jar_bytes);
+        let mut registry = registry_with_jar(db_type, version, package_url, package_bytes.len() as u64);
+        registry.drivers.get_mut(db_type).unwrap().jar.as_mut().unwrap().format = Some(ArtifactFormat::TarZstd);
+        manager
+            .mutate_state(|state| {
+                state.java_runtime = JavaRuntimeConfig { mode: JavaRuntimeMode::System, custom_java_path: None };
+            })
+            .unwrap();
+        let jar_path = manager.driver_jar_path(db_type);
+        let package_path = driver_artifact_download_path(&jar_path, Some(ArtifactFormat::TarZstd));
+        let cache_path =
+            write_cached_driver_download(&manager, db_type, version, package_url, &package_path, &package_bytes);
+        let progress = |_| {};
+
+        install_agent_driver_from_registry(
+            &manager,
+            &registry,
+            DownloadSource::Official,
+            db_type,
+            &progress,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(std::fs::read(&jar_path).unwrap(), jar_bytes);
+        assert!(!package_path.exists());
+        assert!(!cache_path.exists());
+        assert_eq!(manager.load_state().installed_drivers[db_type].version, version);
     }
 
     #[tokio::test]
@@ -2367,7 +3124,7 @@ mod agent_registry_install_tests {
         let events = std::sync::Mutex::new(Vec::new());
         let progress = |event| events.lock().unwrap().push(event);
 
-        write_cached_jre_download(&manager, jre_key, version, url, &archive);
+        write_cached_jre_download(&manager, jre_key, version, url, None, None, &archive);
         ensure_jre_from_registry(
             &manager,
             &registry,
@@ -2383,7 +3140,7 @@ mod agent_registry_install_tests {
 
         // The successful install cleans its cache. Re-add it so the old
         // implementation fails deterministically by consuming it again.
-        write_cached_jre_download(&manager, jre_key, version, url, &archive);
+        write_cached_jre_download(&manager, jre_key, version, url, None, None, &archive);
         ensure_jre_from_registry(
             &manager,
             &registry,
@@ -2408,6 +3165,37 @@ mod agent_registry_install_tests {
             .unwrap()
             .iter()
             .any(|event| event.step == "jre" && event.db_type.as_deref() == Some("dameng")));
+    }
+
+    #[tokio::test]
+    async fn managed_jre_install_extracts_tar_zstd_archive() {
+        let manager = test_manager("managed-zstd-jre");
+        let jre_key = DEFAULT_JRE_KEY;
+        let version = "21.0.12";
+        let url = "https://example.com/dbx-jre.tar.zst";
+        let archive = build_zstd_jre_archive(&manager, jre_key);
+        let expected_sha256 = format!("{:x}", Sha256::digest(&archive));
+        let mut registry = registry_with_jre(jre_key, version, url, archive.len() as u64);
+        let artifact =
+            registry.jres.get_mut(jre_key).unwrap().platforms.get_mut(AgentManager::current_platform()).unwrap();
+        artifact.format = Some(ArtifactFormat::TarZstd);
+        artifact.sha256 = Some(expected_sha256.clone());
+        write_cached_jre_download(
+            &manager,
+            jre_key,
+            version,
+            url,
+            Some(ArtifactFormat::TarZstd),
+            Some(&expected_sha256),
+            &archive,
+        );
+
+        ensure_jre_from_registry(&manager, &registry, DownloadSource::Official, jre_key, "dameng", &|_| {}, None, None)
+            .await
+            .unwrap();
+
+        assert!(manager.is_jre_installed(jre_key));
+        assert_eq!(manager.load_state().jre_versions[jre_key], version);
     }
 
     #[tokio::test]

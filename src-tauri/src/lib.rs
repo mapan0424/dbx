@@ -4,6 +4,11 @@ mod db;
 #[cfg(target_os = "macos")]
 mod macos_app_delegate;
 mod models;
+#[cfg(any(target_os = "windows", test))]
+mod startup_recovery;
+#[cfg(all(not(target_os = "windows"), not(test)))]
+#[path = "startup_recovery_noop.rs"]
+mod startup_recovery;
 mod window_state_guard;
 
 use commands::connection::AppState;
@@ -31,8 +36,6 @@ use tauri_plugin_deep_link::DeepLinkExt;
 
 const DESKTOP_TRAY_ID: &str = "main-tray";
 const APP_CLOSE_REQUESTED_EVENT: &str = "dbx-app-close-requested";
-#[cfg(target_os = "windows")]
-const WEBVIEW2_NO_SANDBOX_ENV: &str = "DBX_WEBVIEW2_NO_SANDBOX";
 #[cfg(target_os = "macos")]
 const APP_MENU_QUIT_ID: &str = "app-menu-quit";
 #[cfg(target_os = "macos")]
@@ -116,6 +119,14 @@ fn should_enable_single_instance(debug_build: bool) -> bool {
     !debug_build
 }
 
+fn startup_data_dir_mode(mode: &data_dir::DataDirMode) -> &'static str {
+    match mode {
+        data_dir::DataDirMode::Default => "default",
+        data_dir::DataDirMode::EnvOverride => "env_override",
+        data_dir::DataDirMode::Portable { .. } => "portable",
+    }
+}
+
 #[cfg(target_os = "macos")]
 fn development_dock_badge_label(debug_build: bool) -> Option<&'static str> {
     debug_build.then_some("DEV")
@@ -146,24 +157,17 @@ fn should_show_main_window_after_setup() -> bool {
     true
 }
 
-#[cfg(target_os = "windows")]
-fn configure_webview2_sandbox_compat() {
-    if !matches!(std::env::var(WEBVIEW2_NO_SANDBOX_ENV).as_deref(), Ok("1")) {
-        return;
-    }
-
-    let mut args = std::env::var("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS").unwrap_or_default();
-    if !args.split_whitespace().any(|arg| arg == "--no-sandbox") {
-        if !args.is_empty() {
-            args.push(' ');
-        }
-        args.push_str("--no-sandbox");
-    }
-    std::env::set_var("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS", args);
+fn should_show_main_window_before_setup_tasks() -> bool {
+    true
 }
 
-#[cfg(not(target_os = "windows"))]
-fn configure_webview2_sandbox_compat() {}
+fn append_startup_probe(message: impl AsRef<str>) {
+    startup_recovery::record(message);
+}
+
+pub(crate) fn clear_startup_probe_after_frontend_ready() {
+    startup_recovery::mark_frontend_ready();
+}
 
 fn should_confirm_app_exit_request(target_os: &str, exit_code: Option<i32>, confirmed_exit: bool) -> bool {
     should_hide_window_on_close(target_os) && exit_code != Some(tauri::RESTART_EXIT_CODE) && !confirmed_exit
@@ -458,6 +462,30 @@ fn show_main_window<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
         let _ = window.unminimize();
         let _ = window.set_focus();
     }
+}
+
+fn main_window_probe_state<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> String {
+    let Some(window) = app.get_webview_window("main") else {
+        return "main_window=missing".to_string();
+    };
+    format!(
+        "main_window visible={:?} minimized={:?} maximized={:?} fullscreen={:?} position={:?} size={:?}",
+        window.is_visible(),
+        window.is_minimized(),
+        window.is_maximized(),
+        window.is_fullscreen(),
+        window.outer_position(),
+        window.outer_size()
+    )
+}
+
+fn prepare_main_window_for_display<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
+    if let Some(decorations) = native_window_decorations_override(std::env::consts::OS) {
+        if let Some(window) = app.get_webview_window("main") {
+            let _ = window.set_decorations(decorations);
+        }
+    }
+    window_state_guard::enforce_main_window_bounds(app);
 }
 
 fn clear_main_webview_focus<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
@@ -805,9 +833,11 @@ mod tests {
         linux_appimage_wayland_backend_override, linux_nvidia_driver_from_state, linux_selected_drm_render_device,
         linux_webkit_rendering_workarounds, native_window_decorations_override, should_confirm_app_exit_request,
         should_enable_single_instance, should_fallback_to_native_quit, should_hide_window_on_close,
-        should_setup_desktop_tray, should_show_main_window_after_setup, tray_menu_labels_for_locale,
-        uses_application_level_icon, LinuxDrmRenderDevice, LinuxNvidiaDriver,
+        should_setup_desktop_tray, should_show_main_window_after_setup, should_show_main_window_before_setup_tasks,
+        startup_data_dir_mode, tray_menu_labels_for_locale, uses_application_level_icon, LinuxDrmRenderDevice,
+        LinuxNvidiaDriver,
     };
+    use crate::data_dir::DataDirMode;
     use std::ffi::OsStr;
     use std::path::{Path, PathBuf};
 
@@ -875,6 +905,16 @@ mod tests {
         assert!(should_enable_single_instance(false));
     }
 
+    #[test]
+    fn startup_data_dir_diagnostics_never_include_paths() {
+        let private_path = PathBuf::from(r"C:\Users\private-user\DBXData");
+        assert_eq!(startup_data_dir_mode(&DataDirMode::Default), "default");
+        assert_eq!(startup_data_dir_mode(&DataDirMode::EnvOverride), "env_override");
+        let label = startup_data_dir_mode(&DataDirMode::Portable { exe_dir: private_path });
+        assert_eq!(label, "portable");
+        assert!(!label.contains("private-user"));
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn labels_debug_builds_in_the_macos_dock() {
@@ -916,6 +956,11 @@ mod tests {
     #[test]
     fn shows_main_window_after_regular_startup_setup() {
         assert!(should_show_main_window_after_setup());
+    }
+
+    #[test]
+    fn shows_main_window_while_startup_setup_continues() {
+        assert!(should_show_main_window_before_setup_tasks());
     }
 
     #[test]
@@ -1116,8 +1161,9 @@ mod tests {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    startup_recovery::initialize();
     rustls::crypto::aws_lc_rs::default_provider().install_default().expect("Failed to install rustls crypto provider");
-    configure_webview2_sandbox_compat();
+    append_startup_probe("runtime prerequisites configured");
     #[cfg(target_os = "linux")]
     apply_linux_webkit_rendering_workarounds();
 
@@ -1159,7 +1205,11 @@ pub fn run() {
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
-        .plugin(tauri_plugin_window_state::Builder::default().build());
+        .plugin(
+            tauri_plugin_window_state::Builder::default()
+                .with_state_flags(window_state_guard::persisted_main_window_state_flags())
+                .build(),
+        );
 
     // macOS app menu (Cmd+Q / Dock Quit). Skip on Linux/Windows so an empty menu bar
     // is not installed where there was none before.
@@ -1187,12 +1237,25 @@ pub fn run() {
         .setup(move |app| {
             let setup_start = Instant::now();
             eprintln!("[STARTUP] plugins registered in {:?}", startup_begin.elapsed());
+            append_startup_probe(format!("setup entered after {:?}", startup_begin.elapsed()));
 
+            if should_show_main_window_before_setup_tasks() {
+                prepare_main_window_for_display(app.handle());
+                show_main_window(app.handle());
+                append_startup_probe(format!(
+                    "early main window show requested; {}",
+                    main_window_probe_state(app.handle())
+                ));
+            }
+
+            append_startup_probe("resolving app data dir");
             let default_data_dir =
                 app.path().app_data_dir().map_err(|e| e.to_string()).expect("Failed to resolve app data dir");
             let data_dir_resolution = data_dir::resolve_data_dir_with_mode(default_data_dir);
             let data_dir = data_dir_resolution.data_dir.clone();
             std::fs::create_dir_all(&data_dir).expect("Failed to create data dir");
+            let data_dir_mode = startup_data_dir_mode(&data_dir_resolution.mode);
+            append_startup_probe(format!("data dir ready mode={data_dir_mode}"));
             let alternative_data_dir = data_dir::alternative_data_dir(&data_dir_resolution);
             match maybe_import_user_data_db(&data_dir, alternative_data_dir.as_deref()) {
                 Ok(result) => eprintln!("[STARTUP] data db fallback import: {result:?}"),
@@ -1201,12 +1264,15 @@ pub fn run() {
             let db_path = data_dir.join("dbx.db");
 
             let t = Instant::now();
+            append_startup_probe(format!("opening storage file=dbx.db data_dir_mode={data_dir_mode}"));
             let storage = tauri::async_runtime::block_on(async {
                 let s = Storage::open(&db_path).await.expect("Failed to open storage");
                 eprintln!("[STARTUP]   Storage::open in {:?}", t.elapsed());
+                append_startup_probe(format!("storage opened in {:?}", t.elapsed()));
                 let t2 = Instant::now();
                 s.migrate_from_json(&data_dir).await.expect("Failed to migrate JSON data");
                 eprintln!("[STARTUP]   migrate_from_json in {:?}", t2.elapsed());
+                append_startup_probe(format!("json migration completed in {:?}", t2.elapsed()));
                 s
             });
             let desktop_settings = tauri::async_runtime::block_on(storage.load_desktop_settings()).unwrap_or_default();
@@ -1227,6 +1293,7 @@ pub fn run() {
             )?;
             apply_debug_log_level(desktop_settings.debug_logging_enabled);
             eprintln!("[STARTUP] storage ready in {:?}", t.elapsed());
+            append_startup_probe(format!("storage ready in {:?}", t.elapsed()));
 
             // Initialize core dialect registry and load external plugin dialects
             let dialect_init_start = Instant::now();
@@ -1241,6 +1308,13 @@ pub fn run() {
                 load_result.skipped.len(),
                 dialect_init_start.elapsed()
             );
+            append_startup_probe(format!(
+                "dialect plugins loaded: {} success, {} errors, {} skipped in {:?}",
+                load_result.loaded.len(),
+                load_result.errors.len(),
+                load_result.skipped.len(),
+                dialect_init_start.elapsed()
+            ));
 
             // Start dialect YAML hot-reload watcher
             let watch_dirs = plugin_dirs.clone();
@@ -1289,12 +1363,13 @@ pub fn run() {
             let app_handle = app.handle().clone();
             commands::mcp_bridge::start(app_handle, state, data_dir);
             eprintln!("[STARTUP] setup complete in {:?} (total {:?})", setup_start.elapsed(), startup_begin.elapsed());
+            append_startup_probe(format!(
+                "setup tasks complete in {:?} total {:?}",
+                setup_start.elapsed(),
+                startup_begin.elapsed()
+            ));
 
-            if let Some(decorations) = native_window_decorations_override(std::env::consts::OS) {
-                if let Some(window) = app.get_webview_window("main") {
-                    let _ = window.set_decorations(decorations);
-                }
-            }
+            prepare_main_window_for_display(app.handle());
             if should_setup_desktop_tray(
                 std::env::consts::OS,
                 desktop_settings.show_tray_icon,
@@ -1305,13 +1380,17 @@ pub fn run() {
             apply_desktop_icon_theme(app.handle(), desktop_settings.icon_theme)?;
             #[cfg(target_os = "macos")]
             apply_macos_development_dock_badge(app.handle())?;
-            window_state_guard::enforce_main_window_bounds(app.handle());
             if should_show_main_window_after_setup() {
                 show_main_window(app.handle());
+                append_startup_probe(format!(
+                    "final main window show requested; {}",
+                    main_window_probe_state(app.handle())
+                ));
             }
             #[cfg(any(windows, target_os = "linux"))]
             let _ = app.deep_link().register_all();
 
+            append_startup_probe("setup finished");
             Ok(())
         })
         .on_window_event(|window, event| {
@@ -1396,6 +1475,9 @@ pub fn run() {
             commands::cloud_sync::snippet_token_status,
             commands::cloud_sync::save_snippet_saved_token,
             commands::cloud_sync::forget_snippet_saved_token,
+            commands::cloud_sync::snippet_sync_settings,
+            commands::cloud_sync::save_snippet_sync_id,
+            commands::cloud_sync::retry_snippet_legacy_cleanup,
             commands::cloud_sync::snippet_sync_upload,
             commands::cloud_sync::snippet_sync_download,
             commands::connection::test_connection,
@@ -1429,6 +1511,7 @@ pub fn run() {
             commands::plugins::uninstall_jdbc_plugin,
             commands::schema::list_databases,
             commands::schema::list_database_storage,
+            commands::schema::get_sqlserver_completion_context,
             commands::schema::list_doris_catalogs,
             commands::schema::list_doris_catalog_databases,
             commands::schema::list_sqlserver_linked_servers,
@@ -1498,7 +1581,7 @@ pub fn run() {
             commands::query::build_search_result_where,
             commands::query::build_rename_object_sql,
             commands::query::build_create_database_sql,
-            #[cfg(feature = "duckdb-bundled")]
+            #[cfg(feature = "duckdb-sidecar")]
             commands::query::build_duckdb_attach_database_sql,
             commands::query::build_sqlite_attach_database_sql,
             commands::query::build_drop_object_sql,
@@ -1561,6 +1644,8 @@ pub fn run() {
             commands::redis_cmd::redis_scan_keys_batch,
             commands::redis_cmd::redis_scan_values,
             commands::redis_cmd::redis_get_value,
+            commands::redis_cmd::redis_get_ttl,
+            commands::redis_cmd::redis_get_stream_entries,
             commands::redis_cmd::redis_get_stream_groups,
             commands::redis_cmd::redis_get_stream_consumers,
             commands::redis_cmd::redis_get_stream_pending,
@@ -1596,6 +1681,15 @@ pub fn run() {
             commands::etcd_cmd::etcd_rename,
             commands::etcd_cmd::etcd_history,
             commands::etcd_cmd::etcd_status,
+            commands::etcd_cmd::etcd_preflight,
+            commands::etcd_cmd::etcd_compact,
+            commands::etcd_cmd::etcd_defrag,
+            commands::etcd_cmd::etcd_watch_start,
+            commands::etcd_cmd::etcd_watch_poll,
+            commands::etcd_cmd::etcd_watch_stop,
+            commands::etcd_cmd::etcd_lease_list,
+            commands::etcd_cmd::etcd_lease_call,
+            commands::etcd_cmd::etcd_auth_call,
             commands::zookeeper_cmd::zookeeper_list_prefix,
             commands::zookeeper_cmd::zookeeper_get,
             commands::zookeeper_cmd::zookeeper_put,
@@ -1839,6 +1933,7 @@ pub fn run() {
             commands::update::fetch_changelog,
             commands::update::get_system_proxy_url,
             commands::update::download_update,
+            commands::update::cancel_update_download,
             commands::update::install_downloaded_update,
             commands::transfer::start_transfer,
             commands::transfer::preview_transfer_ownership,
@@ -1887,8 +1982,16 @@ pub fn run() {
             commands::tunnel_profiles::test_tunnel_profile,
         ])
         .build(tauri::generate_context!())
-        .expect("error while building tauri application")
+        .inspect(|app| {
+            append_startup_probe(format!("tauri application built after {:?}", startup_begin.elapsed()));
+            startup_recovery::start_watchdog(app.handle());
+        })
+        .unwrap_or_else(|error| {
+            append_startup_probe(format!("tauri application build failed: {error}"));
+            panic!("error while building tauri application: {error}");
+        })
         .run(|app_handle, event| {
+            startup_recovery::record_run_event();
             #[cfg(not(target_os = "macos"))]
             let _ = (&app_handle, &event);
 
@@ -1900,8 +2003,16 @@ pub fn run() {
                 if should_confirm_app_exit_request(std::env::consts::OS, *code, confirmed_exit) {
                     api.prevent_exit();
                     request_app_close(app_handle, "quit");
-                } else if let Some(state) = app_handle.try_state::<Arc<AppState>>() {
-                    tauri::async_runtime::block_on(state.shutdown_background_tasks(Duration::from_secs(3)));
+                } else {
+                    tauri::async_runtime::block_on(async {
+                        if let Some(server) = app_handle.try_state::<commands::redis_pubsub_server::PubSubServerState>()
+                        {
+                            server.shutdown(Duration::from_secs(1)).await;
+                        }
+                        if let Some(state) = app_handle.try_state::<Arc<AppState>>() {
+                            state.shutdown(Duration::from_secs(3)).await;
+                        }
+                    });
                 }
             }
 

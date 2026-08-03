@@ -44,6 +44,7 @@ const typeMap: Record<string, { dbType: DatabaseType; profile: string; label: st
 };
 
 const unsupportedTypes = new Set(["http", "https", "ftp", "sftp", "ssh"]);
+let navicatCipherModule: Promise<typeof import("@noble/ciphers/aes.js")> | undefined;
 
 function normalizeKey(value: string) {
   return value.toLowerCase().replace(/[^a-z0-9]/g, "");
@@ -96,12 +97,22 @@ async function decryptNavicatPassword(value: string) {
   const key = new TextEncoder().encode("libcckeylibcckey");
   const iv = new TextEncoder().encode("libcciv libcciv ");
   try {
-    const cryptoKey = await crypto.subtle.importKey("raw", key, { name: "AES-CBC" }, false, ["decrypt"]);
-    const decrypted = new Uint8Array(await crypto.subtle.decrypt({ name: "AES-CBC", iv }, cryptoKey, encrypted));
+    const subtle = globalThis.crypto?.subtle;
+    const decrypted = subtle ? await decryptNavicatPasswordWithWebCrypto(subtle, encrypted, key, iv) : await decryptNavicatPasswordWithoutWebCrypto(encrypted, key, iv);
     return new TextDecoder().decode(stripPkcs7(decrypted));
   } catch {
     return "";
   }
+}
+
+async function decryptNavicatPasswordWithWebCrypto(subtle: SubtleCrypto, encrypted: Uint8Array<ArrayBuffer>, key: Uint8Array<ArrayBuffer>, iv: Uint8Array<ArrayBuffer>) {
+  const cryptoKey = await subtle.importKey("raw", key, { name: "AES-CBC" }, false, ["decrypt"]);
+  return new Uint8Array(await subtle.decrypt({ name: "AES-CBC", iv }, cryptoKey, encrypted));
+}
+
+async function decryptNavicatPasswordWithoutWebCrypto(encrypted: Uint8Array<ArrayBuffer>, key: Uint8Array<ArrayBuffer>, iv: Uint8Array<ArrayBuffer>) {
+  const { cbc } = await (navicatCipherModule ??= import("@noble/ciphers/aes.js"));
+  return cbc(key, iv).decrypt(encrypted);
 }
 
 function parseNavicatPort(value: string, fallback: number) {
@@ -300,7 +311,7 @@ async function parseConnection(node: ParsedNode): Promise<ConnectionConfig | nul
   const name = getAny(node.values, ["name", "connectionName", "connName", "caption", "title"]) || getAny(node.values, ["host", "server", "hostname"]) || sqlitePath || effectiveProfile.label;
   const host = sqlitePath || getAny(node.values, ["host", "server", "hostname", "serverHost", "address"]) || (effectiveProfile.dbType === "sqlite" ? "" : "127.0.0.1");
   // Navicat exports OceanBase Oracle connections with Database="ORCL", but OceanBase resolves the target from the username.
-  const database = effectiveProfile.dbType === "sqlite" ? sqlitePath : effectiveProfile.dbType === "oceanbase-oracle" ? "" : getAny(node.values, ["database", "databaseName", "initialDatabase", "serviceName", "sid", "schema"]);
+  const database = effectiveProfile.dbType === "sqlite" ? "" : effectiveProfile.dbType === "oceanbase-oracle" ? "" : getAny(node.values, ["database", "databaseName", "initialDatabase", "serviceName", "sid", "schema"]);
   const isOracleLike = effectiveProfile.dbType === "oracle" || effectiveProfile.dbType === "oceanbase-oracle";
   const oracleConnectionType = isOracleLike && getAny(node.values, ["sid"]) ? "sid" : isOracleLike ? "service_name" : undefined;
   const username = getAny(node.values, ["user", "username", "userName", "uid"]) || profile.user;

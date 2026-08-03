@@ -2,8 +2,13 @@ import { describe, expect, it } from "vitest";
 import { normalizeSidebarObjectKind, sidebarObjectKindsForDatabase } from "@/lib/database/databaseObjectCapabilities";
 
 describe("databaseObjectCapabilities", () => {
-  it("exposes materialized views for Dameng", () => {
-    expect(sidebarObjectKindsForDatabase("dameng")).toContain("MATERIALIZED_VIEW");
+  it("exposes supported programmable objects for Dameng", () => {
+    expect(sidebarObjectKindsForDatabase("dameng")).toEqual(expect.arrayContaining(["MATERIALIZED_VIEW", "SEQUENCE", "PACKAGE", "PACKAGE_BODY"]));
+  });
+
+  it("exposes synonyms for Xugu only", () => {
+    expect(sidebarObjectKindsForDatabase("xugu")).toContain("SYNONYM");
+    expect(sidebarObjectKindsForDatabase("postgres")).not.toContain("SYNONYM");
   });
 
   it("exposes only tables for HBase namespaces", () => {

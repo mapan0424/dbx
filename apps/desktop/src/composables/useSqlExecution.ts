@@ -9,7 +9,7 @@ import { isSingleDatabase, usesTreeSchemaMode } from "@/lib/database/databaseCap
 import { supportsConnectionLevelSqlExecution } from "@/lib/connection/connectionLevelDatabaseBootstrap";
 import { classifySqlActivityKind } from "@/lib/history/historyActivityKind";
 import { sqlMetadataRefreshTarget } from "@/lib/sql/sqlMetadataRefresh";
-import { isQueryExecutionErrorResult, usesMysqlProtocolDatabaseType } from "@/lib/query/queryResultError";
+import { isQueryExecutionErrorResult } from "@/lib/query/queryResultError";
 import { classifyRedisCommandSafety } from "@/lib/redis/redisCommandSafety";
 import { isSqlExecutionSnapshot, resolveExecutableSql, type SqlExecutionOverride, type SqlExecutionSnapshot } from "@/lib/sql/sqlExecutionTarget";
 import { isElasticsearchRestRequestText, parseElasticsearchRestRequestTarget, splitSqlStatementRanges } from "@/lib/sql/sqlStatementRanges";
@@ -44,7 +44,7 @@ function isDangerousElasticsearchRequest(method: "GET" | "POST" | "PUT" | "DELET
 }
 
 export function isDangerousSql(sql: string, databaseType?: DatabaseType): boolean {
-  if (databaseType === "elasticsearch") {
+  if (databaseType === "elasticsearch" || databaseType === "easysearch") {
     const requests = splitSqlStatementRanges(sql, databaseType)
       .map((statement) => parseElasticsearchRestRequestTarget(statement.sql))
       .filter((request): request is NonNullable<typeof request> => request !== null);
@@ -63,10 +63,9 @@ function primarySqlOperation(sql: string): string {
   return statement?.match(/^([a-z]+)/i)?.[1]?.toUpperCase() || "SQL";
 }
 
-function firstQueryExecutionError(tab: Pick<QueryTab, "result" | "results">, databaseType: DatabaseType | undefined) {
+function firstQueryExecutionError(tab: Pick<QueryTab, "result" | "results">) {
   const activeResult = tab.result;
   if (activeResult && isQueryExecutionErrorResult(activeResult)) return activeResult;
-  if (!usesMysqlProtocolDatabaseType(databaseType) && activeResult?.columns.includes("Error")) return activeResult;
 
   const results = tab.results?.length ? tab.results : tab.result ? [tab.result] : [];
   return results.find((result) => isQueryExecutionErrorResult(result));
@@ -218,7 +217,8 @@ export function useSqlExecution(deps: {
       deps.onMissingDatabase?.();
       return;
     }
-    deps.activeOutputView.value = "result";
+    const statementCount = splitSqlStatementRanges(sql, executionDatabaseType).length;
+    deps.activeOutputView.value = statementCount > 1 ? "summary" : "result";
     const connName = executionConnection?.name || "";
     const start = Date.now();
     const isRedis = executionDatabaseType === "redis";
@@ -232,7 +232,7 @@ export function useSqlExecution(deps: {
       deps.activeOutputView.value = "summary";
     }
     const elapsed = Date.now() - start;
-    const failure = firstQueryExecutionError(tab, executionDatabaseType);
+    const failure = firstQueryExecutionError(tab);
     const success = !failure;
     historyStore.add({
       connection_id: tab.connectionId,
@@ -359,7 +359,7 @@ export function useSqlExecution(deps: {
 
 export function supportsSqlTemplateParameters(connection: Pick<ConnectionConfig, "db_type"> | undefined, sql = ""): boolean {
   if (!connection) return false;
-  if (connection.db_type === "elasticsearch") return !isElasticsearchRestRequestText(sql);
+  if (connection.db_type === "elasticsearch" || connection.db_type === "easysearch") return !isElasticsearchRestRequestText(sql);
   return connection.db_type !== "redis" && connection.db_type !== "mongodb";
 }
 
@@ -372,5 +372,5 @@ export function requiresDatabaseSelection(tab: QueryTab, connection: ConnectionC
   // MySQL-compatible servers decide per statement whether a default database is required.
   // Keep interactive execution connection-scoped instead of rejecting valid qualified or constant queries.
   if (supportsConnectionLevelSqlExecution(connection)) return false;
-  return !["elasticsearch", "qdrant", "milvus", "weaviate", "chromadb", "zookeeper"].includes(connection.db_type);
+  return !["elasticsearch", "easysearch", "qdrant", "milvus", "weaviate", "chromadb", "zookeeper"].includes(connection.db_type);
 }

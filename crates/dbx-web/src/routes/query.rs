@@ -142,7 +142,7 @@ pub struct BuildCreateDatabaseSqlRequest {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[cfg(feature = "duckdb-bundled")]
+#[cfg(feature = "duckdb-sidecar")]
 pub struct BuildDuckDbAttachDatabaseSqlRequest {
     pub options: dbx_core::db_admin_sql::DuckDbAttachDatabaseSqlOptions,
 }
@@ -331,7 +331,9 @@ pub async fn execute_query(
     headers: HeaderMap,
     Json(req): Json<ExecuteQueryRequest>,
 ) -> Result<Json<dbx_core::db::QueryResult>, AppError> {
-    super::mcp_policy::ensure_sql(&state, &headers, &req.connection_id, &req.database, &req.sql).await?;
+    let allow_database_switch = req.client_session_id.as_deref().is_some_and(|id| !id.trim().is_empty());
+    super::mcp_policy::ensure_sql(&state, &headers, &req.connection_id, &req.database, &req.sql, allow_database_switch)
+        .await?;
     let execution_id = req.execution_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
 
     let registered = state.app.running_queries.register_task(
@@ -342,7 +344,7 @@ pub async fn execute_query(
 
     tracing::debug!(connection_id = %req.connection_id, "execute_query");
 
-    let result = dbx_core::query::execute_sql_statement_with_options(
+    let result = dbx_core::query::execute_sql_statement_with_options_typed(
         &state.app,
         &req.connection_id,
         &req.database,
@@ -364,7 +366,7 @@ pub async fn execute_query(
         },
     )
     .await
-    .map_err(AppError::from)?;
+    .map_err(|error| AppError::from(error.into_backend_error()))?;
 
     drop(registered);
     Ok(Json(result))
@@ -375,7 +377,9 @@ pub async fn execute_multi(
     headers: HeaderMap,
     Json(req): Json<ExecuteQueryRequest>,
 ) -> Result<Json<Vec<dbx_core::query::ExecuteMultiResult>>, AppError> {
-    super::mcp_policy::ensure_sql(&state, &headers, &req.connection_id, &req.database, &req.sql).await?;
+    let allow_database_switch = req.client_session_id.as_deref().is_some_and(|id| !id.trim().is_empty());
+    super::mcp_policy::ensure_sql(&state, &headers, &req.connection_id, &req.database, &req.sql, allow_database_switch)
+        .await?;
     let execution_id = req.execution_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
 
     let registered = state.app.running_queries.register_task(
@@ -386,7 +390,7 @@ pub async fn execute_multi(
 
     tracing::debug!(connection_id = %req.connection_id, "execute_multi");
 
-    let result = dbx_core::query::execute_multi_core_with_options_for_client(
+    let result = dbx_core::query::execute_multi_core_with_options_for_client_typed(
         &state.app,
         &req.connection_id,
         &req.database,
@@ -408,10 +412,16 @@ pub async fn execute_multi(
         },
     )
     .await
-    .map_err(AppError::from)?;
+    .map_err(|error| AppError::from(error.into_backend_error()))?;
 
     drop(registered);
-    Ok(Json(result))
+    Ok(execute_multi_response(result))
+}
+
+fn execute_multi_response(
+    result: Vec<dbx_core::query::ExecuteMultiResult>,
+) -> Json<Vec<dbx_core::query::ExecuteMultiResult>> {
+    Json(result)
 }
 
 pub async fn execute_batch(
@@ -420,7 +430,7 @@ pub async fn execute_batch(
     Json(req): Json<ExecuteBatchRequest>,
 ) -> Result<Json<dbx_core::db::QueryResult>, AppError> {
     for statement in &req.statements {
-        super::mcp_policy::ensure_sql(&state, &headers, &req.connection_id, &req.database, statement).await?;
+        super::mcp_policy::ensure_sql(&state, &headers, &req.connection_id, &req.database, statement, false).await?;
     }
     tracing::debug!(connection_id = %req.connection_id, "execute_batch");
     let result = dbx_core::query::execute_statements(
@@ -647,7 +657,7 @@ pub async fn build_create_database_sql(
     dbx_core::db_admin_sql::build_create_database_sql(req.options).map(Json).map_err(AppError::from)
 }
 
-#[cfg(feature = "duckdb-bundled")]
+#[cfg(feature = "duckdb-sidecar")]
 pub async fn build_duckdb_attach_database_sql(Json(req): Json<BuildDuckDbAttachDatabaseSqlRequest>) -> Json<String> {
     Json(dbx_core::db_admin_sql::build_duckdb_attach_database_sql(req.options))
 }
@@ -999,5 +1009,36 @@ mod tests {
         assert!(log.error.as_ref().is_some_and(|e| !e.is_empty()));
         // Missing connection cannot have applied statements.
         assert_eq!(log.executed_count, 0);
+    }
+
+    #[test]
+    fn execute_multi_response_preserves_nested_filtered_error_detail() {
+        let result = dbx_core::query::ExecuteMultiResult {
+            result: dbx_core::db::QueryResult {
+                columns: vec!["Error".to_string()],
+                column_types: vec![],
+                column_sortables: vec![],
+                spatial_columns: vec![],
+                spatial_values: vec![],
+                rows: vec![vec![serde_json::json!("relation customer_orders does not exist")]],
+                affected_rows: 0,
+                execution_time_ms: 0,
+                truncated: false,
+                session_id: None,
+                has_more: false,
+                elasticsearch_raw_body: None,
+            },
+            execution_error: true,
+            statement_index: Some(1),
+            error: Some(dbx_core::backend_error::BackendError::from_sql_detail(
+                "relation customer_orders does not exist",
+            )),
+        };
+
+        let payload = serde_json::to_value(execute_multi_response(vec![result]).0).unwrap();
+
+        assert_eq!(payload[0]["statement_index"], 1);
+        assert_eq!(payload[0]["error"]["code"], "DBX-JDBC-4001");
+        assert_eq!(payload[0]["error"]["detail"], "relation customer_orders does not exist");
     }
 }

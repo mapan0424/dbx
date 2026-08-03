@@ -3,6 +3,7 @@ use std::time::Instant;
 use tauri::{AppHandle, Emitter, State};
 
 use crate::commands::connection::AppState;
+use dbx_core::backend_error::BackendError;
 use dbx_core::db;
 use dbx_core::models::connection::DatabaseType;
 use dbx_core::query_cancel::RunningTaskMetadata;
@@ -12,9 +13,14 @@ use dbx_core::sql::split_sql_statements;
 #[serde(rename_all = "camelCase")]
 struct ExecuteMultiProgress {
     execution_id: String,
+    statement_index: usize,
     completed: usize,
     total: usize,
     success: bool,
+    execution_time_ms: u128,
+    affected_rows: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<BackendError>,
 }
 
 #[tauri::command]
@@ -34,7 +40,7 @@ pub async fn execute_query(
     client_session_id: Option<String>,
     timeout_secs: Option<u64>,
     execution_mode: Option<dbx_core::query::QueryExecutionMode>,
-) -> Result<db::QueryResult, String> {
+) -> Result<db::QueryResult, BackendError> {
     let execution_id = execution_id.filter(|id| !id.trim().is_empty());
     let registered_query = execution_id.as_ref().map(|id| {
         state.running_queries.register_task(
@@ -44,7 +50,7 @@ pub async fn execute_query(
     });
     let cancel_token = registered_query.as_ref().map(|query| query.token());
 
-    dbx_core::query::execute_sql_statement_with_options(
+    dbx_core::query::execute_sql_statement_with_options_typed(
         &state,
         &connection_id,
         &database,
@@ -65,6 +71,7 @@ pub async fn execute_query(
         },
     )
     .await
+    .map_err(dbx_core::query::QueryExecutionError::into_backend_error)
 }
 
 #[tauri::command]
@@ -87,7 +94,7 @@ pub async fn execute_multi(
     use_transaction: Option<bool>,
     continue_on_error: Option<bool>,
     execution_mode: Option<dbx_core::query::QueryExecutionMode>,
-) -> Result<Vec<dbx_core::query::ExecuteMultiResult>, String> {
+) -> Result<Vec<dbx_core::query::ExecuteMultiResult>, BackendError> {
     let execution_id = execution_id.filter(|id| !id.trim().is_empty());
     let registered_query = execution_id.as_ref().map(|id| {
         state.running_queries.register_task(
@@ -99,10 +106,19 @@ pub async fn execute_multi(
     let progress = execution_id.as_ref().map(|execution_id| {
         let app = app.clone();
         let execution_id = execution_id.clone();
-        Arc::new(move |completed, total, success| {
+        Arc::new(move |progress: dbx_core::query::ExecuteMultiProgress| {
             let _ = app.emit(
                 "query-batch-progress",
-                ExecuteMultiProgress { execution_id: execution_id.clone(), completed, total, success },
+                ExecuteMultiProgress {
+                    execution_id: execution_id.clone(),
+                    statement_index: progress.statement_index,
+                    completed: progress.completed,
+                    total: progress.total,
+                    success: progress.success,
+                    execution_time_ms: progress.execution_time_ms,
+                    affected_rows: progress.affected_rows,
+                    error: progress.error,
+                },
             );
         }) as dbx_core::query::ExecuteMultiProgressCallback
     });
@@ -117,7 +133,7 @@ pub async fn execute_multi(
         schema
     );
 
-    let result = dbx_core::query::execute_multi_core_with_options_for_client_and_progress(
+    let result = dbx_core::query::execute_multi_core_with_options_for_client_and_progress_typed(
         &state,
         &connection_id,
         &database,
@@ -156,7 +172,7 @@ pub async fn execute_multi(
             error
         ),
     }
-    result
+    result.map_err(dbx_core::query::QueryExecutionError::into_backend_error)
 }
 
 #[tauri::command]
@@ -415,7 +431,7 @@ pub fn build_create_database_sql(options: dbx_core::db_admin_sql::CreateDatabase
     dbx_core::db_admin_sql::build_create_database_sql(options)
 }
 
-#[cfg(feature = "duckdb-bundled")]
+#[cfg(feature = "duckdb-sidecar")]
 #[tauri::command]
 pub fn build_duckdb_attach_database_sql(
     options: dbx_core::db_admin_sql::DuckDbAttachDatabaseSqlOptions,

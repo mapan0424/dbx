@@ -8,6 +8,7 @@ const mocks = vi.hoisted(() => ({
   closeQuerySession: vi.fn(),
   ensureConnected: vi.fn(),
   executeMulti: vi.fn(),
+  executeMultiWithProgress: vi.fn(),
   executeQuery: vi.fn(),
   getConnectionConfig: vi.fn(),
   prepareQueryPaginationExecutionPlan: vi.fn(),
@@ -21,6 +22,7 @@ vi.mock("@/lib/backend/api", () => ({
   closeClientConnectionSession: mocks.closeClientConnectionSession,
   closeQuerySession: mocks.closeQuerySession,
   executeMulti: mocks.executeMulti,
+  executeMultiWithProgress: mocks.executeMultiWithProgress,
   executeQuery: mocks.executeQuery,
   prepareQueryPaginationExecutionPlan: mocks.prepareQueryPaginationExecutionPlan,
   saveOpenTabsState: mocks.saveOpenTabsState,
@@ -74,6 +76,17 @@ function deferred<T>() {
   return { promise, resolve, reject };
 }
 
+function structuredTimeoutError() {
+  return {
+    version: 1 as const,
+    code: "DBX-JDBC-2002",
+    messageKey: "backendErrors.jdbc.operationTimedOut",
+    messageParams: { stage: "execute" },
+    source: "jdbcAgent" as const,
+    operationOutcome: "unknown" as const,
+  };
+}
+
 describe("queryStore multi-statement errors", () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -99,12 +112,32 @@ describe("queryStore multi-statement errors", () => {
       useAgentResultSession: false,
     }));
     mocks.analyzeEditableQueryEditability.mockResolvedValue({ editable: false, reason: "multiple-statements" });
+    mocks.executeMultiWithProgress.mockImplementation(async (connectionId, database, sql, onProgress, schema, options) => {
+      const results = await mocks.executeMulti(connectionId, database, sql, schema, options?.executionId, options);
+      const total = results.length;
+      results.forEach((result: any, index: number) => {
+        const statementIndex = result.statement_index ?? index;
+        const success = result.execution_error !== true;
+        onProgress({
+          executionId: options?.executionId,
+          statementIndex,
+          completed: index + 1,
+          total,
+          success,
+          executionTimeMs: result.execution_time_ms,
+          affectedRows: result.affected_rows,
+          error: success ? undefined : result.error,
+        });
+      });
+      return results;
+    });
   });
 
   it("opens the first error result from a mixed result batch", async () => {
+    const structuredError = structuredTimeoutError();
     mocks.executeMulti.mockResolvedValue([
       { columns: ["value"], rows: [[1]], affected_rows: 0, execution_time_ms: 1 },
-      { columns: ["Error"], execution_error: true, rows: [["no such table: missing"]], affected_rows: 0, execution_time_ms: 1 },
+      { columns: ["Error"], execution_error: true, error: structuredError, rows: [["no such table: missing"]], affected_rows: 0, execution_time_ms: 1 },
     ]);
     const { useQueryStore } = await import("@/stores/queryStore");
     const store = useQueryStore();
@@ -115,6 +148,148 @@ describe("queryStore multi-statement errors", () => {
     const tab = store.tabs.find((item) => item.id === tabId)!;
     expect(tab.activeResultIndex).toBe(1);
     expect(tab.result?.columns).toEqual(["Error"]);
+    expect(tab.result?.error).toEqual(structuredError);
+    expect(tab.batchSqlExecution?.items[1]?.errorDetails).toEqual(structuredError);
+    expect(tab.batchSqlExecution?.items[1]?.error).not.toBe(structuredError.code);
+    expect(tab.batchSqlExecution?.items[1]?.error).not.toBe("[object Object]");
+  });
+
+  it("updates live per-statement progress before the batch promise resolves", async () => {
+    const pendingExecution = deferred<any[]>();
+    let reportProgress!: (progress: any) => void;
+    mocks.executeMultiWithProgress.mockImplementationOnce((_connectionId, _database, _sql, onProgress) => {
+      reportProgress = onProgress;
+      return pendingExecution.promise;
+    });
+    const { useQueryStore } = await import("@/stores/queryStore");
+    const store = useQueryStore();
+    const tabId = store.createTab("mysql-1", "app", "Query", "query", undefined, "SELECT 1;\nSELECT 2;\nSELECT bad");
+
+    const execution = store.executeTabSql(tabId, "SELECT 1;\nSELECT 2;\nSELECT bad");
+    await vi.waitFor(() => expect(store.tabs.find((item) => item.id === tabId)?.batchSqlExecution?.items[0]?.status).toBe("running"));
+    const executionId = store.tabs.find((item) => item.id === tabId)!.executionId!;
+
+    reportProgress({
+      executionId,
+      statementIndex: 0,
+      completed: 1,
+      total: 3,
+      success: true,
+      executionTimeMs: 4,
+      affectedRows: 1,
+    });
+
+    expect(store.tabs.find((item) => item.id === tabId)?.batchSqlExecution).toMatchObject({
+      completed: 1,
+      total: 3,
+      items: [{ status: "success", executionTimeMs: 4, affectedRows: 1 }, { status: "running" }, { status: "pending" }],
+    });
+
+    pendingExecution.resolve([
+      { columns: [], rows: [], affected_rows: 1, execution_time_ms: 4, statement_index: 0 },
+      { columns: ["Error"], rows: [["bad statement"]], affected_rows: 0, execution_time_ms: 2, statement_index: 1, execution_error: true },
+    ]);
+    await execution;
+
+    expect(store.tabs.find((item) => item.id === tabId)?.batchSqlExecution).toMatchObject({
+      completed: 2,
+      items: [{ status: "success" }, { status: "error", error: "bad statement" }, { status: "skipped" }],
+    });
+  });
+
+  it("records a top-level batch failure on the current statement", async () => {
+    mocks.executeMultiWithProgress.mockRejectedValueOnce(new Error("transport failed"));
+    const { useQueryStore } = await import("@/stores/queryStore");
+    const store = useQueryStore();
+    const tabId = store.createTab("mysql-1", "app", "Query", "query", undefined, "SELECT 1;\nSELECT 2");
+
+    await store.executeTabSql(tabId, "SELECT 1;\nSELECT 2");
+
+    expect(store.tabs.find((item) => item.id === tabId)?.batchSqlExecution).toMatchObject({
+      completed: 1,
+      items: [{ status: "error", error: "transport failed" }, { status: "skipped" }],
+    });
+  });
+
+  it("preserves a structured top-level batch failure", async () => {
+    const structuredError = structuredTimeoutError();
+    mocks.executeMultiWithProgress.mockRejectedValueOnce(structuredError);
+    const { useQueryStore } = await import("@/stores/queryStore");
+    const store = useQueryStore();
+    const tabId = store.createTab("mysql-1", "app", "Query", "query", undefined, "SELECT 1;\nSELECT 2");
+
+    await store.executeTabSql(tabId, "SELECT 1;\nSELECT 2");
+
+    const tab = store.tabs.find((item) => item.id === tabId)!;
+    expect(tab.result?.error).toEqual(structuredError);
+    expect(tab.result?.rows[0]?.[0]).toEqual(expect.any(String));
+    expect(tab.result?.rows[0]?.[0]).not.toBe(structuredError.code);
+    expect(tab.result?.rows[0]?.[0]).not.toBe("[object Object]");
+    expect(tab.batchSqlExecution?.items[0]?.errorDetails).toEqual(structuredError);
+    expect(tab.batchSqlExecution?.items[0]?.error).toBe(tab.result?.rows[0]?.[0]);
+  });
+
+  it("keeps completed progress and records a later top-level batch failure", async () => {
+    mocks.executeMultiWithProgress.mockImplementationOnce((_connectionId, _database, _sql, onProgress, _schema, options) => {
+      onProgress({
+        executionId: options?.executionId,
+        statementIndex: 0,
+        completed: 1,
+        total: 3,
+        success: true,
+        executionTimeMs: 4,
+        affectedRows: 1,
+      });
+      return Promise.reject(new Error("connection lost"));
+    });
+    const { useQueryStore } = await import("@/stores/queryStore");
+    const store = useQueryStore();
+    const tabId = store.createTab("mysql-1", "app", "Query", "query", undefined, "SELECT 1;\nSELECT 2;\nSELECT 3");
+
+    await store.executeTabSql(tabId, "SELECT 1;\nSELECT 2;\nSELECT 3");
+
+    expect(store.tabs.find((item) => item.id === tabId)?.batchSqlExecution).toMatchObject({
+      completed: 2,
+      items: [{ status: "success" }, { status: "error", error: "connection lost" }, { status: "skipped" }],
+    });
+  });
+
+  it("updates the live marker state for a single statement", async () => {
+    const pendingExecution = deferred<any[]>();
+    mocks.executeMulti.mockImplementationOnce(() => pendingExecution.promise);
+    const { useQueryStore } = await import("@/stores/queryStore");
+    const store = useQueryStore();
+    const sql = "SELECT 1";
+    const tabId = store.createTab("mysql-1", "app", "Query", "query", undefined, sql);
+
+    const execution = store.executeTabSql(tabId, sql);
+    await vi.waitFor(() => expect(store.tabs.find((item) => item.id === tabId)?.batchSqlExecution?.items[0]?.status).toBe("running"));
+    expect(mocks.executeMultiWithProgress).not.toHaveBeenCalled();
+
+    pendingExecution.resolve([{ columns: ["Error"], rows: [["bad statement"]], affected_rows: 0, execution_time_ms: 3, statement_index: 0, execution_error: true }]);
+    await execution;
+
+    expect(store.tabs.find((item) => item.id === tabId)?.batchSqlExecution).toMatchObject({
+      completed: 1,
+      total: 1,
+      items: [{ status: "error", executionTimeMs: 3, affectedRows: 0, error: "bad statement" }],
+    });
+  });
+
+  it("marks the active statement cancelled and leaves later statements unexecuted", async () => {
+    const pendingExecution = deferred<never>();
+    mocks.executeMultiWithProgress.mockImplementationOnce(() => pendingExecution.promise);
+    const { useQueryStore } = await import("@/stores/queryStore");
+    const store = useQueryStore();
+    const tabId = store.createTab("mysql-1", "app", "Query", "query", undefined, "SELECT 1;\nSELECT 2");
+
+    const execution = store.executeTabSql(tabId, "SELECT 1;\nSELECT 2");
+    await vi.waitFor(() => expect(store.tabs.find((item) => item.id === tabId)?.batchSqlExecution?.items[0]?.status).toBe("running"));
+    await expect(store.cancelTabExecution(tabId)).resolves.toBe(true);
+    pendingExecution.reject(new Error("Query canceled"));
+    await execution;
+
+    expect(store.tabs.find((item) => item.id === tabId)?.batchSqlExecution?.items).toMatchObject([{ status: "cancelled" }, { status: "skipped" }]);
   });
 
   it("opens a later PostgreSQL error result from a mixed result batch", async () => {
@@ -208,6 +383,31 @@ describe("queryStore multi-statement errors", () => {
       { sql: "SELECT CURRENT_SCHEMA FROM DUMMY", schema: undefined, clientSessionId: tabA },
       { sql: "SELECT CURRENT_SCHEMA FROM DUMMY", schema: undefined, clientSessionId: tabA },
     ]);
+  });
+
+  it("syncs the executing SQL Server tab after a successful standalone USE", async () => {
+    mocks.getConnectionConfig.mockReturnValue({
+      id: "sqlserver-1",
+      name: "SQL Server",
+      db_type: "sqlserver",
+      database: "FooDB",
+      query_timeout_secs: 30,
+    });
+    mocks.executeMulti.mockResolvedValueOnce([{ columns: [], rows: [], affected_rows: 0, execution_time_ms: 1 }]).mockResolvedValueOnce([{ columns: ["Error"], rows: [["Database does not exist"]], affected_rows: 0, execution_time_ms: 1, execution_error: true }]);
+    const { useQueryStore } = await import("@/stores/queryStore");
+    const store = useQueryStore();
+    const tabA = store.createTab("sqlserver-1", "FooDB", "Tab A", "query", "dbo");
+    const tabB = store.createTab("sqlserver-1", "FooDB", "Tab B", "query", "dbo");
+
+    await store.executeTabSql(tabA, "/* switch */ USE [BarDB];");
+
+    expect(store.tabs.find((tab) => tab.id === tabA)).toMatchObject({ database: "BarDB", schema: undefined });
+    expect(store.tabs.find((tab) => tab.id === tabB)).toMatchObject({ database: "FooDB", schema: "dbo" });
+    expect(mocks.closeClientConnectionSession).toHaveBeenCalledWith("sqlserver-1", "FooDB", tabA);
+
+    await store.executeTabSql(tabA, "USE [MissingDB];");
+
+    expect(store.tabs.find((tab) => tab.id === tabA)?.database).toBe("BarDB");
   });
 
   it("invalidates Oracle completion metadata when clearing a tab schema resets its session", async () => {
@@ -457,19 +657,37 @@ describe("queryStore multi-statement errors", () => {
     const tab = store.tabs.find((item) => item.id === tabId)!;
     const retainedRunId = tab.activeResultRunId!;
     const retainedRunCacheKey = tab.resultRuns?.find((run) => run.id === retainedRunId)?.resultCacheKey;
+    expect(tab.batchSqlExecution?.submittedSql).toBe("SELECT 1 AS value");
 
     const execution = store.executeCurrentSql("SELECT 2 AS value", { openInNewResultTab: true });
     await vi.waitFor(() => expect(mocks.executeMulti).toHaveBeenCalledTimes(2));
     expect(await store.setActiveResultRun(tabId, retainedRunId)).toBe(true);
+    expect(tab.batchSqlExecution?.submittedSql).toBe("SELECT 1 AS value");
     pendingExecution.resolve([{ columns: ["value"], rows: [[2]], affected_rows: 0, execution_time_ms: 1 }]);
     await execution;
 
     expect(tab.resultRuns).toHaveLength(2);
     expect(tab.activeResultRunId).not.toBe(retainedRunId);
     expect(tab.result).toMatchObject({ rows: [[2]] });
+    expect(tab.batchSqlExecution?.submittedSql).toBe("SELECT 2 AS value");
     expect(tab.resultRuns?.find((run) => run.id === tab.activeResultRunId)?.resultCacheKey).not.toBe(retainedRunCacheKey);
     expect(await store.setActiveResultRun(tabId, retainedRunId)).toBe(true);
     expect(tab.result).toMatchObject({ rows: [[1]] });
+    expect(tab.batchSqlExecution?.submittedSql).toBe("SELECT 1 AS value");
+
+    const newRunId = tab.resultRuns?.find((run) => run.id !== retainedRunId)?.id;
+    expect(newRunId).toBeTruthy();
+    expect(await store.setActiveResultRun(tabId, newRunId!)).toBe(true);
+    await vi.waitFor(() => expect(mocks.tabResultSnapshots.has(retainedRunCacheKey!)).toBe(true));
+    const retainedRun = tab.resultRuns?.find((run) => run.id === retainedRunId);
+    expect(retainedRun).toBeTruthy();
+    retainedRun!.result = undefined;
+    retainedRun!.results = undefined;
+    retainedRun!.batchSqlExecution = undefined;
+
+    expect(await store.setActiveResultRun(tabId, retainedRunId)).toBe(true);
+    expect(tab.result).toMatchObject({ rows: [[1]] });
+    expect(tab.batchSqlExecution?.submittedSql).toBe("SELECT 1 AS value");
   });
 
   it("restores the retained result when a new-result execution returns no result", async () => {

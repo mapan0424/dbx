@@ -2,12 +2,13 @@ import * as api from "@/lib/backend/api";
 import { connectionObjectTreeNodeSchema, effectiveDatabaseTypeForConnection, metadataSchemaForConnection } from "@/lib/database/jdbcDialect";
 import { invalidateTableMetadataCache, loadTableMetadata } from "@/lib/metadata/tableMetadataCache";
 import { canApplyDataTabMetadata } from "@/lib/sidebar/dataTabOpenPolicy";
-import { isNoSnapshotErrorResult } from "@/lib/query/queryResultError";
+import { isNoSnapshotErrorResult, isQueryExecutionErrorResult } from "@/lib/query/queryResultError";
 import { buildTableSelectSql } from "@/lib/table/tableSelectSql";
 import { editableRowIdentifierColumns, usesSyntheticRowIdKey } from "@/lib/table/tableEditing";
 import { tableOpenPageLimit } from "@/lib/table/tableOpenPageLimit";
 import { uuid } from "@/lib/common/utils";
 import { beginDataTabNavigation, endDataTabNavigation, isCurrentDataTabNavigation } from "@/lib/tabs/dataTabNavigationGeneration";
+import { useSidebarDataOpenRuntime } from "@/composables/useSidebarDataOpenRuntime";
 import { useConnectionStore } from "@/stores/connectionStore";
 import { useQueryStore } from "@/stores/queryStore";
 import { useSettingsStore } from "@/stores/settingsStore";
@@ -168,7 +169,7 @@ async function openTableTarget(target: NavigationTarget, options: { tableInfoTab
     const tabAfterFirstExecute = queryStore.tabs.find((tab) => tab.id === tabId);
     const firstResult = tabAfterFirstExecute?.result;
     const cancelRequestedDuringExecute = (tabAfterFirstExecute?.cancelRequestCount ?? 0) > cancelCountBeforeExecute;
-    const firstQueryFailed = cancelRequestedDuringExecute || tabAfterFirstExecute?.isCancelling === true || (firstResult?.columns.length === 1 && firstResult.columns[0] === "Error");
+    const firstQueryFailed = cancelRequestedDuringExecute || tabAfterFirstExecute?.isCancelling === true || (firstResult !== undefined && isQueryExecutionErrorResult(firstResult));
     // executeTabSql surfaces query failures as an "Error" result instead of throwing.
     // A snapshot-less lake table fails the data preview above but its metadata still
     // reads fine — retry with LIMIT 0 so the user sees the table structure (columns +
@@ -253,6 +254,33 @@ async function openTableTarget(target: NavigationTarget, options: { tableInfoTab
 export function useNavigationTargets(dialogs: { showFieldLineageDialog: { value: boolean }; showDatabaseSearchDialog: { value: boolean }; showDiagramDialog: { value: boolean } }) {
   const connectionStore = useConnectionStore();
   const queryStore = useQueryStore();
+  const settingsStore = useSettingsStore();
+  const { openData } = useSidebarDataOpenRuntime();
+
+  async function openObjectBrowserTableTarget(target: NavigationTarget) {
+    if (!settingsStore.editorSettings.reuseDataTab) {
+      await openTableTarget(target);
+      return;
+    }
+    connectionStore.activeConnectionId = target.connectionId;
+    const normalizedTableType = target.tableType?.trim().toUpperCase().replaceAll(" ", "_");
+    const nodeType = normalizedTableType === "VIEW" ? "view" : normalizedTableType === "MATERIALIZED_VIEW" ? "materialized_view" : "table";
+    await openData(
+      {
+        id: uuid(),
+        label: target.tableName,
+        type: nodeType,
+        connectionId: target.connectionId,
+        database: target.database,
+        schema: target.schema,
+        catalog: target.catalog,
+        tableType: target.tableType,
+      },
+      undefined,
+      "default",
+      { reuseScope: "same-table" },
+    );
+  }
 
   async function openLineageTarget(target: NavigationTarget) {
     dialogs.showFieldLineageDialog.value = false;
@@ -269,7 +297,7 @@ export function useNavigationTargets(dialogs: { showFieldLineageDialog: { value:
     await openTableTarget(target);
   }
 
-  async function onStructureEditorSaved(reloadData: () => Promise<void>, toast: (msg: string, duration?: number) => void, context: { connectionId: string; database: string; schema?: string; tableName: string }, commentChanged?: boolean) {
+  async function onStructureEditorSaved(reloadData: () => Promise<void>, toast: (msg: string, duration?: number) => void, context: { connectionId: string; database: string; schema?: string; catalog?: string; tableName: string }, commentChanged?: boolean) {
     if (!context.tableName) {
       try {
         await connectionStore.refreshObjectListTreeNode(context.connectionId, context.database, context.schema || undefined);
@@ -281,12 +309,13 @@ export function useNavigationTargets(dialogs: { showFieldLineageDialog: { value:
         await connectionStore.refreshObjectListTreeNode(context.connectionId, context.database, context.schema || undefined);
       } catch {}
     }
+    connectionStore.invalidateCompletionTableCache(context.connectionId, context.database, context.tableName, context.schema, context.catalog);
     queryStore.invalidateTableStructure(context.connectionId, context.database, context.schema, context.tableName);
     // 结构已变更：无论是否有打开的 data tab 都必须作废共享元数据缓存，否则
     // 其它 loadTableMetadata 消费者最长 30 秒拿到旧列。不带 schema/catalog
     // 维度（宁可多废，schema 形态在各消费点可能不同）
     invalidateTableMetadataCache({ connectionId: context.connectionId, database: context.database, tableName: context.tableName });
-    const matchingDataTabs = queryStore.tabs.filter((tab) => tab.mode === "data" && tab.connectionId === context.connectionId && tab.database === context.database && tab.tableMeta?.tableName === context.tableName && (tab.tableMeta.schema || "") === (context.schema || ""));
+    const matchingDataTabs = queryStore.tabs.filter((tab) => tab.mode === "data" && tab.connectionId === context.connectionId && tab.database === context.database && tab.tableMeta?.tableName === context.tableName && (tab.schema || tab.tableMeta.schema || "") === (context.schema || ""));
     // 同一 catalog 只强制加载一次，结果分发给全部匹配 tab
     const loadedByCatalog = new Map<string, { columns: ColumnInfo[]; primaryKeys: string[] }>();
     for (const tab of matchingDataTabs) {
@@ -295,8 +324,9 @@ export function useNavigationTargets(dialogs: { showFieldLineageDialog: { value:
         // 捕获不可变目标身份：await 期间 tab 可能被导航复用改指其他表，
         // 共享缓存结果落地前仍必须复核，不能解除新目标的 pending
         const capturedMeta = tab.tableMeta!;
-        const capturedTarget = { connectionId: tab.connectionId, database: tab.database, schema: capturedMeta.schema, catalog: capturedMeta.catalog, tableName: capturedMeta.tableName };
-        const metadataSchema = metadataSchemaForConnection(connection, tab.database, capturedMeta.schema);
+        const capturedSchema = tab.schema || capturedMeta.schema;
+        const capturedTarget = { connectionId: tab.connectionId, database: tab.database, schema: capturedSchema, catalog: capturedMeta.catalog, tableName: capturedMeta.tableName };
+        const metadataSchema = metadataSchemaForConnection(connection, tab.database, capturedSchema);
         // 分组含 tableType：主键计算依赖它，不同 tableType 不能共享加载结果
         const catalogKey = `${capturedMeta.catalog ?? ""}\u0000${capturedMeta.tableType ?? ""}`;
         let metadata = loadedByCatalog.get(catalogKey);
@@ -320,6 +350,7 @@ export function useNavigationTargets(dialogs: { showFieldLineageDialog: { value:
         if (!canApplyDataTabMetadata(currentTab, capturedTarget)) continue;
         queryStore.setTableMeta(tab.id, {
           ...capturedMeta,
+          schema: capturedSchema,
           columns: metadata.columns,
           primaryKeys: metadata.primaryKeys,
         });
@@ -330,5 +361,5 @@ export function useNavigationTargets(dialogs: { showFieldLineageDialog: { value:
     }
   }
 
-  return { openLineageTarget, openDatabaseSearchTarget, openDiagramTarget, onStructureEditorSaved, openTableTarget };
+  return { openLineageTarget, openDatabaseSearchTarget, openDiagramTarget, openObjectBrowserTableTarget, onStructureEditorSaved, openTableTarget };
 }

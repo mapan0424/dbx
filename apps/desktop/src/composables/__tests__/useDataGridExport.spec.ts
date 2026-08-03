@@ -417,6 +417,53 @@ describe("useDataGridExport prepared row statements", () => {
     expect(state.canCopyWithExtractor("sql-inserts")).toBe(false);
   });
 
+  it("keeps an auto-increment primary key when copying only the primary key column as INSERT", () => {
+    const autoIncrementTable: DataGridTableMeta = {
+      tableName: "users",
+      primaryKeys: ["id"],
+      columns: [
+        { name: "id", data_type: "int", is_nullable: false, is_primary_key: true, extra: "auto_increment" },
+        { name: "name", data_type: "varchar", is_nullable: false },
+      ],
+    };
+    const matrix: CellSelectionMatrix = { rowIndexes: [0], columnIndexes: [0], columns: ["id"], rows: [[1]] };
+
+    const state = createExportState(autoIncrementTable, ["id", "name"], matrix);
+
+    expect(state.canCopyWithExtractor("sql-inserts")).toBe(true);
+  });
+
+  it("supports a one-off INSERT primary-key override without changing saved options", async () => {
+    const autoIncrementTable: DataGridTableMeta = {
+      tableName: "users",
+      primaryKeys: ["id"],
+      columns: [{ name: "id", data_type: "int", is_nullable: false, is_primary_key: true, extra: "auto_increment" }],
+    };
+    const matrix: CellSelectionMatrix = { rowIndexes: [0], columnIndexes: [0], columns: ["id"], rows: [[7]] };
+    const savedOptions = {
+      ...DEFAULT_DATA_GRID_EXTRACTOR_OPTIONS,
+      sql: { ...DEFAULT_DATA_GRID_EXTRACTOR_OPTIONS.sql, excludePrimaryKeysFromInsert: true },
+    };
+    const includePrimaryKeys = {
+      ...savedOptions,
+      sql: { ...savedOptions.sql, excludePrimaryKeysFromInsert: false },
+    };
+    vi.mocked(extractDataGridSelection).mockResolvedValueOnce({
+      text: "INSERT INTO `users` (`id`) VALUES (7);",
+      mimeType: "text/sql",
+      fileExtension: "sql",
+      rowCount: 1,
+      columnCount: 1,
+    });
+    const state = createExportState(autoIncrementTable, ["id"], matrix, [7], undefined, undefined, [], savedOptions);
+
+    expect(state.canCopyWithExtractor("sql-inserts")).toBe(false);
+    expect(state.canCopyWithExtractor("sql-inserts", includePrimaryKeys)).toBe(true);
+    await expect(state.copyWithExtractor("sql-inserts", includePrimaryKeys)).resolves.toBe(true);
+    expect(extractDataGridSelection).toHaveBeenCalledWith(expect.objectContaining({ options: expect.objectContaining({ sql: expect.objectContaining({ excludePrimaryKeysFromInsert: false }) }) }));
+    expect(savedOptions.sql.excludePrimaryKeysFromInsert).toBe(true);
+  });
+
   it("sends only selected values for non-SQL extraction and marks column selections", async () => {
     const matrix: CellSelectionMatrix = { rowIndexes: [0], columnIndexes: [1], columns: ["name"], rows: [["Ada"]] };
     vi.mocked(extractDataGridSelection).mockResolvedValueOnce({
@@ -643,5 +690,113 @@ describe("useDataGridExport prepared row statements", () => {
       }),
     );
     expect(extractDataGridSelection).not.toHaveBeenCalled();
+  });
+
+  it("uses the Mongo update formatter for SQL Updates", async () => {
+    const item = { ...row(['ObjectId("507f1f77bcf86cd799439011")', "Alice"]), sourceIndex: 0 };
+    const state = createMongoExportState({
+      columns: ["_id", "name"],
+      item,
+      mongoDocuments: [{ _id: { $oid: "507f1f77bcf86cd799439011" }, name: "Alice" }],
+      selectedCellMatrix: {
+        rowIndexes: [0],
+        columnIndexes: [0, 1],
+        columns: ["_id", "name"],
+        rows: [[item.data[0], item.data[1]]],
+      },
+    });
+
+    expect(state.canCopyWithExtractor("sql-updates")).toBe(true);
+    await expect(state.copyWithExtractor("sql-updates")).resolves.toBe(true);
+
+    const copied = vi.mocked(copyToClipboard).mock.calls[0]?.[0] ?? "";
+    expect(copied).toContain('db.getCollection("documents")');
+    expect(copied).toContain(".updateOne(");
+    expect(copied).toContain('"_id": ObjectId("507f1f77bcf86cd799439011")');
+    expect(copied).toContain('"name": "Alice"');
+    expect(extractDataGridSelection).not.toHaveBeenCalled();
+  });
+
+  it("updates only explicitly selected Mongo fields while keeping _id as the filter", async () => {
+    const item = { ...row(['ObjectId("507f1f77bcf86cd799439011")', "Alice", "active"]), sourceIndex: 0 };
+    const state = createMongoExportState({
+      columns: ["_id", "name", "status"],
+      item,
+      mongoDocuments: [{ _id: { $oid: "507f1f77bcf86cd799439011" }, name: "Alice", status: "active" }],
+      selectedCellMatrix: {
+        rowIndexes: [0],
+        columnIndexes: [1],
+        columns: ["name"],
+        rows: [[item.data[1]]],
+      },
+    });
+
+    expect(state.canCopyWithExtractor("sql-updates")).toBe(true);
+    await expect(state.copyWithExtractor("sql-updates")).resolves.toBe(true);
+
+    const copied = vi.mocked(copyToClipboard).mock.calls[0]?.[0] ?? "";
+    expect(copied).toContain('"_id": ObjectId("507f1f77bcf86cd799439011")');
+    expect(copied).toContain('"name": "Alice"');
+    expect(copied).not.toContain('"status"');
+  });
+
+  it("does not expose Mongo SQL Updates for an _id-only selection", async () => {
+    const item = { ...row(['ObjectId("507f1f77bcf86cd799439011")', "Alice"]), sourceIndex: 0 };
+    const state = createMongoExportState({
+      columns: ["_id", "name"],
+      item,
+      mongoDocuments: [{ _id: { $oid: "507f1f77bcf86cd799439011" }, name: "Alice" }],
+      selectedCellMatrix: {
+        rowIndexes: [0],
+        columnIndexes: [0],
+        columns: ["_id"],
+        rows: [[item.data[0]]],
+      },
+    });
+
+    expect(state.canCopyWithExtractor("sql-updates")).toBe(false);
+    await expect(state.copyWithExtractor("sql-updates")).resolves.toBe(false);
+    expect(copyToClipboard).not.toHaveBeenCalled();
+  });
+
+  it("filters new and deleted Mongo rows from SQL Updates", async () => {
+    const current = { ...row(['ObjectId("507f1f77bcf86cd799439011")', "Alice"]), id: 1, sourceIndex: 0 };
+    const added = { ...row(['ObjectId("507f1f77bcf86cd799439012")', "New"]), id: 2, sourceIndex: 1, isNew: true };
+    const deleted = { ...row(['ObjectId("507f1f77bcf86cd799439013")', "Deleted"]), id: 3, sourceIndex: 2, isDeleted: true };
+    const state = createMongoExportState({
+      columns: ["_id", "name"],
+      item: current,
+      items: [current, added, deleted],
+      mongoDocuments: [
+        { _id: { $oid: "507f1f77bcf86cd799439011" }, name: "Alice" },
+        { _id: { $oid: "507f1f77bcf86cd799439012" }, name: "New" },
+        { _id: { $oid: "507f1f77bcf86cd799439013" }, name: "Deleted" },
+      ],
+      selectedRowIds: new Set([1, 2, 3]),
+    });
+
+    expect(state.canCopyWithExtractor("sql-updates")).toBe(true);
+    await expect(state.copyWithExtractor("sql-updates")).resolves.toBe(true);
+
+    const copied = vi.mocked(copyToClipboard).mock.calls[0]?.[0] ?? "";
+    expect(copied.match(/\.updateOne\(/g)).toHaveLength(1);
+    expect(copied).toContain('"name": "Alice"');
+    expect(copied).not.toContain('"name": "New"');
+    expect(copied).not.toContain('"name": "Deleted"');
+  });
+
+  it("does not expose Mongo SQL Updates without an explicit update target", async () => {
+    const item = { ...row(["507f1f77bcf86cd799439011", "Alice"]), sourceIndex: 0 };
+    const state = createMongoExportState({
+      columns: ["_id", "name"],
+      item,
+      mongoDocuments: [{ _id: { $oid: "507f1f77bcf86cd799439011" }, name: "Alice" }],
+      mongoUpdateTarget: false,
+    });
+
+    expect(state.canCopyWithExtractor("sql-updates")).toBe(false);
+    await expect(state.copyWithExtractor("sql-updates")).resolves.toBe(false);
+    expect(extractDataGridSelection).not.toHaveBeenCalled();
+    expect(copyToClipboard).not.toHaveBeenCalled();
   });
 });

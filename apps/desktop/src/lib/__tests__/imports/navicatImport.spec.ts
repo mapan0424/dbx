@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { parseNavicatConnections } from "@/lib/imports/navicatImport";
 
 class TestElement {
@@ -75,15 +75,19 @@ if (!globalThis.DOMParser) {
   globalThis.DOMParser = TestDOMParser as typeof DOMParser;
 }
 
+afterEach(() => {
+  vi.unstubAllGlobals();
+});
+
 describe("parseNavicatConnections", () => {
-  it("imports SQLite DatabaseFile as both host and database", async () => {
+  it("imports SQLite DatabaseFile as the host without treating it as a schema", async () => {
     const [connection] = await parseNavicatConnections(`<Connections>
   <Connection ConnType="SQLite" Name="local-sqlite" DatabaseFile="C:\\Users\\Yang\\demo.db" />
 </Connections>`);
 
     expect(connection?.db_type).toBe("sqlite");
     expect(connection?.host).toBe("C:\\Users\\Yang\\demo.db");
-    expect(connection?.database).toBe("C:\\Users\\Yang\\demo.db");
+    expect(connection?.database).toBeUndefined();
     expect(connection?.port).toBe(0);
   });
 
@@ -94,6 +98,7 @@ describe("parseNavicatConnections", () => {
 
     expect(connection?.db_type).toBe("sqlite");
     expect(connection?.host).toBe("/home/yang/demo.sqlite");
+    expect(connection?.database).toBeUndefined();
   });
 
   it("uses SQLite Database field as the file path", async () => {
@@ -103,7 +108,7 @@ describe("parseNavicatConnections", () => {
 
     expect(connection?.db_type).toBe("sqlite");
     expect(connection?.host).toBe("/tmp/app.data");
-    expect(connection?.database).toBe("/tmp/app.data");
+    expect(connection?.database).toBeUndefined();
   });
 
   it("keeps non-SQLite host and database mapping unchanged", async () => {
@@ -152,6 +157,17 @@ describe("parseNavicatConnections", () => {
         auth_method: "password",
       }),
     ]);
+  });
+
+  it("decrypts Navicat passwords without SubtleCrypto in insecure HTTP contexts", async () => {
+    const databasePassword = await encryptNavicatPassword("database-secret");
+    vi.stubGlobal("crypto", {});
+
+    const [connection] = await parseNavicatConnections(`<Connections>
+  <Connection ConnType="ORACLE" ConnectionName="oracle-http" Host="db.internal" UserName="app" Password="${databasePassword}" />
+</Connections>`);
+
+    expect(connection?.password).toBe("database-secret");
   });
 
   it("imports key-authenticated SSH field variants with the default port", async () => {

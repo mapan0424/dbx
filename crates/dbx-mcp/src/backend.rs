@@ -1,4 +1,8 @@
-use std::{collections::HashMap, path::Path, sync::Arc};
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use async_trait::async_trait;
 use dbx_core::{
@@ -7,7 +11,7 @@ use dbx_core::{
     connection::AppState,
     db::{redis_driver::RedisCommandResult, ColumnInfo, TableInfo},
     models::connection::{ConnectionConfig, DatabaseType},
-    storage::{McpGlobalPolicy, McpGlobalPolicyState, Storage},
+    storage::{DesktopSettings, McpGlobalPolicy, McpGlobalPolicyState, Storage},
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -134,6 +138,16 @@ pub trait DbxBackend: Send + Sync {
         let _ = (connection, database, command);
         Err("MongoDB shell commands are not supported by this backend.".to_string())
     }
+    /// Release the connection pool pinned by an MCP session (`client_session_id`).
+    async fn close_client_session(
+        &self,
+        connection_id: &str,
+        database: &str,
+        client_session_id: &str,
+    ) -> Result<bool, String> {
+        let _ = (connection_id, database, client_session_id);
+        Err("Session cleanup is not supported by this backend.".to_string())
+    }
     async fn bridge_request(&self, path: &str, body: Value) -> Result<(), String> {
         let _ = (path, body);
         Err("DBX is not running. Please start DBX first.".to_string())
@@ -156,6 +170,7 @@ pub struct WebBackend {
     password: String,
     client: reqwest::Client,
     auth: Mutex<WebAuthState>,
+    connected: Mutex<HashMap<String, ConnectionConfig>>,
 }
 
 impl WebBackend {
@@ -168,7 +183,13 @@ impl WebBackend {
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|error| error.to_string())?;
-        Ok(Self { base_url, password, client, auth: Mutex::new(WebAuthState::default()) })
+        Ok(Self {
+            base_url,
+            password,
+            client,
+            auth: Mutex::new(WebAuthState::default()),
+            connected: Mutex::new(HashMap::new()),
+        })
     }
 
     async fn ensure_auth(&self) -> Result<(), String> {
@@ -260,7 +281,12 @@ impl WebBackend {
     }
 
     async fn ensure_connected(&self, connection: &ConnectionConfig) -> Result<(), String> {
+        let mut connected = self.connected.lock().await;
+        if connected.get(&connection.id) == Some(connection) {
+            return Ok(());
+        }
         self.request(reqwest::Method::POST, "/api/connection/connect", Some(json!({ "config": connection }))).await?;
+        connected.insert(connection.id.clone(), connection.clone());
         Ok(())
     }
 }
@@ -269,17 +295,31 @@ impl LocalBackend {
     pub async fn open(path: &Path) -> Result<Self, String> {
         let storage = Storage::open(path).await?;
         let configs = storage.load_connections().await?;
-        let state = Arc::new(AppState::new(storage));
+        let desktop_settings = storage.load_desktop_settings().await.unwrap_or_default();
+        let data_dir = path.parent().unwrap_or_else(|| Path::new(".")).to_path_buf();
+        let plugin_dir = local_plugin_dir(&desktop_settings, &data_dir);
+        let state = Arc::new(AppState::new_with_plugin_dir(storage, plugin_dir));
         let config_map: HashMap<String, ConnectionConfig> =
             configs.into_iter().map(|config| (config.id.clone(), config)).collect();
         *state.configs.write().await = config_map;
-        let data_dir = path.parent().unwrap_or_else(|| Path::new(".")).to_path_buf();
         Ok(Self { state, data_dir })
     }
 
     pub fn state(&self) -> &Arc<AppState> {
         &self.state
     }
+}
+
+fn local_plugin_dir(settings: &DesktopSettings, data_dir: &Path) -> PathBuf {
+    let legacy_driver_base =
+        settings.driver_store_dir.as_ref().filter(|value| !value.trim().is_empty()).map(PathBuf::from);
+    settings
+        .plugin_store_dir
+        .as_ref()
+        .filter(|value| !value.trim().is_empty())
+        .map(PathBuf::from)
+        .or_else(|| legacy_driver_base.map(|base| base.join("plugins")))
+        .unwrap_or_else(|| data_dir.join("plugins"))
 }
 
 #[async_trait]
@@ -300,9 +340,19 @@ impl DbxBackend for LocalBackend {
         arguments: Value,
         permissions: AgentSqlPermissions,
     ) -> ToolResult {
+        let schema = arguments.get("schema").and_then(|value| value.as_str()).map(ToOwned::to_owned);
         let call =
             ToolCall { id: format!("mcp-{tool_name}"), name: tool_name.to_string(), arguments, provider_payload: None };
-        agent_tools::execute_tool(&call, &self.state, &connection.id, database, &connection.db_type, permissions).await
+        agent_tools::execute_tool(
+            &call,
+            &self.state,
+            &connection.id,
+            database,
+            schema.as_deref(),
+            &connection.db_type,
+            permissions,
+        )
+        .await
     }
 
     async fn execute_query(
@@ -546,10 +596,9 @@ impl DbxBackend for LocalBackend {
                     *single,
                 )
                 .await?;
-                let rows = result.dropped_names.into_iter().map(|name| vec![Value::String(name)]).collect::<Vec<_>>();
-                Ok(query_result(
-                    if rows.is_empty() { Vec::new() } else { vec!["name".to_string()] },
-                    rows,
+                Ok(mongo_drop_indexes_query_result(
+                    result.dropped_names,
+                    result.failures.into_iter().map(|failure| (failure.name, failure.message)).collect(),
                     result.affected_rows,
                 ))
             }
@@ -596,6 +645,16 @@ impl DbxBackend for LocalBackend {
                 Ok(mongo_documents_query_result(result.documents))
             }
         }
+    }
+
+    async fn close_client_session(
+        &self,
+        connection_id: &str,
+        database: &str,
+        client_session_id: &str,
+    ) -> Result<bool, String> {
+        let database = if database.trim().is_empty() { None } else { Some(database) };
+        self.state.close_client_session_pool(connection_id, database, client_session_id).await
     }
 
     async fn bridge_request(&self, path: &str, body: Value) -> Result<(), String> {
@@ -678,13 +737,12 @@ impl DbxBackend for WebBackend {
             }
 
             let max_rows = arguments.get("limit").and_then(Value::as_u64).unwrap_or(100) as usize;
-            let response = self
-                .request(
-                    reqwest::Method::POST,
-                    "/api/query/execute",
-                    Some(json!({ "connectionId": connection.id, "database": database, "sql": sql })),
-                )
-                .await?;
+            let mut body = json!({ "connectionId": connection.id, "database": database, "sql": sql });
+            // Stateful MCP sessions pin every query to the same backend pool.
+            if let Some(client_session_id) = arguments.get("client_session_id").and_then(Value::as_str) {
+                body["clientSessionId"] = json!(client_session_id);
+            }
+            let response = self.request(reqwest::Method::POST, "/api/query/execute", Some(body)).await?;
             let query_result: dbx_core::db::QueryResult =
                 response.json().await.map_err(|error| format!("Invalid query response: {error}"))?;
             Ok(format_query_result(&query_result, max_rows))
@@ -722,6 +780,27 @@ impl DbxBackend for WebBackend {
         .map_err(|error| format!("Invalid query response: {error}"))
     }
 
+    async fn close_client_session(
+        &self,
+        connection_id: &str,
+        database: &str,
+        client_session_id: &str,
+    ) -> Result<bool, String> {
+        self.request(
+            reqwest::Method::POST,
+            "/api/query/close-client-session",
+            Some(json!({
+                "connectionId": connection_id,
+                "database": database,
+                "clientSessionId": client_session_id,
+            })),
+        )
+        .await?
+        .json()
+        .await
+        .map_err(|error| format!("Invalid close session response: {error}"))
+    }
+
     async fn add_connection_for_mcp(&self, config: ConnectionConfig) -> Result<ConnectionConfig, String> {
         self.request(reqwest::Method::POST, "/api/connection/mcp/add", Some(json!({ "config": config })))
             .await?
@@ -731,15 +810,20 @@ impl DbxBackend for WebBackend {
     }
 
     async fn remove_connection_for_mcp(&self, connection_id: &str) -> Result<bool, String> {
-        self.request(
-            reqwest::Method::POST,
-            "/api/connection/mcp/remove",
-            Some(json!({ "connectionId": connection_id })),
-        )
-        .await?
-        .json()
-        .await
-        .map_err(|error| format!("Invalid MCP connection response: {error}"))
+        let removed = self
+            .request(
+                reqwest::Method::POST,
+                "/api/connection/mcp/remove",
+                Some(json!({ "connectionId": connection_id })),
+            )
+            .await?
+            .json()
+            .await
+            .map_err(|error| format!("Invalid MCP connection response: {error}"))?;
+        if removed {
+            self.connected.lock().await.remove(connection_id);
+        }
+        Ok(removed)
     }
 
     async fn list_tables(
@@ -1141,13 +1225,21 @@ impl DbxBackend for WebBackend {
                     .into_iter()
                     .flatten()
                     .filter_map(Value::as_str)
-                    .map(|name| vec![Value::String(name.to_string())])
+                    .map(str::to_string)
                     .collect::<Vec<_>>();
-                Ok(query_result(
-                    if dropped_names.is_empty() { Vec::new() } else { vec!["name".to_string()] },
-                    dropped_names,
-                    affected_rows_from_value(&value),
-                ))
+                let failures = value
+                    .get("failures")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|failure| {
+                        Some((
+                            failure.get("name")?.as_str()?.to_string(),
+                            failure.get("message")?.as_str()?.to_string(),
+                        ))
+                    })
+                    .collect::<Vec<_>>();
+                Ok(mongo_drop_indexes_query_result(dropped_names, failures, affected_rows_from_value(&value)))
             }
             MongoCommand::DropCollection { collection } => {
                 self.request(
@@ -1257,6 +1349,8 @@ fn query_result(columns: Vec<String>, rows: Vec<Vec<Value>>, affected_rows: u64)
         columns,
         column_types: Vec::new(),
         column_sortables: Vec::new(),
+        spatial_columns: vec![],
+        spatial_values: vec![],
         rows,
         affected_rows,
         execution_time_ms: 0,
@@ -1273,6 +1367,28 @@ fn scalar_query_result(column: impl Into<String>, value: Value) -> dbx_core::db:
 
 fn affected_query_result(affected_rows: u64) -> dbx_core::db::QueryResult {
     query_result(Vec::new(), Vec::new(), affected_rows)
+}
+
+fn mongo_drop_indexes_query_result(
+    dropped_names: Vec<String>,
+    failures: Vec<(String, String)>,
+    affected_rows: u64,
+) -> dbx_core::db::QueryResult {
+    if failures.is_empty() {
+        let rows = dropped_names.into_iter().map(|name| vec![Value::String(name)]).collect::<Vec<_>>();
+        return query_result(if rows.is_empty() { Vec::new() } else { vec!["name".to_string()] }, rows, affected_rows);
+    }
+
+    let mut rows = dropped_names
+        .into_iter()
+        .map(|name| vec![Value::String(name), Value::String("dropped".to_string()), Value::Null])
+        .collect::<Vec<_>>();
+    rows.extend(
+        failures.into_iter().map(|(name, message)| {
+            vec![Value::String(name), Value::String("failed".to_string()), Value::String(message)]
+        }),
+    );
+    query_result(vec!["name".to_string(), "status".to_string(), "message".to_string()], rows, affected_rows)
 }
 
 fn mongo_documents_query_result(documents: Vec<Value>) -> dbx_core::db::QueryResult {
@@ -1445,5 +1561,71 @@ mod tests {
         assert_eq!(parse_database_type("Postgres").unwrap(), DatabaseType::Postgres);
         assert_eq!(parse_database_type("mongodb").unwrap(), DatabaseType::MongoDb);
         assert!(parse_database_type("unknown").is_err());
+    }
+
+    #[test]
+    fn mongo_drop_indexes_query_result_preserves_partial_failures() {
+        let result = mongo_drop_indexes_query_result(
+            vec!["email_1".to_string()],
+            vec![("missing_1".to_string(), "index not found".to_string())],
+            1,
+        );
+
+        assert_eq!(result.columns, ["name", "status", "message"]);
+        assert_eq!(
+            result.rows,
+            [
+                vec![Value::String("email_1".to_string()), Value::String("dropped".to_string()), Value::Null],
+                vec![
+                    Value::String("missing_1".to_string()),
+                    Value::String("failed".to_string()),
+                    Value::String("index not found".to_string()),
+                ],
+            ]
+        );
+        assert_eq!(result.affected_rows, 1);
+    }
+
+    #[tokio::test]
+    async fn local_backend_uses_desktop_plugin_directory() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let database_path = data_dir.path().join("dbx.db");
+        let jdbc_plugin_dir = data_dir.path().join("plugins").join("jdbc");
+        std::fs::create_dir_all(&jdbc_plugin_dir).unwrap();
+        std::fs::write(
+            jdbc_plugin_dir.join("manifest.json"),
+            r#"{
+                "id": "jdbc",
+                "name": "DBX JDBC Plugin",
+                "drivers": [{
+                    "id": "jdbc",
+                    "label": "JDBC",
+                    "kind": "external",
+                    "database_type": "jdbc"
+                }]
+            }"#,
+        )
+        .unwrap();
+        let storage = Storage::open(&database_path).await.unwrap();
+        drop(storage);
+
+        let backend = LocalBackend::open(&database_path).await.unwrap();
+
+        assert_eq!(backend.state().plugins.root_dir(), data_dir.path().join("plugins"));
+        assert!(backend.state().plugins.find_driver("jdbc").unwrap().is_some());
+    }
+
+    #[test]
+    fn local_plugin_directory_honors_desktop_storage_settings() {
+        let data_dir = Path::new("C:/Users/user/AppData/Roaming/com.dbx.app");
+        let explicit = DesktopSettings {
+            plugin_store_dir: Some("D:/DBX/plugins-custom".to_string()),
+            ..DesktopSettings::default()
+        };
+        let legacy =
+            DesktopSettings { driver_store_dir: Some("D:/DBX/drivers".to_string()), ..DesktopSettings::default() };
+
+        assert_eq!(local_plugin_dir(&explicit, data_dir), PathBuf::from("D:/DBX/plugins-custom"));
+        assert_eq!(local_plugin_dir(&legacy, data_dir), PathBuf::from("D:/DBX/drivers/plugins"));
     }
 }
