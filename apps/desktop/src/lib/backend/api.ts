@@ -158,6 +158,7 @@ export const listCompletionObjects = forward("listCompletionObjects");
 export const completionAssistantSearch = forward("completionAssistantSearch");
 export const getObjectSource = forward("getObjectSource");
 export const getColumns = forward("getColumns");
+export const getAllColumns = forward("getAllColumns");
 export const getSqlServerColumnMetadata = forward("getSqlServerColumnMetadata");
 export const listDataTypes = forward("listDataTypes");
 export const listIndexes = forward("listIndexes");
@@ -332,6 +333,8 @@ export const pendingOpenSqlFiles = forward("pendingOpenSqlFiles");
 export const pendingOpenDbFiles = forward("pendingOpenDbFiles");
 export const pendingOpenConnectionLinks = forward("pendingOpenConnectionLinks");
 export const readExternalSqlFile = forward("readExternalSqlFile");
+export const readExternalSqlFileSnapshot = forward("readExternalSqlFileSnapshot");
+export const inspectExternalSqlFile = forward("inspectExternalSqlFile");
 export const writeExternalSqlFile = forward("writeExternalSqlFile");
 export const saveExternalSqlFile = forward("saveExternalSqlFile");
 export const listSqlFilesInFolder = forward("listSqlFilesInFolder");
@@ -358,8 +361,14 @@ export const nacosRollbackConfig = forward("nacosRollbackConfig");
 export const nacosGetRNacosConsoleCaptcha = forward("nacosGetRNacosConsoleCaptcha");
 export const nacosLoginRNacosConsole = forward("nacosLoginRNacosConsole");
 export const nacosListServices = forward("nacosListServices");
+export const nacosGetService = forward("nacosGetService");
+export const nacosCreateService = forward("nacosCreateService");
+export const nacosUpdateService = forward("nacosUpdateService");
+export const nacosDeleteService = forward("nacosDeleteService");
 export const nacosListInstances = forward("nacosListInstances");
 export const nacosUpdateInstance = forward("nacosUpdateInstance");
+export const nacosRegisterInstance = forward("nacosRegisterInstance");
+export const nacosDeregisterInstance = forward("nacosDeregisterInstance");
 export const nacosGetDashboard = forward("nacosGetDashboard");
 export const nacosRawRequest = forward("nacosRawRequest");
 
@@ -412,6 +421,7 @@ export const redisSetAdd = forward("redisSetAdd");
 export const redisSetRemove = forward("redisSetRemove");
 export const redisZadd = forward("redisZadd");
 export const redisZrem = forward("redisZrem");
+export const redisZsetUpdate = forward("redisZsetUpdate");
 export const redisStreamAdd = forward("redisStreamAdd");
 export const redisJsonSet = forward("redisJsonSet");
 export const redisCheckJsonModule = forward("redisCheckJsonModule");
@@ -487,6 +497,7 @@ export const mqListClientConnections = forward("mqListClientConnections");
 export const mqListClientChannels = forward("mqListClientChannels");
 export const mqCloseClientConnection = forward("mqCloseClientConnection");
 export const mqListSubscriptions = forward("mqListSubscriptions");
+export const mqEnrichSubscriptions = forward("mqEnrichSubscriptions");
 export const mqCreateSubscription = forward("mqCreateSubscription");
 export const mqDeleteSubscription = forward("mqDeleteSubscription");
 export const mqSkipMessages = forward("mqSkipMessages");
@@ -747,3 +758,13 @@ export type {
   AgentEvent,
   SqlFileEntry,
 } from "@/lib/backend/tauri";
+
+// MQTT
+export const mqttGetBrokerInfo = forward("mqttGetBrokerInfo");
+export const mqttSubscribe = forward("mqttSubscribe");
+export const mqttUnsubscribe = forward("mqttUnsubscribe");
+export const mqttPublish = forward("mqttPublish");
+export const mqttListTopics = forward("mqttListTopics");
+export const mqttGetTopicTree = forward("mqttGetTopicTree");
+export const mqttGetMessages = forward("mqttGetMessages");
+export const mqttClearMessages = forward("mqttClearMessages");
