@@ -181,7 +181,7 @@ describe("connectionStore Xugu table child metadata", () => {
     expect(xugu.api.listTriggers).toHaveBeenCalledWith(xugu.config.id, "SHOP_DEMO", "SYSDBA", "SHOP_ORDERS", undefined);
     expect(xuguGroup.children?.[0]).toMatchObject({
       type: "trigger",
-      label: "TR_EVENTS_ROW (BEFORE · INSERT · FOR EACH ROW · DISABLED · INVALID)",
+      label: "TR_EVENTS_ROW (BEFORE · INSERT · FOR EACH ROW · Disabled · Invalid)",
       valid: false,
       comment: "row audit trigger",
       meta: trigger,
