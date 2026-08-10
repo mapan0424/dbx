@@ -2836,6 +2836,17 @@ export default withEnglishFallback({
     trigger: "disparador",
     typeDefinition: "definición de tipo",
     typeBody: "cuerpo de tipo",
+    triggerTiming: "momento de activación",
+    triggerEvent: "evento de activación",
+    triggerLevel: "nivel de activación",
+    triggerStatus: "estado",
+    triggerCondition: "condición",
+    triggerLanguage: "idioma",
+    enabled: "habilitado",
+    disabled: "deshabilitado",
+    validity: "validez",
+    valid: "válido",
+    invalid: "inválido",
   },
   structureEditor: {
     mysqlDataTypeHelp: {
