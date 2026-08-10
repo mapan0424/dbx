@@ -71,7 +71,8 @@ export type DatabaseType =
   | "jdbc"
   | "mq"
   | "mqtt"
-  | "nacos";
+  | "nacos"
+  | "consul";
 
 export function isElasticsearchCompatibleDatabaseType(dbType?: DatabaseType): boolean {
   return dbType === "elasticsearch" || dbType === "easysearch";
@@ -104,6 +105,7 @@ export interface CompletionAssistantRequest {
   search_in_definitions?: boolean;
   parent_schema?: string | null;
   parent_name?: string | null;
+  parent_type?: "package" | "type" | null;
   match_mode?: CompletionAssistantMatchMode | null;
 }
 
@@ -433,6 +435,7 @@ export interface ObjectInfo {
   parent_schema?: string | null;
   parent_name?: string | null;
   trigger?: TriggerInfo | null;
+  xugu_type_members_expandable?: boolean | null;
 }
 
 export interface ObjectStatistics {
@@ -836,6 +839,8 @@ export type TreeNodeType =
   | "table-search-control"
   | "load-more"
   | "column"
+  | "type-attribute"
+  | "type-method"
   | "index"
   | "fkey"
   | "trigger"
@@ -849,6 +854,8 @@ export type TreeNodeType =
   | "etcd-dashboard"
   | "etcd-access-control"
   | "zookeeper-root"
+  | "consul-root"
+  | "consul-overview"
   | "mongo-db"
   | "mongo-gridfs"
   | "mongo-buckets"
@@ -895,6 +902,12 @@ export interface TreeNode {
   tableName?: string;
   objectName?: string;
   signature?: string;
+  /** Owning programmable object for a nested metadata member. */
+  parentName?: string;
+  parentSchema?: string;
+  parentType?: TreeNodeType;
+  /** Set only for XuguDB object types whose members can be loaded lazily. */
+  xuguTypeMembersExpandable?: boolean;
   tableType?: string;
   comment?: string | null;
   valid?: boolean | null;
@@ -1053,6 +1066,8 @@ export interface QueryTab {
     | "etcd-dashboard"
     | "etcd-access-control"
     | "zookeeper"
+    | "consul"
+    | "consul-overview"
     | "mq"
     | "mqtt"
     | "nacos"

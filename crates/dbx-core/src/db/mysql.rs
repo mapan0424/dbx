@@ -2960,6 +2960,7 @@ fn row_to_object(row: &mysql_async::Row, database: &str) -> ObjectInfo {
         parent_schema: get_opt_str(row, "parent_schema"),
         parent_name: get_opt_str(row, "parent_name"),
         trigger: None,
+        xugu_type_members_expandable: None,
     }
 }
 
@@ -3231,6 +3232,7 @@ fn table_infos_to_objects(
                 parent_schema: table.parent_schema,
                 parent_name: table.parent_name,
                 trigger: None,
+                xugu_type_members_expandable: None,
             }
         })
         .collect()
@@ -5385,6 +5387,7 @@ mod tests {
             parent_schema: None,
             parent_name: None,
             trigger: None,
+            xugu_type_members_expandable: None,
         }
     }
 

@@ -3123,6 +3123,7 @@ pub async fn list_objects(pool: &Pool, schema: &str) -> Result<Vec<ObjectInfo>, 
             parent_name: row.try_get::<_, Option<String>>(6).ok().flatten().filter(|s| !s.is_empty()),
             signature: row.try_get::<_, Option<String>>(7).ok().flatten(),
             trigger: None,
+            xugu_type_members_expandable: None,
         })
         .collect())
 }
