@@ -5109,9 +5109,7 @@ export const useConnectionStore = defineStore("connection", () => {
       setChildren(
         targetNode,
         triggers.map((tr) => {
-          const xuguDetails = isXugu
-            ? [tr.timing, tr.event, tr.level, tr.enabled === false ? i18n.global.t("objects.disabled") : null, tr.valid === false ? i18n.global.t("objects.invalid") : null].filter(Boolean).join(" · ")
-            : `${tr.timing} ${tr.event}`;
+          const xuguDetails = isXugu ? [tr.timing, tr.event, tr.level, tr.enabled === false ? i18n.global.t("objects.disabled") : null, tr.valid === false ? i18n.global.t("objects.invalid") : null].filter(Boolean).join(" · ") : `${tr.timing} ${tr.event}`;
           return {
             id: `${parentId}:${tr.name}`,
             label: `${tr.name} (${xuguDetails})`,
