@@ -432,6 +432,7 @@ export interface ObjectInfo {
   updated_at?: string | null;
   parent_schema?: string | null;
   parent_name?: string | null;
+  trigger?: TriggerInfo | null;
 }
 
 export interface ObjectStatistics {
@@ -500,6 +501,13 @@ export interface TriggerInfo {
   name: string;
   event: string;
   timing: string;
+  level?: string | null;
+  condition?: string | null;
+  language?: string | null;
+  enabled?: boolean | null;
+  valid?: boolean | null;
+  comment?: string | null;
+  created_at?: string | null;
   statement?: string | null;
 }
 
