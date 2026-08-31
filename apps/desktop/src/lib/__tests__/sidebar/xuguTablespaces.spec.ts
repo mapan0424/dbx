@@ -30,16 +30,10 @@ describe("Xugu tablespace tree", () => {
   });
 
   it("preserves expanded state on refresh", () => {
-    const first = buildXuguTablespaceChildren(
-      { id: "conn:storage", connectionId: "conn", database: "APP", children: [] },
-      [{ node_id: "1", space_id: 7, space_name: "DATA1", datafile_num: 0, space_type: "PERMANENT", datafiles: [] }],
-    );
+    const first = buildXuguTablespaceChildren({ id: "conn:storage", connectionId: "conn", database: "APP", children: [] }, [{ node_id: "1", space_id: 7, space_name: "DATA1", datafile_num: 0, space_type: "PERMANENT", datafiles: [] }]);
     first[0].isExpanded = true;
     first[0].children![0].isExpanded = true;
-    const second = buildXuguTablespaceChildren(
-      { id: "conn:storage", connectionId: "conn", database: "APP", children: first },
-      [{ node_id: "1", space_id: 7, space_name: "DATA1", datafile_num: 0, space_type: "PERMANENT", datafiles: [] }],
-    );
+    const second = buildXuguTablespaceChildren({ id: "conn:storage", connectionId: "conn", database: "APP", children: first }, [{ node_id: "1", space_id: 7, space_name: "DATA1", datafile_num: 0, space_type: "PERMANENT", datafiles: [] }]);
     expect(second[0].isExpanded).toBe(true);
     expect(second[0].children?.[0].isExpanded).toBe(true);
   });

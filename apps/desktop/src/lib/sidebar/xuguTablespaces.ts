@@ -4,13 +4,10 @@ export function xuguDatafileDisplayName(path: string, fileNo: number): string {
   const normalized = path.trim().replaceAll("\\", "/");
   const parts = normalized.split("/").filter(Boolean);
   const basename = parts.length > 0 ? parts[parts.length - 1] : undefined;
-  return basename || (path.trim() || `file-${fileNo}`);
+  return basename || path.trim() || `file-${fileNo}`;
 }
 
-export function buildXuguTablespaceChildren(
-  parent: Pick<TreeNode, "id" | "connectionId" | "database" | "children">,
-  tablespaces: readonly XuguTablespaceInfo[],
-): TreeNode[] {
+export function buildXuguTablespaceChildren(parent: Pick<TreeNode, "id" | "connectionId" | "database" | "children">, tablespaces: readonly XuguTablespaceInfo[]): TreeNode[] {
   const existing = new Map((parent.children ?? []).map((child) => [child.id, child] as const));
   return tablespaces.map((tablespace) => {
     const tablespaceId = `${parent.id}:tablespace:${tablespace.space_id}`;

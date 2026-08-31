@@ -4175,11 +4175,7 @@ export const useConnectionStore = defineStore("connection", () => {
           await ensureConnected(connectionId);
           load = reclaimTreeNodeLoad(load, node);
           if (useCachedChildren(node, options, load)) return;
-          const tablespaces = await withMetadataLoadTimeout(
-            connectionId,
-            api.listXuguTablespaces(connectionId, node.database || undefined),
-            "Xugu tablespaces",
-          );
+          const tablespaces = await withMetadataLoadTimeout(connectionId, api.listXuguTablespaces(connectionId, node.database || undefined), "Xugu tablespaces");
           const targetNode = treeNodeLoadTarget(load);
           if (!targetNode) return;
           const children = buildXuguTablespaceChildren(targetNode, tablespaces);
