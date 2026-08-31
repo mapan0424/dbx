@@ -3344,6 +3344,8 @@ export default {
     damengUsers: "Users",
     damengRoles: "Roles",
     damengJobAdmin: "Agent Jobs",
+    xuguTablespaces: "Storage Spaces",
+    xuguDatafiles: "Files",
     linkedServers: "Linked Servers",
     defaultDatabase: "Default DB",
     columns: "Columns",

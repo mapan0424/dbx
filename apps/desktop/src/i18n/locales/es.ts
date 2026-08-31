@@ -3252,6 +3252,8 @@ export default withEnglishFallback({
     damengUsers: "Usuarios",
     damengRoles: "Roles",
     damengJobAdmin: "Trabajos del agente",
+    xuguTablespaces: "Espacios de almacenamiento",
+    xuguDatafiles: "Archivos",
     linkedServers: "Servidores vinculados",
     defaultDatabase: "Base predeterminada",
     columns: "Columnas",

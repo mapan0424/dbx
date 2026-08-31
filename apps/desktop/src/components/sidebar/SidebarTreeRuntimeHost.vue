@@ -655,6 +655,8 @@ const groupTypes: Set<TreeNodeType> = new Set([
   "group-types",
   "group-partitions",
   "group-extensions",
+  "group-tablespaces",
+  "group-datafiles",
 ]);
 
 function isGroupLabel(node: TreeNode): boolean {
@@ -774,6 +776,27 @@ async function toggle(requestId = beginNavigationRequest()) {
     node.isExpanded = !node.isExpanded;
     if (wasExpanded && shouldReleaseCollapsedTreeNodeChildren()) connectionStore.releaseCollapsedTreeNodeChildren(node.id);
     emitNodeToggled(node, wasExpanded);
+    return;
+  }
+
+  if (node.type === "group-tablespaces") {
+    if (connectionStore.canUseLoadedTreeNodeToggle(node)) {
+      node.isExpanded = !node.isExpanded;
+      if (wasExpanded && shouldReleaseCollapsedTreeNodeChildren()) connectionStore.releaseCollapsedTreeNodeChildren(node.id);
+      emitNodeToggled(node, wasExpanded);
+      return;
+    }
+    try {
+      await connectionStore.loadXuguTablespaces(node, { preserveCollapsedChildren: !shouldReleaseCollapsedTreeNodeChildren() });
+      emitNodeToggled(node, wasExpanded);
+    } catch (e: any) {
+      if (!isCurrentNavigationRequest(requestId)) return;
+      if (!wasExpanded) node.isExpanded = false;
+      const errMsg = e?.message || String(e);
+      if (errMsg.includes(CONNECTION_ATTEMPT_CANCELLED_MESSAGE)) return;
+      toast(t("connection.connectFailed", { message: translateBackendError(t, e) }), 5000);
+      openDriverStoreForInstallError(errMsg);
+    }
     return;
   }
 
