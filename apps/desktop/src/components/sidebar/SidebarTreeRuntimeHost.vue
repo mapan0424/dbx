@@ -779,6 +779,14 @@ async function toggle(requestId = beginNavigationRequest()) {
     return;
   }
 
+  // Xugu tablespace rows and their datafile groups are eagerly materialized
+  // with the tablespace listing; expanding them is a pure local toggle.
+  if (node.type === "tablespace" || node.type === "group-datafiles") {
+    node.isExpanded = !node.isExpanded;
+    emitNodeToggled(node, wasExpanded);
+    return;
+  }
+
   if (node.type === "group-tablespaces") {
     if (connectionStore.canUseLoadedTreeNodeToggle(node)) {
       node.isExpanded = !node.isExpanded;
