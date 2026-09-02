@@ -1409,22 +1409,26 @@ function buildMqttExternalConfig(): MqttConnectionConfig {
   };
 }
 
+const INFLUXDB_V1V2_DEFAULT_PORT = 8086;
+const INFLUXDB_V3_DEFAULT_PORT = 8181;
+
 const influxDbVersion = ref<InfluxDbVersion>("1");
 const influxDbOrg = ref("");
 const victoriaMetricsApiPath = ref("/prometheus");
 const victoriaMetricsLookback = ref("1h");
 
-function resetInfluxDbFields(config?: Partial<InfluxDbExternalConfig>) {
-  influxDbVersion.value = config?.version === "2" ? "2" : "1";
+function resetInfluxDbFields(config?: Partial<InfluxDbExternalConfig>, versionHint?: InfluxDbVersion) {
+  const version = versionHint ?? (config?.version === "2" ? "2" : config?.version === "3" ? "3" : "1");
+  influxDbVersion.value = version;
   influxDbOrg.value = config?.org?.trim() || "";
 }
 
-function hydrateInfluxDbFields(value: unknown) {
+function hydrateInfluxDbFields(value: unknown, versionHint?: InfluxDbVersion) {
   if (!value || typeof value !== "object") {
-    resetInfluxDbFields();
+    resetInfluxDbFields(undefined, versionHint);
     return;
   }
-  resetInfluxDbFields(value as Partial<InfluxDbExternalConfig>);
+  resetInfluxDbFields(value as Partial<InfluxDbExternalConfig>, versionHint);
 }
 
 function resetHiveKerberosFields(config?: Pick<ConnectionConfig, "url_params" | "agent_java_options">) {
@@ -1442,6 +1446,9 @@ function resetDamengJvmOptions(config?: Pick<ConnectionConfig, "agent_java_optio
 }
 
 function buildInfluxDbExternalConfig(): InfluxDbExternalConfig {
+  // InfluxDB 3 Core can run with --without-auth; the driver treats an empty
+  // password as "no Authorization header", so the token stays optional here.
+  if (influxDbVersion.value === "3") return { version: "3" };
   if (influxDbVersion.value !== "2") return { version: "1" };
   const org = influxDbOrg.value.trim();
   if (!org) throw new Error("InfluxDB 2.x organization is required");
@@ -1477,10 +1484,16 @@ function buildVictoriaMetricsExternalConfig(): VictoriaMetricsExternalConfig {
   return { apiPath, lookback };
 }
 
-watch(influxDbVersion, (version) => {
+watch(influxDbVersion, (version, previousVersion) => {
   if (form.value.db_type !== "influxdb") return;
-  if (version === "2") {
+  if (version === "2" || version === "3") {
     form.value.username = "";
+  }
+  const port = form.value.port;
+  if (version === "3" && (!port || port === INFLUXDB_V1V2_DEFAULT_PORT)) {
+    form.value.port = INFLUXDB_V3_DEFAULT_PORT;
+  } else if (previousVersion === "3" && port === INFLUXDB_V3_DEFAULT_PORT) {
+    form.value.port = INFLUXDB_V1V2_DEFAULT_PORT;
   }
 });
 
@@ -2556,8 +2569,15 @@ watch(
       } else {
         resetMqttFields();
       }
-      if (config.db_type === "influxdb") {
-        hydrateInfluxDbFields(config.external_config);
+      if (config.db_type === "influxdb" || config.db_type === "influxdb3") {
+        // The influxdb3 engine is presented as the InfluxDB card with
+        // version = 3. Save-side (`applyConnectionFormToConfig`) swaps
+        // db_type back to `influxdb3` when saving.
+        const versionHint: InfluxDbVersion | undefined = config.db_type === "influxdb3" ? "3" : undefined;
+        hydrateInfluxDbFields(config.external_config, versionHint);
+        if (config.db_type === "influxdb3") {
+          form.value.db_type = "influxdb";
+        }
       } else {
         resetInfluxDbFields();
       }
@@ -2766,6 +2786,11 @@ function switchH2ConnectionMode(mode: H2ConnectionMode) {
   resetTestState();
 }
 
+function switchEtcdApiVersion(profile: "etcd" | "etcd-v2") {
+  form.value.driver_profile = profile;
+  resetTestState();
+}
+
 function switchH2DriverProfile(profile: "h2" | "h2-v1" | "h2-v2" | "h2-v3" | "h2-custom") {
   form.value.driver_profile = profile;
   if (profile === "h2-custom") {
@@ -2831,7 +2856,9 @@ function jdbcProductCategory(profileId: string): DbCategoryKey {
   return category;
 }
 
-const dbOptions: DbOption[] = [...CONNECTION_PICKER_OPTIONS, ...jdbcProductPickerOptions().map((option) => ({ ...option, category: jdbcProductCategory(option.value) }))];
+// `influxdb3` is presented as a version option inside the InfluxDB card
+// (see the version <Select> below), not as a standalone picker entry.
+const dbOptions: DbOption[] = [...CONNECTION_PICKER_OPTIONS.filter((option) => option.value !== "influxdb3"), ...jdbcProductPickerOptions().map((option) => ({ ...option, category: jdbcProductCategory(option.value) }))];
 
 const dbCategoryDefinitions = dbCategoryMetadata.map((category) => ({
   ...category,
@@ -3934,10 +3961,16 @@ function connectionConfigForSubmit(id: string, generatedName = ""): ConnectionCo
   } else if (config.db_type === "influxdb") {
     config.external_config = buildInfluxDbExternalConfig();
     config.connection_string = undefined;
-    if (influxDbVersion.value === "2") {
+    if (influxDbVersion.value === "2" || influxDbVersion.value === "3") {
       config.username = "";
       config.password = config.password.trim();
       config.database = config.database?.trim() || undefined;
+    }
+    // Swap db_type to the standalone influxdb3 engine when the version
+    // picker is on 3; the form keeps db_type = influxdb so the same card
+    // renders every InfluxDB flavor.
+    if (influxDbVersion.value === "3") {
+      config.db_type = "influxdb3";
     }
   } else if (config.db_type === "victoriametrics") {
     config.external_config = buildVictoriaMetricsExternalConfig();
@@ -6845,6 +6878,18 @@ function openExternalUrl(url: string) {
                 <!-- etcd: endpoints, user, password, TLS -->
                 <template v-else-if="form.db_type === 'etcd'">
                   <div class="grid grid-cols-4 items-center gap-4">
+                    <Label :class="connectionLabelClass">API</Label>
+                    <div class="col-span-3 space-y-1.5">
+                      <div class="flex flex-wrap gap-2">
+                        <Button size="sm" :variant="!form.driver_profile || form.driver_profile === 'etcd' ? 'default' : 'outline'" @click="switchEtcdApiVersion('etcd')">v3 (etcd 3.x)</Button>
+                        <Button size="sm" :variant="form.driver_profile === 'etcd-v2' ? 'default' : 'outline'" @click="switchEtcdApiVersion('etcd-v2')">v2 (etcd 2.x)</Button>
+                      </div>
+                      <p v-if="form.driver_profile === 'etcd-v2'" class="text-xs text-muted-foreground">
+                        {{ t("connection.etcdV2ApiHint") }}
+                      </p>
+                    </div>
+                  </div>
+                  <div class="grid grid-cols-4 items-center gap-4">
                     <Label :class="connectionLabelClass">{{ t("connection.host") }}</Label>
                     <Input v-model="form.host" class="col-span-2" />
                     <Input v-model.number="form.port" type="number" class="col-span-1" />
@@ -7218,6 +7263,7 @@ function openExternalUrl(url: string) {
                       <SelectContent>
                         <SelectItem value="1">InfluxDB 1.x</SelectItem>
                         <SelectItem value="2">InfluxDB 2.x</SelectItem>
+                        <SelectItem value="3">InfluxDB 3.x</SelectItem>
                       </SelectContent>
                     </Select>
                   </div>
@@ -7247,6 +7293,16 @@ function openExternalUrl(url: string) {
                       <PasswordInput v-model="form.password" class="col-span-3" />
                     </div>
                   </template>
+                  <template v-else-if="influxDbVersion === '3'">
+                    <div class="grid grid-cols-4 items-center gap-4">
+                      <Label :class="connectionLabelClass">{{ t("connection.database") }}</Label>
+                      <Input v-model="form.database" class="col-span-3" placeholder="my-database" />
+                    </div>
+                    <div class="grid grid-cols-4 items-center gap-4">
+                      <Label :class="connectionLabelClass">Token</Label>
+                      <PasswordInput v-model="form.password" class="col-span-3" />
+                    </div>
+                  </template>
                   <template v-else>
                     <div class="grid grid-cols-4 items-center gap-4">
                       <Label :class="connectionLabelClass">{{ t("connection.user") }}</Label>
@@ -7263,7 +7319,7 @@ function openExternalUrl(url: string) {
                   </template>
                   <div class="grid grid-cols-4 items-center gap-4">
                     <Label :class="connectionLabelClass">{{ t("connection.urlParams") }}</Label>
-                    <Input v-model="form.url_params" class="col-span-3" :placeholder="influxDbVersion === '2' ? 'precision=ns' : 'epoch=ms'" />
+                    <Input v-model="form.url_params" class="col-span-3" :placeholder="influxDbVersion === '2' ? 'precision=ns' : influxDbVersion === '3' ? '' : 'epoch=ms'" />
                   </div>
                 </template>
 

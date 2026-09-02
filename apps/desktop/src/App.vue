@@ -62,7 +62,7 @@ import { isMacOS, isWindows } from "@/lib/backend/platform";
 import { isTauriRuntime } from "@/lib/backend/tauriRuntime";
 import { openQueryResultArchiveFile } from "@/lib/query/queryResultArchiveFile";
 import { rememberExternalSqlFileTarget, resolveExternalSqlFileTarget, unassociatedExternalSqlFileTarget } from "@/lib/sql/externalSqlFileTarget";
-import { externalSqlFileOpenErrorMessage, readBrowserSqlFile, sqlFileTitleFromPath } from "@/lib/sql/sqlFileOpen";
+import { externalSqlFileOpenErrorMessage, isSqlFilePath, readBrowserSqlFile, sqlFileTitleFromPath } from "@/lib/sql/sqlFileOpen";
 import type { ConnectionConfig, DatabaseType, ObjectSourceKind, QueryTab, TreeNode } from "@/types/database";
 import { parseConnectionDeepLink, type ConnectionDeepLinkDraft } from "@/lib/connection/connectionDeepLink";
 import { parseAiConfigDeepLink, type AiConfigDeepLinkDraft } from "@/lib/ai/aiConfigDeepLink";
@@ -194,6 +194,7 @@ const {
   checkingUpdates,
   updateInfo,
   updateCheckMessage,
+  updateCheckFailed,
   showUpdateDialog,
   isDownloadingUpdate,
   downloadProgress,
@@ -206,6 +207,7 @@ const {
   openUrl,
   checkUpdates,
   openLatestRelease,
+  changeUpdateDownloadSource,
   ignoreCurrentVersion,
   downloadUpdateInBackground,
   cancelDownload,
@@ -1260,7 +1262,7 @@ async function writeExternalSqlTab(tab: QueryTab, options: { closeAfterSave?: bo
       expectedMissing: options.expectedMissing,
     });
     if (result.kind !== "written") return "retry";
-    rememberExternalSqlFileTarget(tab.externalSqlPath, { connectionId: tab.connectionId, database: tab.database, catalog: tab.catalog });
+    rememberExternalSqlFileTarget(tab.externalSqlPath, { connectionId: tab.connectionId, database: tab.database, catalog: tab.catalog, schema: tab.schema });
     queryStore.markExternalSqlFileSaved(tab.id, result.version);
     toast(t("savedSql.saved"), 2000);
     if (options.closeAfterSave) queryStore.closeTab(tab.id, { force: true });
@@ -1311,6 +1313,7 @@ function savedSqlTargetForSave(tab: QueryTab) {
  */
 async function formattedSqlForSave(tab: QueryTab): Promise<string> {
   if (!settingsStore.editorSettings.formatSqlOnSqlFileSave) return tab.sql;
+  if (tab.externalSqlPath && !isSqlFilePath(tab.externalSqlPath)) return tab.sql;
   const sqlSnapshot = tab.sql;
   if (!sqlSnapshot.trim()) return sqlSnapshot;
   const connection = connectionStore.getConfig(tab.connectionId);
@@ -1590,10 +1593,14 @@ async function confirmSaveSqlToLibrary() {
 async function saveExternalSqlTabAs(tab: QueryTab): Promise<boolean> {
   if (!canSaveSqlTab(tab) || !isTauriRuntime()) return false;
   try {
-    const saved = await api.saveExternalSqlFile(defaultSavedSqlName(tab.title), await formattedSqlForSave(tab));
+    // Non-SQL external tabs (custom-filtered text files) keep their own file
+    // name and extension when saving a copy instead of being forced to .sql.
+    const currentFileName = tab.externalSqlPath?.split(/[\\/]/).pop()?.trim() ?? "";
+    const filterExtension = currentFileName.includes(".") ? currentFileName.split(".").pop()?.toLowerCase() : undefined;
+    const saved = await api.saveExternalSqlFile(currentFileName || defaultSavedSqlName(tab.title), await formattedSqlForSave(tab), filterExtension);
     if (!saved) return false;
     queryStore.linkExternalSqlPath(tab.id, saved.path, sqlFileTitleFromPath(saved.path), saved.version);
-    rememberExternalSqlFileTarget(saved.path, { connectionId: tab.connectionId, database: tab.database, catalog: tab.catalog });
+    rememberExternalSqlFileTarget(saved.path, { connectionId: tab.connectionId, database: tab.database, catalog: tab.catalog, schema: tab.schema });
     invalidateSaveSqlFolderSelection();
     showSaveSqlDialog.value = false;
     closePendingSavedTab();
@@ -1619,6 +1626,9 @@ function applyExternalSqlFileTarget(tab: QueryTab, path: string) {
     if (target.catalog !== undefined || tab.catalog !== undefined) queryStore.updateCatalog(tab.id, target.catalog, target.database);
     else queryStore.updateDatabase(tab.id, target.database);
   }
+  // updateConnection/updateCatalog/updateDatabase all reset the schema, so the
+  // remembered schema has to be reapplied after them.
+  if (target.schema !== tab.schema) queryStore.updateSchema(tab.id, target.schema);
 }
 
 async function openSqlFile() {
@@ -1689,7 +1699,7 @@ async function openSqlFilePath(path: string) {
     await desktopOpenTabsRestorationBarrier?.settled;
     const snapshot = await api.readExternalSqlFileSnapshot(path);
     const target = resolveExternalSqlFileTarget(path, (savedConnectionId) => !!connectionStore.getConfig(savedConnectionId), unassociatedExternalSqlFileTarget());
-    queryStore.openExternalSqlFile(target.connectionId, target.database, path, snapshot.content, snapshot.version, target.catalog);
+    queryStore.openExternalSqlFile(target.connectionId, target.database, path, snapshot.content, snapshot.version, target.catalog, target.schema);
   } catch (e: any) {
     toast(t("toolbar.sqlOpenFailed", { message: externalSqlFileOpenErrorMessage(e, (key, params) => t(key, params)) }), 5000);
   }
@@ -2146,14 +2156,14 @@ async function changeActiveConnection(connectionId: string) {
   if (!connection) return;
   const initialDatabase = resolveDefaultDatabase(connection, []);
   queryStore.updateConnection(tab.id, connectionId, initialDatabase);
-  if (tab.externalSqlPath) rememberExternalSqlFileTarget(tab.externalSqlPath, { connectionId, database: initialDatabase, catalog: undefined });
+  if (tab.externalSqlPath) rememberExternalSqlFileTarget(tab.externalSqlPath, { connectionId, database: initialDatabase, catalog: undefined, schema: undefined });
   connectionStore.activeConnectionId = connectionId;
   try {
     await connectionStore.ensureConnected(connectionId);
     const options = await getDatabaseOptions(connectionId);
     const database = resolveDefaultDatabase(connection, options);
     queryStore.updateDatabase(tab.id, database);
-    if (tab.externalSqlPath) rememberExternalSqlFileTarget(tab.externalSqlPath, { connectionId, database, catalog: undefined });
+    if (tab.externalSqlPath) rememberExternalSqlFileTarget(tab.externalSqlPath, { connectionId, database, catalog: undefined, schema: undefined });
     if (connection.default_schema || connection.db_type === "oracle") {
       try {
         // A configured default wins. Otherwise Oracle returns the session's current schema first.
@@ -2161,6 +2171,7 @@ async function changeActiveConnection(connectionId: string) {
         const schema = schemaAfterConnectionSwitch(connection.db_type, orderedSchemas, connection.default_schema);
         if (schema && activeTab.value?.id === tab.id && activeTab.value.connectionId === connectionId) {
           queryStore.updateSchema(tab.id, schema);
+          if (tab.externalSqlPath) rememberExternalSqlFileTarget(tab.externalSqlPath, { connectionId, database, catalog: undefined, schema });
         }
       } catch {
         // Schema metadata failure must not turn a successful connection switch into a connection error.
@@ -2180,7 +2191,7 @@ function changeActiveDatabase(database: string) {
   const tab = activeTab.value;
   if (tab) {
     queryStore.updateDatabase(tab.id, database);
-    if (tab.externalSqlPath) rememberExternalSqlFileTarget(tab.externalSqlPath, { connectionId: tab.connectionId, database, catalog: tab.catalog });
+    if (tab.externalSqlPath) rememberExternalSqlFileTarget(tab.externalSqlPath, { connectionId: tab.connectionId, database, catalog: tab.catalog, schema: tab.schema });
     if (databaseRequiredTabId.value === tab.id && database) {
       databaseRequiredTabId.value = null;
     }
@@ -2191,7 +2202,7 @@ function changeActiveCatalog(catalog: string | undefined, database: string) {
   const tab = activeTab.value;
   if (tab) {
     queryStore.updateCatalog(tab.id, catalog, database);
-    if (tab.externalSqlPath) rememberExternalSqlFileTarget(tab.externalSqlPath, { connectionId: tab.connectionId, database, catalog });
+    if (tab.externalSqlPath) rememberExternalSqlFileTarget(tab.externalSqlPath, { connectionId: tab.connectionId, database, catalog, schema: tab.schema });
   }
 }
 
@@ -2209,7 +2220,9 @@ async function clearActiveDefaultDatabase() {
 
 function changeActiveSchema(schema: string | undefined) {
   const tab = activeTab.value;
-  if (tab) queryStore.updateSchema(tab.id, schema);
+  if (!tab) return;
+  queryStore.updateSchema(tab.id, schema);
+  if (tab.externalSqlPath) rememberExternalSqlFileTarget(tab.externalSqlPath, { connectionId: tab.connectionId, database: tab.database, catalog: tab.catalog, schema });
 }
 
 function openGitHub() {
@@ -2332,7 +2345,7 @@ async function handleQuickOpenSelect(item: any) {
     try {
       const snapshot = await api.readExternalSqlFileSnapshot(item.filePath);
       const target = resolveExternalSqlFileTarget(item.filePath, (savedConnectionId) => !!connectionStore.getConfig(savedConnectionId), unassociatedExternalSqlFileTarget());
-      queryStore.openExternalSqlFile(target.connectionId, target.database, item.filePath, snapshot.content, snapshot.version, target.catalog);
+      queryStore.openExternalSqlFile(target.connectionId, target.database, item.filePath, snapshot.content, snapshot.version, target.catalog, target.schema);
     } catch (e: any) {
       toast(
         externalSqlFileOpenErrorMessage(e, (key, params) => t(key, params)),
@@ -3348,6 +3361,9 @@ onUnmounted(() => {
           v-model:open="showUpdateDialog"
           :update-info="updateInfo"
           :update-check-message="updateCheckMessage"
+          :checking-updates="checkingUpdates"
+          :update-check-failed="updateCheckFailed"
+          :update-download-source="settingsStore.editorSettings.updateDownloadSource"
           :is-downloading-update="isDownloadingUpdate"
           :download-progress="downloadProgress"
           :update-downloaded="updateDownloaded"
@@ -3356,6 +3372,7 @@ onUnmounted(() => {
           :is-ignoring-update="isIgnoringUpdate"
           :active-task-count="activeUpdateTaskCount"
           @open-latest-release="openLatestRelease"
+          @change-download-source="changeUpdateDownloadSource"
           @download-in-background="downloadUpdateInBackground"
           @cancel-download="cancelDownload"
           @install-downloaded="installDownloadedUpdate"

@@ -2,7 +2,7 @@ import { defineStore } from "pinia";
 import { uuid } from "@/lib/common/utils";
 import { computed, markRaw, nextTick, onScopeDispose, reactive, ref, watch } from "vue";
 import { useI18n } from "vue-i18n";
-import type { BatchSqlExecution, ConnectionConfig, DatabaseType, IndexInfo, ObjectBrowserViewport, QueryResult, QueryResultSourceColumnRef, QueryTab, TableInfoTab, TableStructureEditorTarget } from "@/types/database";
+import type { BatchSqlExecution, ConnectionConfig, DatabaseType, IndexInfo, NacosConfigEditorViewport, ObjectBrowserViewport, QueryResult, QueryResultSourceColumnRef, QueryTab, TableInfoTab, TableStructureEditorTarget } from "@/types/database";
 import { orderPinnedFirst } from "@/lib/app/pinnedItems";
 import { canCancelQueryExecution } from "@/lib/sql/queryExecutionState";
 import { buildExplainSql, parseExplainResult, parseDamengExplainText, parseOracleExplainText, sqlServerExplainResult, type BuildExplainSqlResult } from "@/lib/diagram/explainPlan";
@@ -48,6 +48,7 @@ import { buildTableSelectSql, quoteTableDataIdentifier } from "@/lib/table/table
 import { connectionObjectTreeNodeSchema, connectionQueryExecutionSchema, connectionUsesDatabaseObjectTreeMode, effectiveDatabaseTypeForConnection, gaussdbCountQueryDopHint, metadataSchemaForConnection } from "@/lib/database/jdbcDialect";
 import { frontendQueryTimeoutDelayMs, frontendQueryTimeoutSecsForSql, queryTimeoutSecsForConnection } from "@/lib/sql/queryTimeout";
 import { queryResultNameFromPreamble, queryResultSourceLabel } from "@/lib/sql/queryResultSource";
+import { sqlServerCountUsesLocalTempTable } from "@/lib/query/queryResultCountSession";
 import { beginDataGridNativeSelectionBlock, finishDataGridNativeSelectionBlock } from "@/lib/dataGrid/dataGridNativeSelection";
 import { appendLargeValueCells, canUseTableDataLargeValuePreview, remapLargeValueCells, tableDataLargeValuePreviewOptions, TABLE_DATA_RESULT_MAX_BYTES } from "@/lib/dataGrid/dataGridLargeValues";
 import { simpleDataGridOrderByReferencesMissingColumn, sortDataGridRowIndexes, type DataGridSortDirection } from "@/lib/dataGrid/dataGridSort";
@@ -55,6 +56,7 @@ import { normalizeResultPageSize } from "@/lib/dataGrid/paginationPageSize";
 import { agentProtocolQueryResultMaxRows, capQueryResultTotal, effectiveQueryResultMaxRows, limitQueryPagination, queryResultLimitReached } from "@/lib/dataGrid/queryResultRowLimit";
 import { elasticsearchRestRequestRanges, executableStatementRanges, splitSqlStatementRanges } from "@/lib/sql/sqlStatementRanges";
 import { replaceSqlServerLeadingUseQuery, sqlServerLeadingUseScript, sqlServerUseDatabaseFromStatement } from "@/lib/sql/sqlCompletionLookupTarget";
+import { classifySqlRisk } from "@/lib/sql/sqlRisk";
 import { externalSqlFileDisplayTitles, normalizeExternalSqlPath } from "@/lib/sql/sqlFileOpen";
 import { clearDataGridPendingSnapshot, clearDataGridPendingSnapshotsForTab } from "@/composables/useDataGridEditor";
 import { clearDataGridStructuredFilterStatesForTab } from "@/lib/dataGrid/dataGridFilterBuilderPersistence";
@@ -71,7 +73,7 @@ import { useSavedSqlStore } from "@/stores/savedSqlStore";
 import { useExportTracker } from "@/composables/useExportTracker";
 import { recordQueryCancellationLatency, resourceLifecycleDiagnostics } from "@/lib/diagnostics/resourceLifecycleDiagnostics";
 import { appendDebugLog } from "@/lib/backend/debugLog";
-import { BackendErrorException, formatError, isManualTransactionSessionExpired, normalizeBackendError, type BackendError } from "@/lib/backend/errorUtils";
+import { BackendErrorException, formatError, isManualTransactionSessionExpired, isUnsupportedManualTransactionMethod, normalizeBackendError, type BackendError } from "@/lib/backend/errorUtils";
 import { createSavedSqlEditorPosition, initSavedSqlEditorPositions, restoreSavedSqlEditorPosition, saveSavedSqlEditorPosition } from "@/lib/app/savedSqlEditorPosition";
 import { ensureSqlExtension } from "@/lib/savedSql/savedSqlFileName";
 import { resolveSavedSqlExecutionTarget, savedSqlExecutionTargetFromTab, type SavedSqlExecutionTarget, type SavedSqlOpenTargetMode } from "@/lib/savedSql/savedSqlExecutionTarget";
@@ -1919,7 +1921,7 @@ export const useQueryStore = defineStore("query", () => {
     });
   }
 
-  function openExternalSqlFile(connectionId: string, database: string, path: string, sql: string, version?: QueryTab["externalSqlFileVersion"], catalog?: string) {
+  function openExternalSqlFile(connectionId: string, database: string, path: string, sql: string, version?: QueryTab["externalSqlFileVersion"], catalog?: string, schema?: string) {
     const normalizedPath = normalizeExternalSqlPath(path);
     const existing = tabs.value.find((tab) => tab.mode === "query" && tab.externalSqlPath && normalizeExternalSqlPath(tab.externalSqlPath) === normalizedPath);
     if (existing) {
@@ -1938,6 +1940,10 @@ export const useQueryStore = defineStore("query", () => {
       connectionId,
       database,
       catalog,
+      // Restoring the schema keeps the reopened file on the namespace it was
+      // saved from. Without it the tab has no schema, so sidebar locate and the
+      // metadata paths fall back to the connection default (issue #7648).
+      schema,
       sql,
       originalSql: sql,
       externalSqlPath: path,
@@ -3391,6 +3397,22 @@ export const useQueryStore = defineStore("query", () => {
     tab.objectBrowser = { ...tab.objectBrowser, viewport };
   }
 
+  function updateNacosConfigEditorViewport(connectionId: string, namespace: string, viewport: NacosConfigEditorViewport) {
+    if (!Number.isFinite(viewport.scrollTop) || !Number.isFinite(viewport.scrollLeft)) return;
+    const tab = tabs.value.find((candidate) => candidate.mode === "nacos" && candidate.connectionId === connectionId && (candidate.nacosNamespace || "") === namespace);
+    if (!tab) return;
+    const next = {
+      ...viewport,
+      scrollTop: Math.max(0, Math.round(viewport.scrollTop)),
+      scrollLeft: Math.max(0, Math.round(viewport.scrollLeft)),
+    };
+    const previous = tab.nacosConfigEditorViewport;
+    if (previous?.namespace === next.namespace && previous.dataId === next.dataId && previous.group === next.group && previous.scrollTop === next.scrollTop && previous.scrollLeft === next.scrollLeft) {
+      return;
+    }
+    tab.nacosConfigEditorViewport = next;
+  }
+
   function renameTab(id: string, title: string) {
     const trimmed = title.trim();
     if (!trimmed) return false;
@@ -4427,7 +4449,11 @@ export const useQueryStore = defineStore("query", () => {
       const queryAnalysis = {
         ...target.analysis,
         ...(target.analysis.distinct && canInsertIntoEditableQuerySource(tab, dbType as DatabaseType, target, target.sourceColumns) ? { allowInsert: true } : {}),
-        allowDelete: !target.analysis.distinct,
+        // A DISTINCT result is still one-to-one with the selected source row
+        // when that source's complete primary key is present in the projection.
+        // The candidate filter above guarantees that identity before enabling
+        // the primary-key based delete SQL.
+        allowDelete: true,
         allowInsertDelete: false,
         multiSource: true,
       };
@@ -4497,6 +4523,7 @@ export const useQueryStore = defineStore("query", () => {
     traceId: string;
     elapsed: () => string;
     timeoutSecs: number;
+    txnSessionId?: string;
   }) {
     const resultRowCount = options.result.rows.length;
     if (resultRowCount <= 0) {
@@ -4519,9 +4546,9 @@ export const useQueryStore = defineStore("query", () => {
       return;
     }
 
-    const clientSessionId = tabClientSessionId({ id: options.tabId }, "count");
     const countExecutionId = `${options.executionId}:count`;
     void (async () => {
+      let isolatedClientSessionId: string | undefined;
       try {
         const countTarget = options.countSql ? { sql: options.countSql, schema: options.schema } : await options.countSqlTarget?.();
         if (!countTarget?.sql) {
@@ -4529,12 +4556,23 @@ export const useQueryStore = defineStore("query", () => {
           return;
         }
         queryExecutionLog("info", "count:start", { traceId: options.traceId, elapsed: options.elapsed() });
-        const countResult = await api.executeQuery(options.connectionId, options.database, countTarget.sql, countTarget.schema, countExecutionId, {
-          clientSessionId,
-          catalog: options.catalog,
-          timeoutSecs: options.timeoutSecs,
-        });
-        const total = Number(countResult.rows?.[0]?.[0] ?? 0);
+        let countResult: QueryResult | undefined;
+        if (options.txnSessionId) {
+          const txnResults = await api.executeInManualTransaction(options.txnSessionId, countTarget.sql, options.database, countTarget.schema, 1);
+          countResult = txnResults.find((result) => result.columns.length > 0) ?? txnResults[txnResults.length - 1];
+        } else {
+          const connection = useConnectionStore().getConfig(options.connectionId);
+          const databaseType = effectiveDatabaseTypeForConnection(connection);
+          const usesQuerySession = sqlServerCountUsesLocalTempTable(databaseType, countTarget.sql);
+          const clientSessionId = usesQuerySession ? tabClientSessionId({ id: options.tabId }) : tabClientSessionId({ id: options.tabId }, "count");
+          if (!usesQuerySession) isolatedClientSessionId = clientSessionId;
+          countResult = await api.executeQuery(options.connectionId, options.database, countTarget.sql, countTarget.schema, countExecutionId, {
+            clientSessionId,
+            catalog: options.catalog,
+            timeoutSecs: options.timeoutSecs,
+          });
+        }
+        const total = Number(countResult?.rows?.[0]?.[0] ?? 0);
         if (!Number.isFinite(total) || total < 0) {
           setQueryTotalRowCountIfCurrent(options.tabId, options.executionId, options.result, undefined);
           return;
@@ -4555,9 +4593,46 @@ export const useQueryStore = defineStore("query", () => {
           error,
         });
       } finally {
-        void closeClientSessionId(options.connectionId, options.database, clientSessionId, options.catalog, { tabId: options.tabId });
+        if (isolatedClientSessionId) {
+          void closeClientSessionId(options.connectionId, options.database, isolatedClientSessionId, options.catalog, { tabId: options.tabId });
+        }
       }
     })();
+  }
+
+  async function countTabResultRows(id: string): Promise<number | undefined> {
+    const tab = tabs.value.find((candidate) => candidate.id === id);
+    if (!tab?.resultCountSql) return undefined;
+
+    const target = queryResultExecutionLocation(tab);
+    const connection = useConnectionStore().getConfig(target.connectionId);
+    const databaseType = effectiveDatabaseTypeForConnection(connection);
+    let countResult: QueryResult | undefined;
+    let isolatedClientSessionId: string | undefined;
+
+    try {
+      if (tab.autoCommit === false && tab.txnSessionId) {
+        const txnResults = await api.executeInManualTransaction(tab.txnSessionId, tab.resultCountSql, target.database, target.schema, 1);
+        countResult = txnResults.find((result) => result.columns.length > 0) ?? txnResults[txnResults.length - 1];
+      } else {
+        const usesQuerySession = sqlServerCountUsesLocalTempTable(databaseType, tab.resultCountSql);
+        const clientSessionId = usesQuerySession ? tabClientSessionId(tab) : tabClientSessionId(tab, "count");
+        if (!usesQuerySession) isolatedClientSessionId = clientSessionId;
+        countResult = await api.executeQuery(target.connectionId, target.database, tab.resultCountSql, target.schema, undefined, {
+          clientSessionId,
+          catalog: target.catalog,
+          maxRows: 1,
+          timeoutSecs: queryTimeoutSecsForConnection(connection, useSettingsStore().editorSettings.globalQueryTimeoutSecs),
+        });
+      }
+
+      const total = Number(countResult?.rows?.[0]?.[0]);
+      return Number.isFinite(total) && total >= 0 ? total : undefined;
+    } finally {
+      if (isolatedClientSessionId) {
+        void closeClientSessionId(target.connectionId, target.database, isolatedClientSessionId, target.catalog, { tabId: tab.id });
+      }
+    }
   }
 
   async function executeTabSql(
@@ -5350,45 +5425,7 @@ export const useQueryStore = defineStore("query", () => {
         return false;
       }
 
-      let executionPromise: Promise<QueryResult[]>;
-      if (tab.autoCommit === false) {
-        if (!tab.txnSessionId) {
-          queryExecutionLog("info", "begin-manual-txn:start", { traceId, elapsed: elapsed() });
-          tab.txnSessionId = await api.beginManualTransaction(executionConnectionId, executionDatabase, executionSchema, executionCatalog);
-          queryExecutionLog("info", "begin-manual-txn:done", { traceId, txnSessionId: tab.txnSessionId, elapsed: elapsed() });
-        }
-        queryExecutionLog("info", "execute-in-txn:invoke", { traceId, txnSessionId: tab.txnSessionId, elapsed: elapsed() });
-        executionDispatched = true;
-        // Only an initial manual execution classifies the user SQL (Oracle-only).
-        // A later cursor-page fetch must neither set nor clear the sticky bit.
-        const isInitialOracleManualExecution = effectiveDbType === "oracle" && !options?.pagination?.sessionId;
-        const classificationSql = isInitialOracleManualExecution ? queryBaseSql : undefined;
-        let manualTransactionRecoveryAttempted = false;
-        executionPromise = (async () => {
-          const txnSessionId = tab.txnSessionId;
-          if (!txnSessionId) throw new Error("Manual transaction session was not initialized");
-          const executeInTransaction = (sessionId: string) =>
-            useAgentResultSession
-              ? api.executeInManualTransaction(sessionId, sqlToExecute, executionDatabase, executionSchema, agentProtocolQueryResultMaxRows(queryResultMaxRows), useOracleLobPreview, pageLimit, options?.pagination?.sessionId, classificationSql)
-              : api.executeInManualTransaction(sessionId, sqlToExecute, executionDatabase, executionSchema, pageLimit ?? agentProtocolQueryResultMaxRows(queryResultMaxRows), useOracleLobPreview, undefined, undefined, classificationSql);
-          try {
-            return await executeInTransaction(txnSessionId);
-          } catch (error) {
-            if (options?.pagination?.sessionId || manualTransactionRecoveryAttempted || !isManualTransactionSessionExpired(error)) throw error;
-            manualTransactionRecoveryAttempted = true;
-            // The expired session was discarded by the backend; the replacement
-            // session starts fresh, so the old sticky state resets with it.
-            clearOracleTxnPossiblyDirty(tab);
-            tab.txnSessionId = undefined;
-            tab.txnAutoRolledBack = true;
-            queryExecutionLog("info", "manual-txn:expired-recover", { traceId, elapsed: elapsed() });
-            const refreshedSessionId = await api.beginManualTransaction(executionConnectionId, executionDatabase, executionSchema, executionCatalog);
-            tab.txnSessionId = refreshedSessionId;
-            queryExecutionLog("info", "manual-txn:restarted", { traceId, txnSessionId: refreshedSessionId, elapsed: elapsed() });
-            return executeInTransaction(refreshedSessionId);
-          }
-        })();
-      } else {
+      const executeWithoutManualTransaction = (): Promise<QueryResult[]> => {
         queryExecutionLog("info", "execute-multi:start", { traceId, elapsed: elapsed() });
         // Query and data tabs use a tab-scoped pool so repeated executions keep
         // connection-local state and avoid MySQL pool resets on every refresh.
@@ -5429,22 +5466,81 @@ export const useQueryStore = defineStore("query", () => {
           clientSession: Boolean(executionClientSessionId),
         });
         executionDispatched = true;
-        executionPromise =
-          tab.batchSqlExecution && tab.batchSqlExecution.total > 1
-            ? api.executeMultiWithProgress(
-                executionConnectionId,
-                executionDatabase,
-                sqlToExecute,
-                (progress) => {
-                  const current = findExecutionTab(id);
-                  if (current?.executionId === executionId) {
-                    applyBatchSqlProgress(current, progress, continueOnBatchError, batchResume?.startStatementIndex ?? 0);
-                  }
-                },
-                executionSchema,
-                { ...executionOptions, executionId },
-              )
-            : api.executeMulti(executionConnectionId, executionDatabase, sqlToExecute, executionSchema, executionId, executionOptions);
+        return tab.batchSqlExecution && tab.batchSqlExecution.total > 1
+          ? api.executeMultiWithProgress(
+              executionConnectionId,
+              executionDatabase,
+              sqlToExecute,
+              (progress) => {
+                const current = findExecutionTab(id);
+                if (current?.executionId === executionId) {
+                  applyBatchSqlProgress(current, progress, continueOnBatchError, batchResume?.startStatementIndex ?? 0);
+                }
+              },
+              executionSchema,
+              { ...executionOptions, executionId },
+            )
+          : api.executeMulti(executionConnectionId, executionDatabase, sqlToExecute, executionSchema, executionId, executionOptions);
+      };
+
+      let executionPromise: Promise<QueryResult[]>;
+      if (tab.autoCommit === false) {
+        let useLegacyReadFallback = false;
+        if (!tab.txnSessionId) {
+          queryExecutionLog("info", "begin-manual-txn:start", { traceId, elapsed: elapsed() });
+          try {
+            tab.txnSessionId = await api.beginManualTransaction(executionConnectionId, executionDatabase, executionSchema, executionCatalog);
+            queryExecutionLog("info", "begin-manual-txn:done", { traceId, txnSessionId: tab.txnSessionId, elapsed: elapsed() });
+          } catch (error) {
+            const risk = classifySqlRisk(sqlToExecute, { dialect: effectiveDbType }).risk;
+            if (!isUnsupportedManualTransactionMethod(error) || risk !== "read") throw error;
+            tab.autoCommit = true;
+            clearManualTransactionSession(tab);
+            useLegacyReadFallback = true;
+            queryExecutionLog("warn", "begin-manual-txn:legacy-read-fallback", {
+              traceId,
+              elapsed: elapsed(),
+              databaseType: effectiveDbType,
+            });
+          }
+        }
+        if (useLegacyReadFallback) {
+          executionPromise = executeWithoutManualTransaction();
+        } else {
+          queryExecutionLog("info", "execute-in-txn:invoke", { traceId, txnSessionId: tab.txnSessionId, elapsed: elapsed() });
+          executionDispatched = true;
+          // Only an initial manual execution classifies the user SQL (Oracle-only).
+          // A later cursor-page fetch must neither set nor clear the sticky bit.
+          const isInitialOracleManualExecution = effectiveDbType === "oracle" && !options?.pagination?.sessionId;
+          const classificationSql = isInitialOracleManualExecution ? queryBaseSql : undefined;
+          let manualTransactionRecoveryAttempted = false;
+          executionPromise = (async () => {
+            const txnSessionId = tab.txnSessionId;
+            if (!txnSessionId) throw new Error("Manual transaction session was not initialized");
+            const executeInTransaction = (sessionId: string) =>
+              useAgentResultSession
+                ? api.executeInManualTransaction(sessionId, sqlToExecute, executionDatabase, executionSchema, agentProtocolQueryResultMaxRows(queryResultMaxRows), useOracleLobPreview, pageLimit, options?.pagination?.sessionId, classificationSql)
+                : api.executeInManualTransaction(sessionId, sqlToExecute, executionDatabase, executionSchema, pageLimit ?? agentProtocolQueryResultMaxRows(queryResultMaxRows), useOracleLobPreview, undefined, undefined, classificationSql);
+            try {
+              return await executeInTransaction(txnSessionId);
+            } catch (error) {
+              if (options?.pagination?.sessionId || manualTransactionRecoveryAttempted || !isManualTransactionSessionExpired(error)) throw error;
+              manualTransactionRecoveryAttempted = true;
+              // The expired session was discarded by the backend; the replacement
+              // session starts fresh, so the old sticky state resets with it.
+              clearOracleTxnPossiblyDirty(tab);
+              tab.txnSessionId = undefined;
+              tab.txnAutoRolledBack = true;
+              queryExecutionLog("info", "manual-txn:expired-recover", { traceId, elapsed: elapsed() });
+              const refreshedSessionId = await api.beginManualTransaction(executionConnectionId, executionDatabase, executionSchema, executionCatalog);
+              tab.txnSessionId = refreshedSessionId;
+              queryExecutionLog("info", "manual-txn:restarted", { traceId, txnSessionId: refreshedSessionId, elapsed: elapsed() });
+              return executeInTransaction(refreshedSessionId);
+            }
+          })();
+        }
+      } else {
+        executionPromise = executeWithoutManualTransaction();
       }
       const annotatedResults = annotateQueryResultSources(markQueryResultsRowsRaw(await withFrontendQueryTimeout(executionPromise, frontendTimeoutSecs, t("editor.queryTimeoutError", { seconds: frontendTimeoutSecs }))), queryBaseSql, sourceLabelDatabase, effectiveDbType, options?.sourceOffset);
       const results = offsetBatchQueryResultIndexes(annotatedResults.results, batchResume?.startStatementIndex ?? 0);
@@ -5647,6 +5743,7 @@ export const useQueryStore = defineStore("query", () => {
             traceId,
             elapsed,
             timeoutSecs: queryTimeoutSecs,
+            txnSessionId: current.autoCommit === false ? current.txnSessionId : undefined,
           });
         }
         queryExecutionLog("info", "result:assigned", {
@@ -6896,6 +6993,7 @@ export const useQueryStore = defineStore("query", () => {
     updateEditorViewport,
     updateEditorSelection,
     updateObjectBrowserViewport,
+    updateNacosConfigEditorViewport,
     setAutoCommit,
     commitTransaction,
     rollbackTransaction,
@@ -6969,6 +7067,7 @@ export const useQueryStore = defineStore("query", () => {
     exportResultArchive,
     importResultArchive,
     fetchTabResultForExport,
+    countTabResultRows,
     buildQueryResultExportRequest,
     exportQuerySqlDirect,
     getResourceLifecycleDiagnostics: () => resourceLifecycleDiagnostics(tabs.value),
