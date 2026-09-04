@@ -10,11 +10,50 @@ export const SINGLE_IDENTIFIER_PATTERN = /^[A-Za-z0-9_$-]+$/;
 const LEADING_SEPARATOR_PATTERN = /^[_$-]+/;
 const TRAILING_SEPARATOR_PATTERN = /[_$-]+$/;
 const SEPARATOR_RUN_PATTERN = /[_$-]+/;
-// Word boundaries inside an identifier segment: lower→Upper (userName),
-// UPPER→Upper+lower (HTTPServer), and digit→letter (user2Name / sha256Hash).
-// Letter→digit is deliberately NOT a boundary so digit runs stay attached to
-// the preceding word (ipv4, sha256, field1).
-const WORD_BOUNDARY_PATTERN = /(?<=[a-z])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])|(?<=[0-9])(?=[A-Za-z])/;
+
+function isAsciiLowercase(code: number): boolean {
+  return code >= 97 && code <= 122;
+}
+
+function isAsciiUppercase(code: number): boolean {
+  return code >= 65 && code <= 90;
+}
+
+function isAsciiDigit(code: number): boolean {
+  return code >= 48 && code <= 57;
+}
+
+/**
+ * Split word boundaries without lookbehind so the desktop bundle remains
+ * compatible with older WebKit/JavaScriptCore runtimes.
+ *
+ * Boundaries are lower→Upper (userName), UPPER→Upper+lower (HTTPServer), and
+ * digit→letter (user2Name / sha256Hash). Letter→digit is deliberately NOT a
+ * boundary so digit runs stay attached to the preceding word.
+ */
+function splitIdentifierSegment(segment: string): string[] {
+  if (segment.length < 2) return [segment];
+
+  const words: string[] = [];
+  let wordStart = 0;
+
+  for (let index = 1; index < segment.length; index += 1) {
+    const previous = segment.charCodeAt(index - 1);
+    const current = segment.charCodeAt(index);
+    const next = segment.charCodeAt(index + 1);
+    const lowerToUpper = isAsciiLowercase(previous) && isAsciiUppercase(current);
+    const acronymBoundary = isAsciiUppercase(previous) && isAsciiUppercase(current) && isAsciiLowercase(next);
+    const digitToLetter = isAsciiDigit(previous) && (isAsciiLowercase(current) || isAsciiUppercase(current));
+
+    if (lowerToUpper || acronymBoundary || digitToLetter) {
+      words.push(segment.slice(wordStart, index));
+      wordStart = index;
+    }
+  }
+
+  words.push(segment.slice(wordStart));
+  return words;
+}
 
 interface IdentifierParts {
   leading: string;
@@ -30,7 +69,7 @@ function splitIntoWords(core: string): IdentifierParts {
   const inner = core.slice(leading.length, core.length - trailing.length);
   const words = inner
     .split(SEPARATOR_RUN_PATTERN)
-    .flatMap((segment) => segment.split(WORD_BOUNDARY_PATTERN))
+    .flatMap(splitIdentifierSegment)
     .filter((word) => word.length > 0);
   return { leading, words, trailing };
 }
