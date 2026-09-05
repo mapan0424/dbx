@@ -1263,6 +1263,7 @@ export interface QueryTab {
     | "sqlserver-trace"
     | "mysql-dashboard"
     | "postgres-dashboard"
+    | "xugu-dashboard"
     | "dolt-version-control";
   /** Ephemeral navigation intent; it is consumed by HBaseBrowser and is not persisted. */
   hbaseCreateTableOnOpen?: boolean;

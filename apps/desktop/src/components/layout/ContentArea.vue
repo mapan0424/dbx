@@ -116,6 +116,7 @@ const ProcessListPanel = defineAsyncComponent(() => import("@/components/admin/P
 const SqlServerActivityTracePanel = defineAsyncComponent(() => import("@/components/admin/SqlServerActivityTracePanel.vue"));
 const MySqlDashboard = defineAsyncComponent(() => import("@/components/admin/MySqlDashboard.vue"));
 const PostgresDashboard = defineAsyncComponent(() => import("@/components/admin/PostgresDashboard.vue"));
+const XuguServerDashboard = defineAsyncComponent(() => import("@/components/admin/XuguServerDashboard.vue"));
 const DamengJobAdmin = defineAsyncComponent(() => import("@/components/admin/DamengJobAdmin.vue"));
 const DamengUserAdmin = defineAsyncComponent(() => import("@/components/admin/DamengUserAdmin.vue"));
 const DamengRoleAdmin = defineAsyncComponent(() => import("@/components/admin/DamengRoleAdmin.vue"));
@@ -2554,6 +2555,12 @@ defineExpose({
     <template v-else-if="activeTab.mode === 'postgres-dashboard'">
       <div class="min-h-0 flex-1">
         <PostgresDashboard :key="activeTab.id" :connection-id="activeTab.connectionId" />
+      </div>
+    </template>
+
+    <template v-else-if="activeTab.mode === 'xugu-dashboard'">
+      <div class="min-h-0 flex-1">
+        <XuguServerDashboard :key="activeTab.id" :connection-id="activeTab.connectionId" />
       </div>
     </template>
 
