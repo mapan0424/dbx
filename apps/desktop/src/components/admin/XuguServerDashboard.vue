@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, ref } from "vue";
+import { computed, onMounted, onUnmounted, reactive, ref } from "vue";
 import { Activity, AlertTriangle, Database, Gauge, HardDrive, Loader2, RefreshCcw, Server, Users } from "@lucide/vue";
 import { useI18n } from "vue-i18n";
 import { Badge } from "@/components/ui/badge";
@@ -59,6 +59,19 @@ const lockModes = ref<XuguLockModeSummary[]>([]);
 const tablespaces = ref<XuguTablespaceSummary[]>([]);
 const lockWaits = ref("");
 const lockOwners = ref("");
+const availability = reactive({
+  version: false,
+  nodes: false,
+  runInfo: false,
+  sessions: false,
+  activeSessions: false,
+  transactions: false,
+  lockWaits: false,
+  memory: false,
+  sessionStatuses: false,
+  lockModes: false,
+  tablespaces: false,
+});
 const refreshSeconds = ref(5);
 let refreshTimer: ReturnType<typeof setInterval> | null = null;
 
@@ -68,28 +81,29 @@ const supported = computed(() => connectionSupportsXuguServerDashboard(connectio
 const runInfoByNode = computed(() => new Map(runInfo.value.map((entry) => [entry.nodeId, entry])));
 const sessionsByNode = computed(() => new Map(sessions.value.map((entry) => [entry.nodeId, entry])));
 const transactionsByNode = computed(() => new Map(transactions.value.map((entry) => [entry.nodeId, entry])));
-const onlineNodes = computed(() => nodes.value.filter((node) => xuguClusterNodeStateLabel(node.state) === "running").length);
-const totalSessions = computed(() => sessions.value.reduce((sum, row) => sum + numeric(row.sessions), 0));
-const activeSessions = computed(() => sessions.value.reduce((sum, row) => sum + numeric(row.activeSessions), 0));
-const activeTransactions = computed(() => {
+const onlineNodes = computed<number | null>(() => (availability.nodes ? nodes.value.filter((node) => xuguClusterNodeStateLabel(node.state) === "running").length : null));
+const totalSessions = computed<number | null>(() => (availability.sessions ? sessions.value.reduce((sum, row) => sum + numeric(row.sessions), 0) : null));
+const activeSessions = computed<number | null>(() => (availability.activeSessions ? sessions.value.reduce((sum, row) => sum + numeric(row.activeSessions), 0) : null));
+const activeTransactions = computed<number | null>(() => {
+  if (!availability.transactions && !availability.runInfo) return null;
   const values = transactions.value.length > 0 ? transactions.value.map((row) => row.activeTransactions) : runInfo.value.map((row) => row.activeTransactions);
   return values.reduce((sum, value) => sum + numeric(value), 0);
 });
-const bufferTotalBytes = computed(() => sum(memory.value, "bufferTotalBytes"));
-const bufferFreeBytes = computed(() => sum(memory.value, "bufferFreeBytes"));
-const bufferDirtyBytes = computed(() => sum(memory.value, "bufferDirtyBytes"));
-const sgaTotalBytes = computed(() => sum(memory.value, "sgaTotalBytes"));
-const sgaFreeBytes = computed(() => sum(memory.value, "sgaFreeBytes"));
-const swapTotalBytes = computed(() => sum(memory.value, "swapTotalBytes"));
-const swapFreeBytes = computed(() => sum(memory.value, "swapFreeBytes"));
-const diskReadBytes = computed(() => sum(runInfo.value, "diskReadBytes"));
-const diskWriteBytes = computed(() => sum(runInfo.value, "diskWriteBytes"));
-const freeStores = computed(() => sum(runInfo.value, "freeStores"));
-const transactionSpan = computed(() => runInfo.value.reduce((total, entry) => total + Math.max(0, numeric(entry.maxTransactionId) - numeric(entry.minTransactionId)), 0));
-const walBacklog = computed(() => runInfo.value.reduce((total, entry) => total + Math.max(0, numeric(entry.xlogWritePosition) - numeric(entry.xlogCheckpointPosition)), 0));
-const totalDatafiles = computed(() => sum(tablespaces.value, "datafiles"));
-const mediaErrors = computed(() => tablespaces.value.filter((entry) => ["1", "TRUE", "Y"].includes(entry.mediaError.trim().toUpperCase())).length);
-const dataOrTempFreeBytes = computed(() => tablespaces.value.filter((entry) => /DATA|TEMP/i.test(entry.spaceType)).reduce((total, entry) => total + numeric(entry.freeBytes), 0));
+const bufferTotalBytes = computed(() => (availability.memory ? sum(memory.value, "bufferTotalBytes") : null));
+const bufferFreeBytes = computed(() => (availability.memory ? sum(memory.value, "bufferFreeBytes") : null));
+const bufferDirtyBytes = computed(() => (availability.memory ? sum(memory.value, "bufferDirtyBytes") : null));
+const sgaTotalBytes = computed(() => (availability.memory ? sum(memory.value, "sgaTotalBytes") : null));
+const sgaFreeBytes = computed(() => (availability.memory ? sum(memory.value, "sgaFreeBytes") : null));
+const swapTotalBytes = computed(() => (availability.memory ? sum(memory.value, "swapTotalBytes") : null));
+const swapFreeBytes = computed(() => (availability.memory ? sum(memory.value, "swapFreeBytes") : null));
+const diskReadBytes = computed(() => (availability.runInfo ? sum(runInfo.value, "diskReadBytes") : null));
+const diskWriteBytes = computed(() => (availability.runInfo ? sum(runInfo.value, "diskWriteBytes") : null));
+const freeStores = computed(() => (availability.runInfo ? sum(runInfo.value, "freeStores") : null));
+const transactionSpan = computed<number | null>(() => (availability.runInfo ? runInfo.value.reduce((total, entry) => total + Math.max(0, numeric(entry.maxTransactionId) - numeric(entry.minTransactionId)), 0) : null));
+const walBacklog = computed<number | null>(() => (availability.runInfo ? runInfo.value.reduce((total, entry) => total + Math.max(0, numeric(entry.xlogWritePosition) - numeric(entry.xlogCheckpointPosition)), 0) : null));
+const totalDatafiles = computed(() => (availability.tablespaces ? sum(tablespaces.value, "datafiles") : null));
+const mediaErrors = computed<number | null>(() => (availability.tablespaces ? tablespaces.value.filter((entry) => ["1", "TRUE", "Y"].includes(entry.mediaError.trim().toUpperCase())).length : null));
+const dataOrTempFreeBytes = computed<number | null>(() => (availability.tablespaces ? tablespaces.value.filter((entry) => /DATA|TEMP/i.test(entry.spaceType)).reduce((total, entry) => total + numeric(entry.freeBytes), 0) : null));
 
 function numeric(value: string): number {
   const parsed = Number(value);
@@ -100,7 +114,8 @@ function sum<T extends Record<string, string>>(entries: T[], key: keyof T): numb
   return entries.reduce((total, entry) => total + numeric(entry[key]), 0);
 }
 
-function percentage(total: number, available: number): number {
+function percentage(total: number | null, available: number | null): number {
+  if (total === null || available === null) return 0;
   if (total <= 0) return 0;
   return Math.max(0, Math.min(100, ((total - available) / total) * 100));
 }
@@ -114,7 +129,8 @@ function formatBytes(value: number): string {
   return `${scaled >= 100 || index === 0 ? scaled.toFixed(0) : scaled.toFixed(1)} ${units[index]}`;
 }
 
-function sessionStatusCount(status: "idle" | "executing"): number {
+function sessionStatusCount(status: "idle" | "executing"): number | null {
+  if (!availability.sessionStatuses) return null;
   return sessionStatuses.value
     .filter((entry) => {
       const normalized = Math.abs(numeric(entry.status)) % 1000;
@@ -123,11 +139,16 @@ function sessionStatusCount(status: "idle" | "executing"): number {
     .reduce((total, entry) => total + numeric(entry.sessions), 0);
 }
 
-function otherSessionCount(): number {
-  return Math.max(0, totalSessions.value - sessionStatusCount("idle") - sessionStatusCount("executing"));
+function otherSessionCount(): number | null {
+  if (totalSessions.value === null || !availability.sessionStatuses) return null;
+  const idle = sessionStatusCount("idle");
+  const executing = sessionStatusCount("executing");
+  if (idle === null || executing === null) return null;
+  return Math.max(0, totalSessions.value - idle - executing);
 }
 
-function lockModeCount(lockMode: string): number {
+function lockModeCount(lockMode: string): number | null {
+  if (!availability.lockModes) return null;
   return lockModes.value.filter((entry) => entry.lockMode.toUpperCase() === lockMode).reduce((total, entry) => total + numeric(entry.locks), 0);
 }
 
@@ -184,9 +205,23 @@ async function load() {
     }
 
     const [versionResult, nodeResult, runInfoResult, sessionResult, activeSessionResult, transactionResult, lockResult, memoryResult, sessionStatusResult, lockModeResult, tablespaceResult] = results;
+    availability.version = versionResult.status === "fulfilled";
+    availability.nodes = nodeResult.status === "fulfilled";
+    availability.runInfo = runInfoResult.status === "fulfilled";
+    availability.sessions = sessionResult.status === "fulfilled";
+    availability.activeSessions = activeSessionResult.status === "fulfilled";
+    availability.transactions = transactionResult.status === "fulfilled";
+    availability.lockWaits = lockResult.status === "fulfilled";
+    availability.memory = memoryResult.status === "fulfilled";
+    availability.sessionStatuses = sessionStatusResult.status === "fulfilled";
+    availability.lockModes = lockModeResult.status === "fulfilled";
+    availability.tablespaces = tablespaceResult.status === "fulfilled";
     if (versionResult.status === "fulfilled") version.value = xuguVersionFromResult(versionResult.value);
+    else version.value = "";
     if (nodeResult.status === "fulfilled") nodes.value = xuguClusterNodesFromResult(nodeResult.value);
+    else nodes.value = [];
     if (runInfoResult.status === "fulfilled") runInfo.value = xuguRunInfoFromResult(runInfoResult.value);
+    else runInfo.value = [];
     const activeByNode = activeSessionResult.status === "fulfilled" ? new Map(xuguSessionSummaryFromResult(activeSessionResult.value).map((row) => [row.nodeId, row])) : new Map();
     sessions.value =
       sessionResult.status === "fulfilled"
@@ -196,14 +231,22 @@ async function load() {
           })
         : [];
     if (transactionResult.status === "fulfilled") transactions.value = xuguTransactionSummaryFromResult(transactionResult.value);
+    else transactions.value = [];
     if (lockResult.status === "fulfilled") {
       lockWaits.value = xuguScalarFromResult(lockResult.value, "LOCK_WAITS");
       lockOwners.value = xuguScalarFromResult(lockResult.value, "LOCK_OWNERS");
+    } else {
+      lockWaits.value = "";
+      lockOwners.value = "";
     }
     if (memoryResult.status === "fulfilled") memory.value = xuguMemoryStatusFromResult(memoryResult.value);
+    else memory.value = [];
     if (sessionStatusResult.status === "fulfilled") sessionStatuses.value = xuguSessionStatusSummaryFromResult(sessionStatusResult.value);
+    else sessionStatuses.value = [];
     if (lockModeResult.status === "fulfilled") lockModes.value = xuguLockModeSummaryFromResult(lockModeResult.value);
+    else lockModes.value = [];
     if (tablespaceResult.status === "fulfilled") tablespaces.value = xuguTablespaceSummaryFromResult(tablespaceResult.value);
+    else tablespaces.value = [];
   } catch (cause: any) {
     error.value = cause?.message || String(cause);
   } finally {
@@ -280,18 +323,18 @@ onUnmounted(stopAutoRefresh);
         <div class="rounded-lg border bg-card p-3">
           <div class="flex items-center gap-1.5 text-xs text-muted-foreground"><Server class="h-3.5 w-3.5" />{{ t("xuguServerDashboard.onlineNodes") }}</div>
           <div class="mt-2 text-xl font-semibold">
-            {{ onlineNodes }}<span class="ml-1 text-xs font-normal text-muted-foreground">/ {{ nodes.length }}</span>
+            {{ onlineNodes === null ? "—" : onlineNodes }}<span v-if="onlineNodes !== null" class="ml-1 text-xs font-normal text-muted-foreground">/ {{ nodes.length }}</span>
           </div>
         </div>
         <div class="rounded-lg border bg-card p-3">
           <div class="flex items-center gap-1.5 text-xs text-muted-foreground"><Users class="h-3.5 w-3.5" />{{ t("xuguServerDashboard.sessions") }}</div>
           <div class="mt-2 text-xl font-semibold">
-            {{ totalSessions }}<span class="ml-1 text-xs font-normal text-muted-foreground">{{ t("xuguServerDashboard.activeCount", { count: activeSessions }) }}</span>
+            {{ totalSessions === null ? "—" : totalSessions }}<span class="ml-1 text-xs font-normal text-muted-foreground">{{ activeSessions === null ? "—" : t("xuguServerDashboard.activeCount", { count: activeSessions }) }}</span>
           </div>
         </div>
         <div class="rounded-lg border bg-card p-3">
           <div class="flex items-center gap-1.5 text-xs text-muted-foreground"><Activity class="h-3.5 w-3.5" />{{ t("xuguServerDashboard.transactions") }}</div>
-          <div class="mt-2 text-xl font-semibold">{{ activeTransactions }}</div>
+          <div class="mt-2 text-xl font-semibold">{{ activeTransactions === null ? "—" : activeTransactions }}</div>
         </div>
         <div class="rounded-lg border bg-card p-3">
           <div class="flex items-center gap-1.5 text-xs text-muted-foreground"><Database class="h-3.5 w-3.5" />{{ t("xuguServerDashboard.lockWaits") }}</div>
@@ -309,29 +352,29 @@ onUnmounted(stopAutoRefresh);
             <div>
               <div class="mb-1.5 flex items-center justify-between text-xs">
                 <span>{{ t("xuguServerDashboard.bufferPool") }}</span
-                ><span class="text-muted-foreground">{{ formatBytes(bufferTotalBytes - bufferFreeBytes) }} / {{ formatBytes(bufferTotalBytes) }}</span>
+                ><span class="text-muted-foreground">{{ bufferTotalBytes === null || bufferFreeBytes === null ? "—" : `${formatBytes(bufferTotalBytes - bufferFreeBytes)} / ${formatBytes(bufferTotalBytes)}` }}</span>
               </div>
               <div class="h-2 overflow-hidden rounded-full bg-muted"><div class="h-full rounded-full bg-primary" :style="{ width: `${percentage(bufferTotalBytes, bufferFreeBytes)}%` }" /></div>
               <div class="mt-1.5 flex justify-between text-[11px] text-muted-foreground">
-                <span>{{ t("xuguServerDashboard.usedPercent", { percent: percentage(bufferTotalBytes, bufferFreeBytes).toFixed(1) }) }}</span
-                ><span>{{ t("xuguServerDashboard.dirtyPages", { value: formatBytes(bufferDirtyBytes) }) }}</span>
+                <span>{{ bufferTotalBytes === null || bufferFreeBytes === null ? "—" : t("xuguServerDashboard.usedPercent", { percent: percentage(bufferTotalBytes, bufferFreeBytes).toFixed(1) }) }}</span
+                ><span>{{ bufferDirtyBytes === null ? "—" : t("xuguServerDashboard.dirtyPages", { value: formatBytes(bufferDirtyBytes) }) }}</span>
               </div>
             </div>
             <div>
               <div class="mb-1.5 flex items-center justify-between text-xs">
                 <span>{{ t("xuguServerDashboard.sga") }}</span
-                ><span class="text-muted-foreground">{{ formatBytes(sgaTotalBytes - sgaFreeBytes) }} / {{ formatBytes(sgaTotalBytes) }}</span>
+                ><span class="text-muted-foreground">{{ sgaTotalBytes === null || sgaFreeBytes === null ? "—" : `${formatBytes(sgaTotalBytes - sgaFreeBytes)} / ${formatBytes(sgaTotalBytes)}` }}</span>
               </div>
               <div class="h-2 overflow-hidden rounded-full bg-muted"><div class="h-full rounded-full bg-sky-500" :style="{ width: `${percentage(sgaTotalBytes, sgaFreeBytes)}%` }" /></div>
-              <div class="mt-1.5 text-[11px] text-muted-foreground">{{ t("xuguServerDashboard.usedPercent", { percent: percentage(sgaTotalBytes, sgaFreeBytes).toFixed(1) }) }}</div>
+              <div class="mt-1.5 text-[11px] text-muted-foreground">{{ sgaTotalBytes === null || sgaFreeBytes === null ? "—" : t("xuguServerDashboard.usedPercent", { percent: percentage(sgaTotalBytes, sgaFreeBytes).toFixed(1) }) }}</div>
             </div>
             <div>
               <div class="mb-1.5 flex items-center justify-between text-xs">
                 <span>{{ t("xuguServerDashboard.swap") }}</span
-                ><span class="text-muted-foreground">{{ formatBytes(swapTotalBytes - swapFreeBytes) }} / {{ formatBytes(swapTotalBytes) }}</span>
+                ><span class="text-muted-foreground">{{ swapTotalBytes === null || swapFreeBytes === null ? "—" : `${formatBytes(swapTotalBytes - swapFreeBytes)} / ${formatBytes(swapTotalBytes)}` }}</span>
               </div>
               <div class="h-2 overflow-hidden rounded-full bg-muted"><div class="h-full rounded-full bg-amber-500" :style="{ width: `${percentage(swapTotalBytes, swapFreeBytes)}%` }" /></div>
-              <div class="mt-1.5 text-[11px] text-muted-foreground">{{ t("xuguServerDashboard.usedPercent", { percent: percentage(swapTotalBytes, swapFreeBytes).toFixed(1) }) }}</div>
+              <div class="mt-1.5 text-[11px] text-muted-foreground">{{ swapTotalBytes === null || swapFreeBytes === null ? "—" : t("xuguServerDashboard.usedPercent", { percent: percentage(swapTotalBytes, swapFreeBytes).toFixed(1) }) }}</div>
             </div>
           </div>
         </section>
@@ -344,27 +387,27 @@ onUnmounted(stopAutoRefresh);
           <div class="grid grid-cols-2 gap-px bg-border sm:grid-cols-4">
             <div class="bg-card p-3">
               <div class="text-xs text-muted-foreground">{{ t("xuguServerDashboard.diskRead") }}</div>
-              <div class="mt-1.5 text-lg font-semibold">{{ formatBytes(diskReadBytes) }}</div>
+              <div class="mt-1.5 text-lg font-semibold">{{ diskReadBytes === null ? "—" : formatBytes(diskReadBytes) }}</div>
             </div>
             <div class="bg-card p-3">
               <div class="text-xs text-muted-foreground">{{ t("xuguServerDashboard.diskWrite") }}</div>
-              <div class="mt-1.5 text-lg font-semibold">{{ formatBytes(diskWriteBytes) }}</div>
+              <div class="mt-1.5 text-lg font-semibold">{{ diskWriteBytes === null ? "—" : formatBytes(diskWriteBytes) }}</div>
             </div>
             <div class="bg-card p-3">
               <div class="text-xs text-muted-foreground">{{ t("xuguServerDashboard.walPending") }}</div>
-              <div class="mt-1.5 text-lg font-semibold">{{ formatBytes(walBacklog) }}</div>
+              <div class="mt-1.5 text-lg font-semibold">{{ walBacklog === null ? "—" : formatBytes(walBacklog) }}</div>
             </div>
             <div class="bg-card p-3">
               <div class="text-xs text-muted-foreground">{{ t("xuguServerDashboard.transactionSpan") }}</div>
-              <div class="mt-1.5 text-lg font-semibold">{{ transactionSpan }}</div>
+              <div class="mt-1.5 text-lg font-semibold">{{ transactionSpan === null ? "—" : transactionSpan }}</div>
             </div>
             <div class="col-span-2 bg-card p-3">
               <div class="text-xs text-muted-foreground">{{ t("xuguServerDashboard.freeStores") }}</div>
-              <div class="mt-1.5 text-lg font-semibold">{{ freeStores }}</div>
+              <div class="mt-1.5 text-lg font-semibold">{{ freeStores === null ? "—" : freeStores }}</div>
             </div>
             <div class="col-span-2 bg-card p-3">
               <div class="text-xs text-muted-foreground">{{ t("xuguServerDashboard.datafiles") }}</div>
-              <div class="mt-1.5 text-lg font-semibold">{{ totalDatafiles }}</div>
+              <div class="mt-1.5 text-lg font-semibold">{{ totalDatafiles === null ? "—" : totalDatafiles }}</div>
             </div>
           </div>
         </section>
@@ -379,15 +422,15 @@ onUnmounted(stopAutoRefresh);
           <div class="grid grid-cols-3 gap-px bg-border">
             <div class="bg-card p-3">
               <div class="text-xs text-muted-foreground">{{ t("xuguServerDashboard.idleSessions") }}</div>
-              <div class="mt-1.5 text-lg font-semibold">{{ sessionStatusCount("idle") }}</div>
+              <div class="mt-1.5 text-lg font-semibold">{{ sessionStatusCount("idle") ?? "—" }}</div>
             </div>
             <div class="bg-card p-3">
               <div class="text-xs text-muted-foreground">{{ t("xuguServerDashboard.executingSessions") }}</div>
-              <div class="mt-1.5 text-lg font-semibold">{{ sessionStatusCount("executing") }}</div>
+              <div class="mt-1.5 text-lg font-semibold">{{ sessionStatusCount("executing") ?? "—" }}</div>
             </div>
             <div class="bg-card p-3">
               <div class="text-xs text-muted-foreground">{{ t("xuguServerDashboard.otherSessions") }}</div>
-              <div class="mt-1.5 text-lg font-semibold">{{ otherSessionCount() }}</div>
+              <div class="mt-1.5 text-lg font-semibold">{{ otherSessionCount() ?? "—" }}</div>
             </div>
           </div>
           <div class="grid grid-cols-2 gap-3 p-3 text-xs">
@@ -418,22 +461,22 @@ onUnmounted(stopAutoRefresh);
             </div>
             <div class="bg-card p-3">
               <div class="text-xs text-muted-foreground">{{ t("xuguServerDashboard.tablespaces") }}</div>
-              <div class="mt-1.5 text-lg font-semibold">{{ tablespaces.length }}</div>
+              <div class="mt-1.5 text-lg font-semibold">{{ availability.tablespaces ? tablespaces.length : "—" }}</div>
             </div>
             <div class="bg-card p-3">
               <div class="text-xs text-muted-foreground">{{ t("xuguServerDashboard.mediaErrors") }}</div>
-              <div class="mt-1.5 text-lg font-semibold" :class="mediaErrors > 0 ? 'text-destructive' : ''">{{ mediaErrors }}</div>
+              <div class="mt-1.5 text-lg font-semibold" :class="mediaErrors !== null && mediaErrors > 0 ? 'text-destructive' : ''">{{ mediaErrors ?? "—" }}</div>
             </div>
           </div>
           <div class="border-t p-3">
             <div class="mb-2 flex items-center justify-between text-xs">
               <span class="text-muted-foreground">{{ t("xuguServerDashboard.lockModes") }}</span
-              ><span class="text-muted-foreground">{{ t("xuguServerDashboard.dataTempFree", { value: formatBytes(dataOrTempFreeBytes) }) }}</span>
+              ><span class="text-muted-foreground">{{ dataOrTempFreeBytes === null ? "—" : t("xuguServerDashboard.dataTempFree", { value: formatBytes(dataOrTempFreeBytes) }) }}</span>
             </div>
             <div class="grid grid-cols-5 gap-2 text-center text-xs">
               <div v-for="mode in ['S', 'X', 'IS', 'IX', 'SIX']" :key="mode" class="rounded-md bg-muted/50 px-2 py-1.5">
                 <div class="text-muted-foreground">{{ mode }}</div>
-                <div class="mt-0.5 font-semibold">{{ lockModeCount(mode) }}</div>
+                <div class="mt-0.5 font-semibold">{{ lockModeCount(mode) ?? "—" }}</div>
               </div>
             </div>
             <div class="mt-2 text-[11px] text-muted-foreground">{{ t("xuguServerDashboard.rowLockLimit") }}</div>
@@ -478,10 +521,10 @@ onUnmounted(stopAutoRefresh);
                   {{ valueFor(sessionsByNode, node.nodeId, "sessions") }}<span class="ml-1 text-muted-foreground">/ {{ valueFor(sessionsByNode, node.nodeId, "activeSessions") }}</span>
                 </td>
                 <td class="px-3 py-2">{{ transactionsByNode.has(node.nodeId) ? valueFor(transactionsByNode, node.nodeId, "activeTransactions") : valueFor(runInfoByNode, node.nodeId, "activeTransactions") }}</td>
-                <td class="px-3 py-2">{{ formatBytes(numeric(valueFor(runInfoByNode, node.nodeId, "diskReadBytes"))) }}</td>
-                <td class="px-3 py-2">{{ formatBytes(numeric(valueFor(runInfoByNode, node.nodeId, "diskWriteBytes"))) }}</td>
-                <td class="px-3 py-2">{{ formatBytes(Math.max(0, numeric(valueFor(runInfoByNode, node.nodeId, "xlogWritePosition")) - numeric(valueFor(runInfoByNode, node.nodeId, "xlogCheckpointPosition")))) }}</td>
-                <td class="px-3 py-2">{{ valueFor(runInfoByNode, node.nodeId, "freeStores") }}</td>
+                <td class="px-3 py-2">{{ availability.runInfo ? formatBytes(numeric(valueFor(runInfoByNode, node.nodeId, "diskReadBytes"))) : "—" }}</td>
+                <td class="px-3 py-2">{{ availability.runInfo ? formatBytes(numeric(valueFor(runInfoByNode, node.nodeId, "diskWriteBytes"))) : "—" }}</td>
+                <td class="px-3 py-2">{{ availability.runInfo ? formatBytes(Math.max(0, numeric(valueFor(runInfoByNode, node.nodeId, "xlogWritePosition")) - numeric(valueFor(runInfoByNode, node.nodeId, "xlogCheckpointPosition")))) : "—" }}</td>
+                <td class="px-3 py-2">{{ availability.runInfo ? valueFor(runInfoByNode, node.nodeId, "freeStores") : "—" }}</td>
                 <td class="px-3 py-2 text-muted-foreground">{{ node.bootTime || "—" }}</td>
               </tr>
               <tr v-if="!loading && nodes.length === 0">
