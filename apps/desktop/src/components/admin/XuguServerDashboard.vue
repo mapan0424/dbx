@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, ref } from "vue";
-import { Activity, AlertTriangle, Database, Gauge, Loader2, RefreshCcw, Server, Users } from "@lucide/vue";
+import { Activity, AlertTriangle, Database, Gauge, HardDrive, Loader2, RefreshCcw, Server, Users } from "@lucide/vue";
 import { useI18n } from "vue-i18n";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -9,23 +9,35 @@ import * as api from "@/lib/backend/api";
 import {
   XUGU_ACTIVE_SESSION_SQL,
   XUGU_CLUSTER_NODES_SQL,
+  XUGU_LOCK_MODE_SUMMARY_SQL,
   XUGU_LOCK_WAITS_SQL,
+  XUGU_MEMORY_STATUS_SQL,
   XUGU_RUN_INFO_SQL,
   XUGU_SESSION_SUMMARY_SQL,
+  XUGU_SESSION_STATUS_SUMMARY_SQL,
+  XUGU_TABLESPACE_SUMMARY_SQL,
   XUGU_TRANSACTION_SUMMARY_SQL,
   XUGU_VERSION_SQL,
   connectionSupportsXuguServerDashboard,
   xuguClusterNodeStateLabel,
   xuguClusterNodeTypeLabels,
   xuguClusterNodesFromResult,
+  xuguLockModeSummaryFromResult,
+  xuguMemoryStatusFromResult,
   xuguRunInfoFromResult,
   xuguScalarFromResult,
   xuguSessionSummaryFromResult,
+  xuguSessionStatusSummaryFromResult,
+  xuguTablespaceSummaryFromResult,
   xuguTransactionSummaryFromResult,
   xuguVersionFromResult,
   type XuguClusterNode,
+  type XuguLockModeSummary,
+  type XuguMemoryStatus,
   type XuguRunInfo,
   type XuguSessionSummary,
+  type XuguSessionStatusSummary,
+  type XuguTablespaceSummary,
   type XuguTransactionSummary,
 } from "@/lib/database/xuguServerStatus";
 
@@ -41,7 +53,12 @@ const nodes = ref<XuguClusterNode[]>([]);
 const runInfo = ref<XuguRunInfo[]>([]);
 const sessions = ref<XuguSessionSummary[]>([]);
 const transactions = ref<XuguTransactionSummary[]>([]);
+const memory = ref<XuguMemoryStatus[]>([]);
+const sessionStatuses = ref<XuguSessionStatusSummary[]>([]);
+const lockModes = ref<XuguLockModeSummary[]>([]);
+const tablespaces = ref<XuguTablespaceSummary[]>([]);
 const lockWaits = ref("");
+const lockOwners = ref("");
 const refreshSeconds = ref(5);
 let refreshTimer: ReturnType<typeof setInterval> | null = null;
 
@@ -58,10 +75,60 @@ const activeTransactions = computed(() => {
   const values = transactions.value.length > 0 ? transactions.value.map((row) => row.activeTransactions) : runInfo.value.map((row) => row.activeTransactions);
   return values.reduce((sum, value) => sum + numeric(value), 0);
 });
+const bufferTotalBytes = computed(() => sum(memory.value, "bufferTotalBytes"));
+const bufferFreeBytes = computed(() => sum(memory.value, "bufferFreeBytes"));
+const bufferDirtyBytes = computed(() => sum(memory.value, "bufferDirtyBytes"));
+const sgaTotalBytes = computed(() => sum(memory.value, "sgaTotalBytes"));
+const sgaFreeBytes = computed(() => sum(memory.value, "sgaFreeBytes"));
+const swapTotalBytes = computed(() => sum(memory.value, "swapTotalBytes"));
+const swapFreeBytes = computed(() => sum(memory.value, "swapFreeBytes"));
+const diskReadBytes = computed(() => sum(runInfo.value, "diskReadBytes"));
+const diskWriteBytes = computed(() => sum(runInfo.value, "diskWriteBytes"));
+const freeStores = computed(() => sum(runInfo.value, "freeStores"));
+const transactionSpan = computed(() => runInfo.value.reduce((total, entry) => total + Math.max(0, numeric(entry.maxTransactionId) - numeric(entry.minTransactionId)), 0));
+const walBacklog = computed(() => runInfo.value.reduce((total, entry) => total + Math.max(0, numeric(entry.xlogWritePosition) - numeric(entry.xlogCheckpointPosition)), 0));
+const totalDatafiles = computed(() => sum(tablespaces.value, "datafiles"));
+const mediaErrors = computed(() => tablespaces.value.filter((entry) => ["1", "TRUE", "Y"].includes(entry.mediaError.trim().toUpperCase())).length);
+const dataOrTempFreeBytes = computed(() => tablespaces.value.filter((entry) => /DATA|TEMP/i.test(entry.spaceType)).reduce((total, entry) => total + numeric(entry.freeBytes), 0));
 
 function numeric(value: string): number {
   const parsed = Number(value);
   return Number.isFinite(parsed) ? parsed : 0;
+}
+
+function sum<T extends Record<string, string>>(entries: T[], key: keyof T): number {
+  return entries.reduce((total, entry) => total + numeric(entry[key]), 0);
+}
+
+function percentage(total: number, available: number): number {
+  if (total <= 0) return 0;
+  return Math.max(0, Math.min(100, ((total - available) / total) * 100));
+}
+
+function formatBytes(value: number): string {
+  if (!Number.isFinite(value) || value < 0) return "—";
+  if (value === 0) return "0 B";
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  const index = Math.min(Math.floor(Math.log(value) / Math.log(1024)), units.length - 1);
+  const scaled = value / 1024 ** index;
+  return `${scaled >= 100 || index === 0 ? scaled.toFixed(0) : scaled.toFixed(1)} ${units[index]}`;
+}
+
+function sessionStatusCount(status: "idle" | "executing"): number {
+  return sessionStatuses.value
+    .filter((entry) => {
+      const normalized = Math.abs(numeric(entry.status)) % 1000;
+      return status === "idle" ? normalized === 112 : normalized === 114;
+    })
+    .reduce((total, entry) => total + numeric(entry.sessions), 0);
+}
+
+function otherSessionCount(): number {
+  return Math.max(0, totalSessions.value - sessionStatusCount("idle") - sessionStatusCount("executing"));
+}
+
+function lockModeCount(lockMode: string): number {
+  return lockModes.value.filter((entry) => entry.lockMode.toUpperCase() === lockMode).reduce((total, entry) => total + numeric(entry.locks), 0);
 }
 
 function nodeStateClass(node: XuguClusterNode): string {
@@ -103,6 +170,10 @@ async function load() {
       ["activeSessions", XUGU_ACTIVE_SESSION_SQL, 500],
       ["transactions", XUGU_TRANSACTION_SUMMARY_SQL, 500],
       ["lockWaits", XUGU_LOCK_WAITS_SQL, 1],
+      ["memory", XUGU_MEMORY_STATUS_SQL, 500],
+      ["sessionStatuses", XUGU_SESSION_STATUS_SUMMARY_SQL, 500],
+      ["lockModes", XUGU_LOCK_MODE_SUMMARY_SQL, 500],
+      ["tablespaces", XUGU_TABLESPACE_SUMMARY_SQL, 500],
     ] as const;
     const results = await Promise.allSettled(requests.map(([, sql, maxRows]) => query(sql, maxRows)));
     const failed = results.filter((result): result is PromiseRejectedResult => result.status === "rejected");
@@ -112,18 +183,27 @@ async function load() {
       throw failed[0]?.reason ?? new Error(t("xuguServerDashboard.loadFailed"));
     }
 
-    const [versionResult, nodeResult, runInfoResult, sessionResult, activeSessionResult, transactionResult, lockResult] = results;
+    const [versionResult, nodeResult, runInfoResult, sessionResult, activeSessionResult, transactionResult, lockResult, memoryResult, sessionStatusResult, lockModeResult, tablespaceResult] = results;
     if (versionResult.status === "fulfilled") version.value = xuguVersionFromResult(versionResult.value);
     if (nodeResult.status === "fulfilled") nodes.value = xuguClusterNodesFromResult(nodeResult.value);
     if (runInfoResult.status === "fulfilled") runInfo.value = xuguRunInfoFromResult(runInfoResult.value);
-    if (sessionResult.status === "fulfilled" && activeSessionResult.status === "fulfilled") {
-      const activeByNode = new Map(xuguSessionSummaryFromResult(activeSessionResult.value).map((row) => [row.nodeId, row.activeSessions]));
-      sessions.value = xuguSessionSummaryFromResult(sessionResult.value).map((row) => ({ ...row, activeSessions: activeByNode.get(row.nodeId) ?? "0" }));
-    } else {
-      sessions.value = [];
-    }
+    const activeByNode = activeSessionResult.status === "fulfilled" ? new Map(xuguSessionSummaryFromResult(activeSessionResult.value).map((row) => [row.nodeId, row])) : new Map();
+    sessions.value =
+      sessionResult.status === "fulfilled"
+        ? xuguSessionSummaryFromResult(sessionResult.value).map((row) => {
+            const active = activeByNode.get(row.nodeId);
+            return { ...row, activeSessions: active?.activeSessions ?? "0", oldestStatement: active?.oldestStatement ?? "" };
+          })
+        : [];
     if (transactionResult.status === "fulfilled") transactions.value = xuguTransactionSummaryFromResult(transactionResult.value);
-    if (lockResult.status === "fulfilled") lockWaits.value = xuguScalarFromResult(lockResult.value, "LOCK_WAITS");
+    if (lockResult.status === "fulfilled") {
+      lockWaits.value = xuguScalarFromResult(lockResult.value, "LOCK_WAITS");
+      lockOwners.value = xuguScalarFromResult(lockResult.value, "LOCK_OWNERS");
+    }
+    if (memoryResult.status === "fulfilled") memory.value = xuguMemoryStatusFromResult(memoryResult.value);
+    if (sessionStatusResult.status === "fulfilled") sessionStatuses.value = xuguSessionStatusSummaryFromResult(sessionStatusResult.value);
+    if (lockModeResult.status === "fulfilled") lockModes.value = xuguLockModeSummaryFromResult(lockModeResult.value);
+    if (tablespaceResult.status === "fulfilled") tablespaces.value = xuguTablespaceSummaryFromResult(tablespaceResult.value);
   } catch (cause: any) {
     error.value = cause?.message || String(cause);
   } finally {
@@ -219,13 +299,155 @@ onUnmounted(stopAutoRefresh);
         </div>
       </div>
 
+      <div class="mt-4 grid gap-4 xl:grid-cols-2">
+        <section class="overflow-hidden rounded-lg border bg-card">
+          <div class="flex items-center justify-between border-b px-3 py-2.5">
+            <div class="flex items-center gap-1.5 text-sm font-semibold"><Database class="h-4 w-4 text-primary" />{{ t("xuguServerDashboard.memoryAndCache") }}</div>
+            <div class="text-xs text-muted-foreground">{{ t("xuguServerDashboard.memoryHint") }}</div>
+          </div>
+          <div class="space-y-4 p-3">
+            <div>
+              <div class="mb-1.5 flex items-center justify-between text-xs">
+                <span>{{ t("xuguServerDashboard.bufferPool") }}</span
+                ><span class="text-muted-foreground">{{ formatBytes(bufferTotalBytes - bufferFreeBytes) }} / {{ formatBytes(bufferTotalBytes) }}</span>
+              </div>
+              <div class="h-2 overflow-hidden rounded-full bg-muted"><div class="h-full rounded-full bg-primary" :style="{ width: `${percentage(bufferTotalBytes, bufferFreeBytes)}%` }" /></div>
+              <div class="mt-1.5 flex justify-between text-[11px] text-muted-foreground">
+                <span>{{ t("xuguServerDashboard.usedPercent", { percent: percentage(bufferTotalBytes, bufferFreeBytes).toFixed(1) }) }}</span
+                ><span>{{ t("xuguServerDashboard.dirtyPages", { value: formatBytes(bufferDirtyBytes) }) }}</span>
+              </div>
+            </div>
+            <div>
+              <div class="mb-1.5 flex items-center justify-between text-xs">
+                <span>{{ t("xuguServerDashboard.sga") }}</span
+                ><span class="text-muted-foreground">{{ formatBytes(sgaTotalBytes - sgaFreeBytes) }} / {{ formatBytes(sgaTotalBytes) }}</span>
+              </div>
+              <div class="h-2 overflow-hidden rounded-full bg-muted"><div class="h-full rounded-full bg-sky-500" :style="{ width: `${percentage(sgaTotalBytes, sgaFreeBytes)}%` }" /></div>
+              <div class="mt-1.5 text-[11px] text-muted-foreground">{{ t("xuguServerDashboard.usedPercent", { percent: percentage(sgaTotalBytes, sgaFreeBytes).toFixed(1) }) }}</div>
+            </div>
+            <div>
+              <div class="mb-1.5 flex items-center justify-between text-xs">
+                <span>{{ t("xuguServerDashboard.swap") }}</span
+                ><span class="text-muted-foreground">{{ formatBytes(swapTotalBytes - swapFreeBytes) }} / {{ formatBytes(swapTotalBytes) }}</span>
+              </div>
+              <div class="h-2 overflow-hidden rounded-full bg-muted"><div class="h-full rounded-full bg-amber-500" :style="{ width: `${percentage(swapTotalBytes, swapFreeBytes)}%` }" /></div>
+              <div class="mt-1.5 text-[11px] text-muted-foreground">{{ t("xuguServerDashboard.usedPercent", { percent: percentage(swapTotalBytes, swapFreeBytes).toFixed(1) }) }}</div>
+            </div>
+          </div>
+        </section>
+
+        <section class="overflow-hidden rounded-lg border bg-card">
+          <div class="flex items-center justify-between border-b px-3 py-2.5">
+            <div class="flex items-center gap-1.5 text-sm font-semibold"><HardDrive class="h-4 w-4 text-primary" />{{ t("xuguServerDashboard.runtimeAndWrite") }}</div>
+            <div class="text-xs text-muted-foreground">{{ t("xuguServerDashboard.cumulativeHint") }}</div>
+          </div>
+          <div class="grid grid-cols-2 gap-px bg-border sm:grid-cols-4">
+            <div class="bg-card p-3">
+              <div class="text-xs text-muted-foreground">{{ t("xuguServerDashboard.diskRead") }}</div>
+              <div class="mt-1.5 text-lg font-semibold">{{ formatBytes(diskReadBytes) }}</div>
+            </div>
+            <div class="bg-card p-3">
+              <div class="text-xs text-muted-foreground">{{ t("xuguServerDashboard.diskWrite") }}</div>
+              <div class="mt-1.5 text-lg font-semibold">{{ formatBytes(diskWriteBytes) }}</div>
+            </div>
+            <div class="bg-card p-3">
+              <div class="text-xs text-muted-foreground">{{ t("xuguServerDashboard.walPending") }}</div>
+              <div class="mt-1.5 text-lg font-semibold">{{ formatBytes(walBacklog) }}</div>
+            </div>
+            <div class="bg-card p-3">
+              <div class="text-xs text-muted-foreground">{{ t("xuguServerDashboard.transactionSpan") }}</div>
+              <div class="mt-1.5 text-lg font-semibold">{{ transactionSpan }}</div>
+            </div>
+            <div class="col-span-2 bg-card p-3">
+              <div class="text-xs text-muted-foreground">{{ t("xuguServerDashboard.freeStores") }}</div>
+              <div class="mt-1.5 text-lg font-semibold">{{ freeStores }}</div>
+            </div>
+            <div class="col-span-2 bg-card p-3">
+              <div class="text-xs text-muted-foreground">{{ t("xuguServerDashboard.datafiles") }}</div>
+              <div class="mt-1.5 text-lg font-semibold">{{ totalDatafiles }}</div>
+            </div>
+          </div>
+        </section>
+      </div>
+
+      <div class="mt-4 grid gap-4 xl:grid-cols-2">
+        <section class="overflow-hidden rounded-lg border bg-card">
+          <div class="flex items-center justify-between border-b px-3 py-2.5">
+            <div class="flex items-center gap-1.5 text-sm font-semibold"><Users class="h-4 w-4 text-primary" />{{ t("xuguServerDashboard.sessionsAndTransactions") }}</div>
+            <div class="text-xs text-muted-foreground">{{ t("xuguServerDashboard.activeSessionHint") }}</div>
+          </div>
+          <div class="grid grid-cols-3 gap-px bg-border">
+            <div class="bg-card p-3">
+              <div class="text-xs text-muted-foreground">{{ t("xuguServerDashboard.idleSessions") }}</div>
+              <div class="mt-1.5 text-lg font-semibold">{{ sessionStatusCount("idle") }}</div>
+            </div>
+            <div class="bg-card p-3">
+              <div class="text-xs text-muted-foreground">{{ t("xuguServerDashboard.executingSessions") }}</div>
+              <div class="mt-1.5 text-lg font-semibold">{{ sessionStatusCount("executing") }}</div>
+            </div>
+            <div class="bg-card p-3">
+              <div class="text-xs text-muted-foreground">{{ t("xuguServerDashboard.otherSessions") }}</div>
+              <div class="mt-1.5 text-lg font-semibold">{{ otherSessionCount() }}</div>
+            </div>
+          </div>
+          <div class="grid grid-cols-2 gap-3 p-3 text-xs">
+            <div>
+              <div class="text-muted-foreground">{{ t("xuguServerDashboard.oldestStatement") }}</div>
+              <div class="mt-1 truncate font-medium" :title="sessions.find((entry) => entry.oldestStatement)?.oldestStatement">{{ sessions.find((entry) => entry.oldestStatement)?.oldestStatement || "—" }}</div>
+            </div>
+            <div>
+              <div class="text-muted-foreground">{{ t("xuguServerDashboard.oldestTransaction") }}</div>
+              <div class="mt-1 truncate font-medium" :title="transactions.find((entry) => entry.oldestTransaction)?.oldestTransaction">{{ transactions.find((entry) => entry.oldestTransaction)?.oldestTransaction || "—" }}</div>
+            </div>
+          </div>
+        </section>
+
+        <section class="overflow-hidden rounded-lg border bg-card">
+          <div class="flex items-center justify-between border-b px-3 py-2.5">
+            <div class="flex items-center gap-1.5 text-sm font-semibold"><Activity class="h-4 w-4 text-primary" />{{ t("xuguServerDashboard.locksAndCapacity") }}</div>
+            <div class="text-xs text-muted-foreground">{{ t("xuguServerDashboard.readOnlyHint") }}</div>
+          </div>
+          <div class="grid grid-cols-2 gap-px bg-border sm:grid-cols-4">
+            <div class="bg-card p-3">
+              <div class="text-xs text-muted-foreground">{{ t("xuguServerDashboard.lockOwners") }}</div>
+              <div class="mt-1.5 text-lg font-semibold">{{ lockOwners || "—" }}</div>
+            </div>
+            <div class="bg-card p-3">
+              <div class="text-xs text-muted-foreground">{{ t("xuguServerDashboard.lockWaits") }}</div>
+              <div class="mt-1.5 text-lg font-semibold">{{ lockWaits || "—" }}</div>
+            </div>
+            <div class="bg-card p-3">
+              <div class="text-xs text-muted-foreground">{{ t("xuguServerDashboard.tablespaces") }}</div>
+              <div class="mt-1.5 text-lg font-semibold">{{ tablespaces.length }}</div>
+            </div>
+            <div class="bg-card p-3">
+              <div class="text-xs text-muted-foreground">{{ t("xuguServerDashboard.mediaErrors") }}</div>
+              <div class="mt-1.5 text-lg font-semibold" :class="mediaErrors > 0 ? 'text-destructive' : ''">{{ mediaErrors }}</div>
+            </div>
+          </div>
+          <div class="border-t p-3">
+            <div class="mb-2 flex items-center justify-between text-xs">
+              <span class="text-muted-foreground">{{ t("xuguServerDashboard.lockModes") }}</span
+              ><span class="text-muted-foreground">{{ t("xuguServerDashboard.dataTempFree", { value: formatBytes(dataOrTempFreeBytes) }) }}</span>
+            </div>
+            <div class="grid grid-cols-5 gap-2 text-center text-xs">
+              <div v-for="mode in ['S', 'X', 'IS', 'IX', 'SIX']" :key="mode" class="rounded-md bg-muted/50 px-2 py-1.5">
+                <div class="text-muted-foreground">{{ mode }}</div>
+                <div class="mt-0.5 font-semibold">{{ lockModeCount(mode) }}</div>
+              </div>
+            </div>
+            <div class="mt-2 text-[11px] text-muted-foreground">{{ t("xuguServerDashboard.rowLockLimit") }}</div>
+          </div>
+        </section>
+      </div>
+
       <section class="mt-4 overflow-hidden rounded-lg border bg-card">
         <div class="flex items-center justify-between border-b px-3 py-2.5">
           <div class="text-sm font-semibold">{{ t("xuguServerDashboard.nodes") }}</div>
           <div class="text-xs text-muted-foreground">{{ t("xuguServerDashboard.readOnlyHint") }}</div>
         </div>
         <div class="overflow-auto">
-          <table class="w-full min-w-[1120px] text-left text-xs">
+          <table class="w-full min-w-[1180px] text-left text-xs">
             <thead class="bg-muted/40 text-muted-foreground">
               <tr>
                 <th class="px-3 py-2 font-medium">{{ t("xuguServerDashboard.node") }}</th>
@@ -234,9 +456,10 @@ onUnmounted(stopAutoRefresh);
                 <th class="px-3 py-2 font-medium">{{ t("xuguServerDashboard.cpuLoad") }}</th>
                 <th class="px-3 py-2 font-medium">{{ t("xuguServerDashboard.sessions") }}</th>
                 <th class="px-3 py-2 font-medium">{{ t("xuguServerDashboard.transactions") }}</th>
-                <th class="px-3 py-2 font-medium">{{ t("xuguServerDashboard.lockWaits") }}</th>
                 <th class="px-3 py-2 font-medium">{{ t("xuguServerDashboard.diskRead") }}</th>
                 <th class="px-3 py-2 font-medium">{{ t("xuguServerDashboard.diskWrite") }}</th>
+                <th class="px-3 py-2 font-medium">{{ t("xuguServerDashboard.walPending") }}</th>
+                <th class="px-3 py-2 font-medium">{{ t("xuguServerDashboard.freeStores") }}</th>
                 <th class="px-3 py-2 font-medium">{{ t("xuguServerDashboard.bootTime") }}</th>
               </tr>
             </thead>
@@ -255,13 +478,14 @@ onUnmounted(stopAutoRefresh);
                   {{ valueFor(sessionsByNode, node.nodeId, "sessions") }}<span class="ml-1 text-muted-foreground">/ {{ valueFor(sessionsByNode, node.nodeId, "activeSessions") }}</span>
                 </td>
                 <td class="px-3 py-2">{{ transactionsByNode.has(node.nodeId) ? valueFor(transactionsByNode, node.nodeId, "activeTransactions") : valueFor(runInfoByNode, node.nodeId, "activeTransactions") }}</td>
-                <td class="px-3 py-2">{{ valueFor(runInfoByNode, node.nodeId, "lockWaits") }}</td>
-                <td class="px-3 py-2">{{ valueFor(runInfoByNode, node.nodeId, "diskReadBytes") }}</td>
-                <td class="px-3 py-2">{{ valueFor(runInfoByNode, node.nodeId, "diskWriteBytes") }}</td>
+                <td class="px-3 py-2">{{ formatBytes(numeric(valueFor(runInfoByNode, node.nodeId, "diskReadBytes"))) }}</td>
+                <td class="px-3 py-2">{{ formatBytes(numeric(valueFor(runInfoByNode, node.nodeId, "diskWriteBytes"))) }}</td>
+                <td class="px-3 py-2">{{ formatBytes(Math.max(0, numeric(valueFor(runInfoByNode, node.nodeId, "xlogWritePosition")) - numeric(valueFor(runInfoByNode, node.nodeId, "xlogCheckpointPosition")))) }}</td>
+                <td class="px-3 py-2">{{ valueFor(runInfoByNode, node.nodeId, "freeStores") }}</td>
                 <td class="px-3 py-2 text-muted-foreground">{{ node.bootTime || "—" }}</td>
               </tr>
               <tr v-if="!loading && nodes.length === 0">
-                <td colspan="10" class="px-3 py-10 text-center text-muted-foreground">{{ t("xuguServerDashboard.emptyNodes") }}</td>
+                <td colspan="11" class="px-3 py-10 text-center text-muted-foreground">{{ t("xuguServerDashboard.emptyNodes") }}</td>
               </tr>
             </tbody>
           </table>
