@@ -223,11 +223,13 @@ async function load() {
     if (runInfoResult.status === "fulfilled") runInfo.value = xuguRunInfoFromResult(runInfoResult.value);
     else runInfo.value = [];
     const activeByNode = activeSessionResult.status === "fulfilled" ? new Map(xuguSessionSummaryFromResult(activeSessionResult.value).map((row) => [row.nodeId, row])) : new Map();
+    // 活跃会话查询整体失败时不能把缺失显示成硬 0，那会读成"无活跃会话"
+    const activeSessionsUnavailable = activeSessionResult.status !== "fulfilled";
     sessions.value =
       sessionResult.status === "fulfilled"
         ? xuguSessionSummaryFromResult(sessionResult.value).map((row) => {
             const active = activeByNode.get(row.nodeId);
-            return { ...row, activeSessions: active?.activeSessions ?? "0", oldestStatement: active?.oldestStatement ?? "" };
+            return { ...row, activeSessions: active?.activeSessions ?? (activeSessionsUnavailable ? "—" : "0"), oldestStatement: active?.oldestStatement ?? "" };
           })
         : [];
     if (transactionResult.status === "fulfilled") transactions.value = xuguTransactionSummaryFromResult(transactionResult.value);
