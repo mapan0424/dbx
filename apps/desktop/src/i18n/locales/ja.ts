@@ -3359,6 +3359,7 @@ export default withEnglishFallback({
     dropEventSuccess: "イベントが削除されました {name}",
     editObject: "オブジェクトを編集",
     createEvent: "イベントを作成",
+    viewDependencies: "依存関係を表示",
   },
   visibleDatabases: {
     title: "表示するデータベース",

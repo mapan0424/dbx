@@ -3333,6 +3333,7 @@ export default withEnglishFallback({
     dropEventSuccess: "Evento eliminato {name}",
     editObject: "Modifica oggetto",
     createEvent: "Nuovo evento",
+    viewDependencies: "Visualizza dipendenze",
   },
   visibleDatabases: {
     title: "Database Visibili",
