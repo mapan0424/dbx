@@ -1252,9 +1252,9 @@ fn export_sql_statement_bytes(database_type: Option<DatabaseType>, text: &str) -
 }
 
 pub(crate) fn is_internal_export_column(database_type: Option<DatabaseType>, column: &str) -> bool {
-    // Oracle-compatible ROWID is injected only to identify editable rows. It
-    // is not a physical table column and must never propagate into exports.
-    crate::sql_dialect::uses_oracle_row_id(database_type)
+    // Synthetic ROWID is injected only to identify editable rows. It is not a
+    // physical table column and must never propagate into exports.
+    crate::sql_dialect::uses_synthetic_row_id(database_type)
         && column.eq_ignore_ascii_case(crate::sql_dialect::DBX_ROWID_COLUMN)
 }
 

@@ -112,7 +112,7 @@ import {
   isClickHouseExistingRowReadonlyColumn,
   isHiddenGridColumn,
   isTdengineExistingRowReadonlyColumn,
-  usesSyntheticRowIdKey,
+  shouldIncludeSyntheticRowId,
 } from "@/lib/table/tableEditing";
 import { buildDataGridColumnDistinctValuesSql, buildDataGridConditionalUpdateSql, buildDataGridContextFilterCondition, buildDataGridCountSql, buildHiveTablePropertiesSql, type DataGridContextFilterMode } from "@/lib/dataGrid/dataGridSql";
 import {
@@ -4349,7 +4349,7 @@ async function refreshSavedRows(request: { dirtyRows: ReadonlyMap<number, Readon
     ...tableDataLargeValuePreviewOptions(resolvedDatabaseType.value, tableMeta.columns, tableMeta.primaryKeys, pageSize.value),
     whereInput: identityConditions.join(" OR "),
     limit: planResult.plan.sourceIndexes.length + 1,
-    includeRowId: usesSyntheticRowIdKey(resolvedDatabaseType.value, tableMeta.primaryKeys, tableMeta.tableType),
+    includeRowId: shouldIncludeSyntheticRowId(resolvedDatabaseType.value, tableMeta.primaryKeys, tableMeta.tableType),
   });
   const refreshed = await api.executeQuery(connectionId, props.executionDatabase ?? props.database ?? "", sql, tableMeta.schema ?? props.schema, undefined, {
     maxRows: planResult.plan.sourceIndexes.length + 1,
@@ -5542,7 +5542,7 @@ async function hydrateVisibleLargeValuePreviews(generation: number) {
     whereInput: predicates.map((predicate) => `(${predicate})`).join(" OR "),
     limit: requests.size,
     offset: 0,
-    includeRowId: usesSyntheticRowIdKey(resolvedDatabaseType.value, tableMeta.primaryKeys, tableMeta.tableType),
+    includeRowId: shouldIncludeSyntheticRowId(resolvedDatabaseType.value, tableMeta.primaryKeys, tableMeta.tableType),
   });
   if (!visibleLargeValuePreviewActive || generation !== visibleLargeValuePreviewRequestedGeneration || props.result !== sourceResult) return;
   const connection = connectionStore.getConfig(props.connectionId);
@@ -5709,7 +5709,7 @@ async function fetchLargeValueRequestChunk(columnIndex: number, requests: LargeV
     whereInput: predicates.map((predicate) => `(${predicate})`).join(" OR "),
     limit: requests.length,
     offset: 0,
-    includeRowId: usesSyntheticRowIdKey(resolvedDatabaseType.value, tableMeta.primaryKeys, tableMeta.tableType),
+    includeRowId: shouldIncludeSyntheticRowId(resolvedDatabaseType.value, tableMeta.primaryKeys, tableMeta.tableType),
   });
   const connection = props.connectionId ? connectionStore.getConfig(props.connectionId) : undefined;
   const results = await api.executeMulti(props.connectionId!, props.executionDatabase ?? props.database ?? "", sql, undefined, uuid(), {
@@ -7115,7 +7115,7 @@ async function applyOrderBySearch() {
       injectDefaultTimeSeriesWhere: true,
       limit: pageSize.value,
       whereInput: currentWhereInput(),
-      includeRowId: usesSyntheticRowIdKey(resolvedDatabaseType.value, tableMeta.primaryKeys, tableMeta.tableType),
+      includeRowId: shouldIncludeSyntheticRowId(resolvedDatabaseType.value, tableMeta.primaryKeys, tableMeta.tableType),
     });
     markConditionInputsApplied();
     await props.onExecuteSql(sql);
@@ -7154,7 +7154,7 @@ async function applyWhereFilter() {
       limit: pageSize.value,
       injectDefaultTimeSeriesWhere: true,
       whereInput,
-      includeRowId: usesSyntheticRowIdKey(resolvedDatabaseType.value, tableMeta.primaryKeys, tableMeta.tableType),
+      includeRowId: shouldIncludeSyntheticRowId(resolvedDatabaseType.value, tableMeta.primaryKeys, tableMeta.tableType),
     });
     markConditionInputsApplied();
     await props.onExecuteSql(sql);
