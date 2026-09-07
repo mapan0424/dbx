@@ -109,7 +109,7 @@ export function shouldIncludeSyntheticRowId(databaseType: DatabaseType | undefin
 
 export function isHiddenGridColumn(databaseType: DatabaseType | undefined, column: string, primaryKeys: string[], tableType?: string): boolean {
   if (databaseType === "neo4j" && column === DBX_NEO4J_ELEMENT_ID_COLUMN) return true;
-  return usesSyntheticRowIdKey(databaseType, primaryKeys, tableType) && column.toUpperCase() === DBX_ROWID_COLUMN;
+  return shouldIncludeSyntheticRowId(databaseType, primaryKeys, tableType) && column.toUpperCase() === DBX_ROWID_COLUMN;
 }
 
 export function isTdengineExistingRowReadonlyColumn(databaseType: DatabaseType | undefined, column: string, columns: ColumnInfo[]): boolean {
