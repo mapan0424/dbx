@@ -3051,10 +3051,6 @@ fn oracle_character_lob_constructor(data_type: &str) -> Option<&'static str> {
     }
 }
 
-fn is_oracle_row_id(database_type: Option<DatabaseType>, name: Option<&str>) -> bool {
-    uses_oracle_row_id(database_type) && name.is_some_and(|name| name.eq_ignore_ascii_case(DBX_ROWID_COLUMN))
-}
-
 fn is_synthetic_row_id(database_type: Option<DatabaseType>, name: Option<&str>) -> bool {
     uses_synthetic_row_id(database_type) && name.is_some_and(|name| name.eq_ignore_ascii_case(DBX_ROWID_COLUMN))
 }
