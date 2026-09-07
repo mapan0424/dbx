@@ -11,7 +11,7 @@ import { canApplyDataTabMetadata, dataTabMetadataNeedsRefresh, findExistingDataT
 import type { SidebarDataOpenRequest } from "@/lib/sidebar/sidebarDataOpenCoordinator";
 import { hasTreeNodeDatabaseContext } from "@/lib/sidebar/treeNodeContext";
 import { buildTableSelectSql } from "@/lib/table/tableSelectSql";
-import { usesSyntheticRowIdKey } from "@/lib/table/tableEditing";
+import { shouldIncludeSyntheticRowId } from "@/lib/table/tableEditing";
 import { tableOpenPageLimit } from "@/lib/table/tableOpenPageLimit";
 import { canActivateExistingDataTableTab } from "@/lib/tabs/dataTabActivation";
 import { beginDataTabNavigation, endDataTabNavigation, isCurrentDataTabNavigation } from "@/lib/tabs/dataTabNavigationGeneration";
@@ -303,7 +303,7 @@ export function useSidebarDataOpenRuntime() {
 
       const columns = cachedTableMeta?.columns ?? [];
       const primaryKeys = cachedTableMeta?.primaryKeys ?? [];
-      const includeRowId = usesSyntheticRowIdKey(effectiveDbType, primaryKeys, tableType);
+      const includeRowId = shouldIncludeSyntheticRowId(effectiveDbType, primaryKeys, tableType);
       const sql = await buildTableSelectSql({
         databaseType: effectiveDbType,
         identifierQuote: connectionStore.connectionIdentifierQuote?.(node.connectionId),

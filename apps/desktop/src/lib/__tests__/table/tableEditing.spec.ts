@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   DBX_ROWID_COLUMN,
   DBX_TDENGINE_TBNAME_COLUMN,
+  canInsertTableRows,
   canDeleteExistingTdengineRows,
   canEditExistingTableRows,
   canUseKeylessRowPredicate,
@@ -12,6 +13,7 @@ import {
   isTdengineExistingRowReadonlyColumn,
   isTableDataEditable,
   supportsDataGridTransaction,
+  shouldIncludeSyntheticRowId,
   usesSyntheticRowIdKey,
 } from "@/lib/table/tableEditing";
 import type { ColumnInfo, IndexInfo } from "@/types/database";
@@ -43,6 +45,29 @@ describe("tableEditing", () => {
     expect(editablePrimaryKeys("oracle", [column("ID"), column("NAME")], "TABLE")).toEqual([DBX_ROWID_COLUMN]);
     expect(editablePrimaryKeys("oceanbase-oracle", [column("ID"), column("NAME")], "TABLE")).toEqual([DBX_ROWID_COLUMN]);
     expect(editablePrimaryKeys("oceanbase-oracle", [column("ID", true), column("NAME")], "TABLE")).toEqual(["ID"]);
+  });
+
+  it("uses Xugu ROWID for ordinary, partitioned, and temporary tables but not views", () => {
+    const columns = [column("ID"), column("VALUE")];
+    expect(editablePrimaryKeys("xugu", columns, "TABLE")).toEqual([DBX_ROWID_COLUMN]);
+    expect(editablePrimaryKeys("xugu", columns, "PARTITIONED TABLE")).toEqual([DBX_ROWID_COLUMN]);
+    expect(editablePrimaryKeys("xugu", columns, "TEMPORARY TABLE")).toEqual([DBX_ROWID_COLUMN]);
+    expect(editablePrimaryKeys("xugu", columns, "VIEW")).toEqual([]);
+    expect(usesSyntheticRowIdKey("xugu", [DBX_ROWID_COLUMN], "TABLE")).toBe(true);
+    expect(usesSyntheticRowIdKey("xugu", [DBX_ROWID_COLUMN], "PARTITIONED TABLE")).toBe(true);
+    expect(usesSyntheticRowIdKey("xugu", [DBX_ROWID_COLUMN], "TEMPORARY TABLE")).toBe(true);
+    expect(usesSyntheticRowIdKey("xugu", [DBX_ROWID_COLUMN], "VIEW")).toBe(false);
+    expect(isTableDataEditable("xugu", [DBX_ROWID_COLUMN], "TABLE")).toBe(true);
+    expect(isTableDataEditable("xugu", [DBX_ROWID_COLUMN], "VIEW")).toBe(false);
+    expect(canInsertTableRows("xugu")).toBe(true);
+  });
+
+  it("includes Xugu ROWID while cold table metadata has no declared primary keys", () => {
+    expect(shouldIncludeSyntheticRowId("xugu", [], "TABLE")).toBe(true);
+    expect(shouldIncludeSyntheticRowId("xugu", [], "PARTITIONED TABLE")).toBe(true);
+    expect(shouldIncludeSyntheticRowId("xugu", [], "TEMPORARY TABLE")).toBe(true);
+    expect(shouldIncludeSyntheticRowId("xugu", [], "VIEW")).toBe(false);
+    expect(shouldIncludeSyntheticRowId("oracle", [], "TABLE")).toBe(false);
   });
 
   it("treats view data tabs as readonly", () => {
