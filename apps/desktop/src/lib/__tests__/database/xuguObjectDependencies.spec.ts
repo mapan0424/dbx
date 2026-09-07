@@ -10,6 +10,13 @@ describe("xuguObjectDependenciesSql", () => {
     expect(sql).toContain("'DEPENDS_ON'");
     expect(sql).toContain("'REFERENCED_BY'");
     expect(sql).toContain("AND o.OBJ_TYPE = 5");
+    expect(sql).toContain("d.OWNER_ID2 = t.SCHEMA_ID AND d.OBJ_ID2 = t.OBJ_ID AND d.OBJ_TYPE2 = t.OBJ_TYPE");
+    expect(sql).toContain("SELECT 'DEPENDS_ON' AS DIRECTION, d.OWNER_ID1 AS OWNER_ID, d.OBJ_ID1 AS OBJ_ID, d.OBJ_TYPE1 AS OBJ_TYPE");
+    expect(sql).toContain("d.OWNER_ID1 = t.SCHEMA_ID AND d.OBJ_ID1 = t.OBJ_ID AND d.OBJ_TYPE1 = t.OBJ_TYPE");
+    expect(sql).toContain("SELECT 'REFERENCED_BY' AS DIRECTION, d.OWNER_ID2 AS OWNER_ID, d.OBJ_ID2 AS OBJ_ID, d.OBJ_TYPE2 AS OBJ_TYPE");
+    expect(sql).toContain("o.SCHEMA_ID = r.OWNER_ID AND o.OBJ_ID = r.OBJ_ID AND o.OBJ_TYPE = r.OBJ_TYPE");
+    expect(sql).not.toContain("t.USER_ID");
+    expect(sql).not.toContain("o.USER_ID = r.OWNER_ID");
     expect(sql).toContain("ORDER BY r.DIRECTION, s.SCHEMA_NAME, o.OBJ_NAME");
   });
 

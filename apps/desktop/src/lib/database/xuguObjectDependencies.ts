@@ -45,7 +45,7 @@ export function xuguObjectDependenciesSql(options: { schema: string; objectName:
   const objectName = quoteXuguString(options.objectName);
   const objectType = OBJECT_TYPE_CODES[options.objectType];
   return `WITH target AS (
-  SELECT o.DB_ID, o.USER_ID, o.SCHEMA_ID, o.OBJ_ID
+  SELECT o.DB_ID, o.SCHEMA_ID, o.OBJ_ID, o.OBJ_TYPE
   FROM ALL_OBJECTS o
   JOIN ALL_SCHEMAS s ON s.DB_ID = o.DB_ID AND s.SCHEMA_ID = o.SCHEMA_ID
   WHERE o.DB_ID = CURRENT_DB_ID
@@ -53,13 +53,13 @@ export function xuguObjectDependenciesSql(options: { schema: string; objectName:
     AND UPPER(o.OBJ_NAME) = UPPER(${objectName})
     AND o.OBJ_TYPE = ${objectType}
 ), dependency_rows AS (
-  SELECT 'DEPENDS_ON' AS DIRECTION, d.OWNER_ID2 AS OWNER_ID, d.OBJ_ID2 AS OBJ_ID, d.DB_ID
+  SELECT 'DEPENDS_ON' AS DIRECTION, d.OWNER_ID1 AS OWNER_ID, d.OBJ_ID1 AS OBJ_ID, d.OBJ_TYPE1 AS OBJ_TYPE, d.DB_ID
   FROM target t
-  JOIN ALL_DEPENDS d ON d.DB_ID = t.DB_ID AND d.OWNER_ID1 = t.USER_ID AND d.OBJ_ID1 = t.OBJ_ID
+  JOIN ALL_DEPENDS d ON d.DB_ID = t.DB_ID AND d.OWNER_ID2 = t.SCHEMA_ID AND d.OBJ_ID2 = t.OBJ_ID AND d.OBJ_TYPE2 = t.OBJ_TYPE
   UNION ALL
-  SELECT 'REFERENCED_BY' AS DIRECTION, d.OWNER_ID1 AS OWNER_ID, d.OBJ_ID1 AS OBJ_ID, d.DB_ID
+  SELECT 'REFERENCED_BY' AS DIRECTION, d.OWNER_ID2 AS OWNER_ID, d.OBJ_ID2 AS OBJ_ID, d.OBJ_TYPE2 AS OBJ_TYPE, d.DB_ID
   FROM target t
-  JOIN ALL_DEPENDS d ON d.DB_ID = t.DB_ID AND d.OWNER_ID2 = t.USER_ID AND d.OBJ_ID2 = t.OBJ_ID
+  JOIN ALL_DEPENDS d ON d.DB_ID = t.DB_ID AND d.OWNER_ID1 = t.SCHEMA_ID AND d.OBJ_ID1 = t.OBJ_ID AND d.OBJ_TYPE1 = t.OBJ_TYPE
 )
 SELECT r.DIRECTION,
        s.SCHEMA_NAME,
@@ -73,7 +73,7 @@ SELECT r.DIRECTION,
          ELSE 'OBJECT_' || o.OBJ_TYPE
        END AS OBJECT_TYPE
 FROM dependency_rows r
-JOIN ALL_OBJECTS o ON o.DB_ID = r.DB_ID AND o.USER_ID = r.OWNER_ID AND o.OBJ_ID = r.OBJ_ID
+JOIN ALL_OBJECTS o ON o.DB_ID = r.DB_ID AND o.SCHEMA_ID = r.OWNER_ID AND o.OBJ_ID = r.OBJ_ID AND o.OBJ_TYPE = r.OBJ_TYPE
 JOIN ALL_SCHEMAS s ON s.DB_ID = o.DB_ID AND s.SCHEMA_ID = o.SCHEMA_ID
 ORDER BY r.DIRECTION, s.SCHEMA_NAME, o.OBJ_NAME;`;
 }
