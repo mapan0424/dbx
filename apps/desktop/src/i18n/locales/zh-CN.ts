@@ -3117,6 +3117,7 @@ export default withEnglishFallback({
     dropTableSuccess: "表「{name}」已删除",
     editView: "编辑视图",
     viewSource: "查看源码",
+    viewDependencies: "查看依赖关系",
     viewObject: "查看",
     changeOpenMode: "修改打开方式",
     viewDetails: "查看详情",

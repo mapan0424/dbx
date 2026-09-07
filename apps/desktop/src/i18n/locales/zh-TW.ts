@@ -3084,6 +3084,7 @@ export default withEnglishFallback({
     dropTableSuccess: "資料表「{name}」已刪除",
     editView: "編輯檢視",
     viewSource: "檢視原始碼",
+    viewDependencies: "檢視相依關係",
     viewDetails: "檢視詳細資料",
     viewDdl: "檢視 DDL",
     viewDdlLoading: "正在讀取 DDL...",
