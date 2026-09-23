@@ -261,11 +261,11 @@ pub fn build_query_pagination_execution_plan(
         plan.page_limit = Some(options.pagination.limit);
         plan.page_offset = Some(options.pagination.offset);
         plan.use_agent_result_session = true;
-    } else if options.database_type == Some(DatabaseType::Kingbase)
+    } else if matches!(options.database_type, Some(DatabaseType::Kingbase | DatabaseType::Xugu))
         && single_selectable_statement(&options.sql, options.database_type).is_ok()
         && has_top_level_top(&options.sql)
     {
-        // Kingbase SQL Server compatibility mode rejects a statement that mixes a
+        // Kingbase SQL Server compatibility mode and Xugu reject statements mixing a
         // top-level TOP with a sibling LIMIT/OFFSET. Without an Agent cursor the
         // query-result export executes the statement once and streams the whole
         // result; the TOP clause already bounds the row count.
@@ -313,11 +313,13 @@ pub fn build_paginated_query_sql(options: PaginatedQuerySqlOptions) -> QuerySqlB
         TablePaginationStrategy::AgentMaxRows | TablePaginationStrategy::Unbounded => ok(format!("{statement};")),
         TablePaginationStrategy::IrisTop => ok(add_iris_top_limit(&statement, safe_limit)),
         TablePaginationStrategy::LimitOffset => {
-            // Kingbase SQL Server compatibility mode accepts TOP as a real clause.
+            // Kingbase SQL Server compatibility mode and Xugu accept TOP as a real clause.
             // Appending LIMIT/OFFSET alongside a top-level TOP would be rejected by
             // the server ("multiple TOP/LIMIT clauses not allowed"), so fall back to
             // the Agent cursor / client-side row cap for such statements.
-            if options.database_type == Some(DatabaseType::Kingbase) && has_top_level_top(&statement) {
+            if matches!(options.database_type, Some(DatabaseType::Kingbase | DatabaseType::Xugu))
+                && has_top_level_top(&statement)
+            {
                 return err("unsupported");
             }
             let dedup_order_by = dedup_projection_count_without_order_by(&options.original_sql);
@@ -4860,6 +4862,67 @@ WHERE u.id = picked.id;
         assert_eq!(plan.sql_to_execute, sql);
         assert!(plan.page_sql.is_none());
         assert!(plan.use_agent_result_session);
+    }
+
+    #[test]
+    fn xugu_top_clause_keeps_first_page_agent_cursor() {
+        for sql in [
+            "SELECT TOP 10 * FROM events",
+            "select top 10 * from events",
+            "/* first page */ SELECT /* bounded */ TOP 10 * FROM events",
+        ] {
+            let plan = build_query_pagination_execution_plan(QueryPaginationExecutionPlanOptions {
+                sql: sql.to_string(),
+                query_base_sql: sql.to_string(),
+                database_type: Some(DatabaseType::Xugu),
+                pagination: QueryPagination { limit: 100, offset: 0, session_id: None },
+                use_agent_cursor: true,
+                first_page_uses_actual_sql: false,
+            });
+
+            assert_eq!(plan.sql_to_execute, sql);
+            assert!(plan.page_sql.is_none());
+            assert_eq!(plan.page_limit, Some(100));
+            assert_eq!(plan.page_offset, Some(0));
+            assert!(plan.use_agent_result_session);
+            assert!(!plan.single_execution);
+        }
+    }
+
+    #[test]
+    fn xugu_top_clause_without_agent_uses_single_execution() {
+        let sql = "SELECT TOP 10 * FROM events";
+        let plan = build_query_pagination_execution_plan(QueryPaginationExecutionPlanOptions {
+            sql: sql.to_string(),
+            query_base_sql: sql.to_string(),
+            database_type: Some(DatabaseType::Xugu),
+            pagination: QueryPagination { limit: 100, offset: 0, session_id: None },
+            use_agent_cursor: false,
+            first_page_uses_actual_sql: true,
+        });
+
+        assert_eq!(plan.sql_to_execute, sql);
+        assert!(plan.page_sql.is_none());
+        assert_eq!(plan.page_limit, Some(100));
+        assert_eq!(plan.page_offset, Some(0));
+        assert!(!plan.use_agent_result_session);
+        assert!(plan.single_execution);
+    }
+
+    #[test]
+    fn xugu_top_clause_rejects_sibling_limit_on_every_page() {
+        for offset in [0, 100] {
+            let result = build_paginated_query_sql(PaginatedQuerySqlOptions {
+                original_sql: "SELECT TOP 10 * FROM events".to_string(),
+                database_type: Some(DatabaseType::Xugu),
+                limit: 100,
+                offset,
+            });
+
+            assert!(!result.ok);
+            assert!(result.sql.is_none());
+            assert_eq!(result.reason.as_deref(), Some("unsupported"));
+        }
     }
 
     #[test]
