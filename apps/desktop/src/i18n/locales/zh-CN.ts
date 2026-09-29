@@ -4844,6 +4844,8 @@ export default withEnglishFallback({
     systemWide: "此操作授予或回收实例级权限，将影响整个实例，而不只是当前数据库。",
     schema: "模式名",
     objectType: "对象类型",
+    tableColumn: "表列",
+    viewColumn: "视图列",
     object: "对象名",
     column: "列名",
     roleToGrant: "授予的角色名",

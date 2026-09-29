@@ -771,8 +771,8 @@ onBeforeUnmount(() => {
               >{{ t("xuguUserPermissions.objectType")
               }}<select v-model="objectType" class="h-9 w-full rounded-md border bg-background px-2 text-sm text-foreground">
                 <template v-if="grantScope === 'column'"
-                  ><option value="TABLE">Table column</option>
-                  <option value="VIEW">View column</option></template
+                  ><option value="TABLE">{{ t("xuguUserPermissions.tableColumn") }}</option>
+                  <option value="VIEW">{{ t("xuguUserPermissions.viewColumn") }}</option></template
                 ><template v-else
                   ><option v-for="item in XUGU_OBJECT_TYPES" :key="item.sql" :value="item.sql">{{ item.label }}</option></template
                 >

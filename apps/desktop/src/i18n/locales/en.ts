@@ -4869,6 +4869,8 @@ export default {
     systemWide: "This grants or revokes an instance-level privilege and affects the whole instance, not only the current database.",
     schema: "Schema name",
     objectType: "Object type",
+    tableColumn: "Table column",
+    viewColumn: "View column",
     object: "Object name",
     column: "Column name",
     roleToGrant: "Role name to grant",
