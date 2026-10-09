@@ -281,6 +281,11 @@ function requestedTableFilters(): Record<string, string> | undefined {
 const sourceTransferType = computed(() => transferDatabaseTypeForConnection(store.getConfig(sourceConnectionId.value)));
 const targetTransferType = computed(() => transferDatabaseTypeForConnection(store.getConfig(targetConnectionId.value)));
 const isXuguTransferPair = computed(() => sourceTransferType.value === "xugu" && targetTransferType.value === "xugu");
+// The table-name-case selector is hidden for Xugu pairs; reset any earlier choice so the
+// blocking xuguPreserveTableNames hint cannot strand the user without a visible control.
+watch(isXuguTransferPair, (isXuguPair) => {
+  if (isXuguPair) targetTableNameCase.value = "preserve";
+});
 const targetStrategyType = computed(() => (targetTransferType.value === "xugu" ? "xugu" : connectionType(targetConnectionId.value)));
 const xuguTransferHint = computed(() => {
   if (sourceTransferType.value === "xugu" || targetTransferType.value === "xugu") {

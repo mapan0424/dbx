@@ -10385,10 +10385,16 @@ fn xugu_transfer_page_sql(
     table: &str,
     schema: &str,
     catalog: Option<&str>,
+    primary_keys: &[String],
     offset: u64,
     limit: usize,
 ) -> String {
-    format!("{} LIMIT {limit} OFFSET {offset}", xugu_transfer_cursor_sql(columns, table, schema, catalog))
+    // Re-running LIMIT/OFFSET pages is unstable for tables without a unique key
+    // (rows can be skipped or repeated), so order by the primary key when present.
+    let order = postgres_order_by_expression(primary_keys, &DatabaseType::Xugu)
+        .map(|expression| format!(" ORDER BY {expression}"))
+        .unwrap_or_default();
+    format!("{}{order} LIMIT {limit} OFFSET {offset}", xugu_transfer_cursor_sql(columns, table, schema, catalog))
 }
 
 /// Build a source-side projection for Xugu transfer rows whose wire values are
@@ -11767,6 +11773,7 @@ where
                     table,
                     &request.source_schema,
                     request.source_catalog.as_deref(),
+                    &primary_key_columns,
                     offset,
                     batch_size,
                 );
@@ -15499,9 +15506,22 @@ CREATE TABLE "Other"."prefix""Source"."NAME" ("ID" INT);"#;
         assert!(xugu_transfer_shares_agent_session(&DatabaseType::Xugu, "conn:SYSTEM", "conn:SYSTEM"));
         assert!(!xugu_transfer_shares_agent_session(&DatabaseType::Xugu, "conn:SYSTEM", "conn:GIS"));
         assert!(!xugu_transfer_shares_agent_session(&DatabaseType::Postgres, "conn", "conn"));
-        let sql = xugu_transfer_page_sql(&[test_column("G", "GEOMETRY")], "SHAPES", "APP", None, 1000, 1000);
+        let sql = xugu_transfer_page_sql(&[test_column("G", "GEOMETRY")], "SHAPES", "APP", None, &[], 1000, 1000);
         assert!(sql.contains("ST_AsEWKB(\"G\")"));
         assert!(sql.ends_with("LIMIT 1000 OFFSET 1000"));
+
+        // A primary key makes LIMIT/OFFSET paging deterministic; without one the
+        // plain projection keeps the previous behavior.
+        let keyed = xugu_transfer_page_sql(
+            &[test_column("ID", "INTEGER"), test_column("G", "GEOMETRY")],
+            "SHAPES",
+            "APP",
+            None,
+            &["ID".to_string()],
+            2000,
+            1000,
+        );
+        assert!(keyed.contains(" ORDER BY \"ID\" LIMIT 1000 OFFSET 2000"));
     }
 
     #[test]
