@@ -1942,6 +1942,8 @@ export interface TabUiState {
   page?: Record<string, TabPageUiState>;
 }
 
+export type DatabaseSearchScope = "data" | "structure";
+
 export interface DatabaseSearchResultItem {
   id: string;
   schema?: string;
@@ -1950,6 +1952,11 @@ export interface DatabaseSearchResultItem {
   matchedColumns: string[];
   preview: string;
   whereInput: string;
+  /** Present for structure-scope hits (column name / comment search). */
+  searchScope?: DatabaseSearchScope;
+  columnName?: string;
+  columnComment?: string;
+  structureMatchIn?: Array<"name" | "comment">;
 }
 
 export interface DatabaseSearchTableTask {
@@ -1959,6 +1966,7 @@ export interface DatabaseSearchTableTask {
 
 export interface DatabaseSearchTabState {
   keyword: string;
+  searchScope?: DatabaseSearchScope;
   perTableLimit: number;
   progressDone: number;
   progressTotal: number;
@@ -1987,6 +1995,11 @@ export interface QueryTab {
    */
   titleNumber?: number;
   titleNumberKey?: string;
+  /**
+   * User-chosen suffix shown after the tab title (set from the tab context menu).
+   * It replaces the automatic `titleNumber` for this tab and is persisted with it.
+   */
+  titleSuffix?: string;
   /** Force the editor to word-wrap regardless of the global setting, e.g. for auto-generated single-line templates. */
   forceWordWrap?: boolean;
   connectionId: string;
@@ -2100,6 +2113,7 @@ export interface QueryTab {
     columnName: string;
   };
   executionId?: string;
+  liveQueryMessages?: QueryMessage[];
   /** Ephemeral result run targeted by the current execution; null means a new run is being produced. */
   executingResultRunId?: string | null;
   isExplaining?: boolean;
