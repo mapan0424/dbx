@@ -66,7 +66,6 @@ fn render_definition(
     let at = |p: usize| indices.get(p).and_then(|i| tokens.get(*i));
     let q = |s: &str| quote_identifier(s, &DatabaseType::Xugu);
     let qualified = format!("{}.{}", q(target_schema), q(name));
-    let body_start;
     if *kind == db::ObjectSourceKind::View && at(0).is_some_and(|t| word(t, "SELECT") || word(t, "WITH")) {
         let ddl = format!("CREATE VIEW {}.{} AS\n{source}", q(source_schema), q(name));
         return render_definition(&ddl, kind, name, source_schema, target_schema);
@@ -110,7 +109,7 @@ fn render_definition(
         }
         p += 1;
     }
-    body_start = *indices.get(p).ok_or("Incomplete object definition")?;
+    let body_start = *indices.get(p).ok_or("Incomplete object definition")?;
     // A qualifier can also be an alias or a PL/SQL variable. Fail closed when
     // the source schema name is declared/used as an unqualified identifier;
     // rewriting its later dotted references would silently change semantics.
