@@ -51,12 +51,24 @@ fn identifier_matches(token: &Token, expected: &str) -> bool {
 
 /// Rewrite identifiers, not string literals/comments/dynamic SQL. Always qualify the
 /// declaration, including catalog definitions whose object name was unqualified.
+#[cfg(test)]
 fn render_definition(
     source: &str,
     kind: &db::ObjectSourceKind,
     name: &str,
     source_schema: &str,
     target_schema: &str,
+) -> Result<String, String> {
+    render_definition_in_scope(source, kind, name, source_schema, target_schema, false)
+}
+
+fn render_definition_in_scope(
+    source: &str,
+    kind: &db::ObjectSourceKind,
+    name: &str,
+    source_schema: &str,
+    target_schema: &str,
+    schema_is_package: bool,
 ) -> Result<String, String> {
     let source = source.trim();
     let source = source.strip_suffix("\n/").unwrap_or(source).trim_end();
@@ -68,7 +80,7 @@ fn render_definition(
     let qualified = format!("{}.{}", q(target_schema), q(name));
     if *kind == db::ObjectSourceKind::View && at(0).is_some_and(|t| word(t, "SELECT") || word(t, "WITH")) {
         let ddl = format!("CREATE VIEW {}.{} AS\n{source}", q(source_schema), q(name));
-        return render_definition(&ddl, kind, name, source_schema, target_schema);
+        return render_definition_in_scope(&ddl, kind, name, source_schema, target_schema, schema_is_package);
     }
     let mut p = 0;
     if at(p).is_some_and(|t| word(t, "CREATE")) {
@@ -110,6 +122,8 @@ fn render_definition(
         p += 1;
     }
     let body_start = *indices.get(p).ok_or("Incomplete object definition")?;
+    let package_shadows_schema = schema_is_package
+        || (matches!(kind, db::ObjectSourceKind::Package | db::ObjectSourceKind::PackageBody) && name == source_schema);
     // A qualifier can also be an alias or a PL/SQL variable. Fail closed when
     // the source schema name is declared/used as an unqualified identifier;
     // rewriting its later dotted references would silently change semantics.
@@ -126,12 +140,24 @@ fn render_definition(
     }
     // Only the schema token preceding a period is rewritten. Quoted identifiers
     // retain exact-case semantics; unquoted identifiers follow Xugu case folding.
-    for pair in indices.windows(2) {
-        if pair[0] >= body_start
-            && tokens[pair[1]] == Token::Period
-            && identifier_matches(&tokens[pair[0]], source_schema)
+    for (position, index) in indices.iter().enumerate() {
+        if *index >= body_start
+            && indices.get(position + 1).map(|i| &tokens[*i]) == Some(&Token::Period)
+            && position.checked_sub(1).map(|p| &tokens[indices[p]]) != Some(&Token::Period)
+            && identifier_matches(&tokens[*index], source_schema)
         {
-            tokens[pair[0]] = Token::Word(sqlparser::tokenizer::Word {
+            // In a package named like its schema, SRC.F can mean a package
+            // member rather than a schema-qualified standalone function. No
+            // token-only rewrite can prove which meaning the compiler chose.
+            let relation_position = position.checked_sub(1).is_some_and(|p| {
+                ["FROM", "JOIN", "UPDATE", "INTO", "REFERENCES"].iter().any(|k| word(&tokens[indices[p]], k))
+            });
+            if source_schema != target_schema && package_shadows_schema && !relation_position {
+                return Err(format!(
+                    "Ambiguous package/schema qualifier {source_schema} in {name}; cross-schema transfer refused"
+                ));
+            }
+            tokens[*index] = Token::Word(sqlparser::tokenizer::Word {
                 value: target_schema.into(),
                 quote_style: Some('"'),
                 keyword: sqlparser::keywords::Keyword::NoKeyword,
@@ -195,6 +221,96 @@ fn dependencies_sql(schema: &str) -> String {
       WHERE o.DB_ID=CURRENT_DB_ID AND s.SCHEMA_NAME={} AND r.SCHEMA_ID=o.SCHEMA_ID",quote_string_literal(schema))
 }
 
+struct CteBinding {
+    name: Token,
+    declaration: usize,
+    visible: std::ops::Range<usize>,
+}
+
+fn closing_parenthesis(code: &[&Token], start: usize) -> Option<usize> {
+    if code.get(start).copied() != Some(&Token::LParen) {
+        return None;
+    }
+    let mut depth = 0;
+    for (i, token) in code.iter().enumerate().skip(start) {
+        match token {
+            Token::LParen => depth += 1,
+            Token::RParen => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// CTE names are query-local relations, not catalog objects. Preserve lexical
+/// scope, sequential visibility and quoted case; an explicit schema qualifier
+/// still denotes a real object even when a CTE has the same name.
+fn cte_bindings(code: &[&Token]) -> Result<Vec<CteBinding>, String> {
+    let mut bindings = Vec::new();
+    for start in 0..code.len() {
+        if !word(code[start], "WITH") {
+            continue;
+        }
+        let mut p = start + 1;
+        let recursive = code.get(p).is_some_and(|t| word(t, "RECURSIVE"));
+        p += usize::from(recursive);
+        let mut depth = 0;
+        let end = (p..code.len())
+            .find(|&i| match code[i] {
+                Token::LParen => {
+                    depth += 1;
+                    false
+                }
+                Token::RParen if depth == 0 => true,
+                Token::RParen => {
+                    depth -= 1;
+                    false
+                }
+                Token::SemiColon => depth == 0,
+                _ => false,
+            })
+            .unwrap_or(code.len());
+        let first_body = p;
+        while p < end && matches!(code[p], Token::Word(_)) {
+            let declaration = p;
+            let name = code[p].clone();
+            p += 1;
+            if code.get(p).copied() == Some(&Token::LParen) {
+                p = closing_parenthesis(code, p).ok_or("Incomplete CTE column list")? + 1;
+            }
+            if !code.get(p).is_some_and(|t| word(t, "AS")) {
+                break; // WITH CHECK OPTION, WITH READ ONLY, etc.
+            }
+            p += 1;
+            if code.get(p).is_some_and(|t| word(t, "NOT")) {
+                p += 1;
+            }
+            if code.get(p).is_some_and(|t| word(t, "MATERIALIZED")) {
+                p += 1;
+            }
+            let Some(close) = closing_parenthesis(code, p) else {
+                return Err("Incomplete or unsupported CTE definition".into());
+            };
+            bindings.push(CteBinding {
+                name,
+                declaration,
+                visible: (if recursive { first_body } else { close + 1 })..end,
+            });
+            p = close + 1;
+            if code.get(p).copied() != Some(&Token::Comma) {
+                break;
+            }
+            p += 1;
+        }
+    }
+    Ok(bindings)
+}
+
 /// Supplement incomplete dependency dictionaries using identifier tokens in the
 /// definitions we already read. This is ordering only, not SQL rewriting or an
 /// automatic dependency-copy closure. Literals/comments and explicitly external
@@ -210,6 +326,7 @@ fn add_definition_dependencies(
         for ddl in std::iter::once(object.definition.as_str()).chain(object.package_body.as_deref()) {
             let tokens = Tokenizer::new(&GenericDialect {}, ddl).tokenize().map_err(|e| e.to_string())?;
             let code: Vec<&Token> = tokens.iter().filter(|t| !matches!(t, Token::Whitespace(_))).collect();
+            let ctes = cte_bindings(&code)?;
             let local_routines: Vec<&Token> = code
                 .windows(2)
                 .filter(|pair| word(pair[0], "FUNCTION") || word(pair[0], "PROCEDURE"))
@@ -222,6 +339,18 @@ fn add_definition_dependencies(
                 };
                 let previous = i.checked_sub(1).and_then(|p| code.get(p)).copied();
                 let next = code.get(i + 1).copied();
+                let cte_name = ctes.iter().any(|cte| {
+                    cte.declaration == i
+                        || (cte.visible.contains(&i)
+                            && identifier_matches(&cte.name, name)
+                            && previous != Some(&Token::Period)
+                            && next != Some(&Token::LParen)
+                            && (next == Some(&Token::Period)
+                                || previous.is_some_and(|t| word(t, "FROM") || word(t, "JOIN"))))
+                });
+                if cte_name {
+                    continue;
+                }
                 let is_reference = if previous == Some(&Token::Period) {
                     i.checked_sub(2).and_then(|p| code.get(p)).is_some_and(|qualifier| {
                         identifier_matches(qualifier, source_schema) || identifier_matches(qualifier, target_schema)
@@ -262,9 +391,14 @@ fn order_objects(mut objects: Vec<PlannedObject>) -> Result<Vec<PlannedObject>, 
                         || objects.iter().all(|other| other.kind == TransferObjectKind::Trigger || other.exists)))
         });
         let Some(i) = next else {
+            let phase_note = if objects.iter().any(|o| o.package_body.is_some()) {
+                "; separate package specification/body compilation phases are not supported"
+            } else {
+                ""
+            };
             return Err(format!(
-                "Cyclic Xugu object dependencies: {}",
-                objects.iter().map(|o| o.name.as_str()).collect::<Vec<_>>().join(", ")
+                "Cyclic Xugu object dependencies: {}{phase_note}",
+                objects.iter().map(|o| o.name.as_str()).collect::<Vec<_>>().join(", "),
             ));
         };
         ordered.push(objects.remove(i));
@@ -285,6 +419,26 @@ pub(crate) async fn prepare(state: &AppState, request: &TransferRequest, source_
     }
     let mut objects = Vec::new();
     let mut seen = HashSet::new();
+    // The qualifier can occur outside the package too. Include unselected,
+    // visible packages before treating the prefix as a schema name.
+    let schema_is_package = if request.source_schema != request.target_schema {
+        crate::schema::list_objects_core(
+            state,
+            &request.source_connection_id,
+            &request.source_database,
+            &request.source_schema,
+            None,
+            None,
+            None,
+            Some(&["PACKAGE".to_string()]),
+            None,
+        )
+        .await?
+        .iter()
+        .any(|package| package.name == request.source_schema)
+    } else {
+        false
+    };
     for selection in request.objects.as_deref().unwrap_or_default() {
         if selection.object_type == TransferObjectKind::Table {
             continue;
@@ -376,8 +530,14 @@ pub(crate) async fn prepare(state: &AppState, request: &TransferRequest, source_
                     None,
                 )
                 .await?;
-                object.definition =
-                    render_definition(&source.source, &kind, name, &request.source_schema, &request.target_schema)?;
+                object.definition = render_definition_in_scope(
+                    &source.source,
+                    &kind,
+                    name,
+                    &request.source_schema,
+                    &request.target_schema,
+                    schema_is_package,
+                )?;
                 if selection.object_type == TransferObjectKind::Package {
                     let body = crate::schema::get_object_source_core(
                         state,
@@ -391,12 +551,13 @@ pub(crate) async fn prepare(state: &AppState, request: &TransferRequest, source_
                     )
                     .await?;
                     if !body.source.trim().is_empty() {
-                        object.package_body = Some(render_definition(
+                        object.package_body = Some(render_definition_in_scope(
                             &body.source,
                             &db::ObjectSourceKind::PackageBody,
                             name,
                             &request.source_schema,
                             &request.target_schema,
+                            schema_is_package,
                         )?);
                     }
                 }
@@ -710,6 +871,139 @@ mod tests {
         assert_eq!(ordered.len(), 2);
         assert!(ordered.iter().any(|o| o.name == "B" && o.exists));
         assert!(ordered.iter().any(|o| o.name == "A" && !o.exists));
+    }
+
+    #[test]
+    fn cte_names_do_not_create_false_catalog_dependencies_or_cycles() {
+        use TransferObjectKind::*;
+        for query in [
+            "WITH V_B AS (SELECT 1 AS N) SELECT N FROM V_B",
+            "WITH V_B(N) AS (SELECT 1) SELECT V_B.N FROM V_B",
+            "WITH FIRST_CTE AS (SELECT 1 AS N), V_B AS (SELECT N FROM FIRST_CTE) SELECT N FROM V_B",
+            "WITH RECURSIVE V_B(N) AS (SELECT 1 UNION ALL SELECT N + 1 FROM V_B WHERE N < 3) SELECT N FROM V_B",
+            "SELECT N FROM (WITH V_B AS (SELECT 1 AS N) SELECT N FROM V_B) Q",
+        ] {
+            let mut objects = vec![planned(View, "V_A", &[]), planned(View, "V_B", &[])];
+            objects[0].definition = format!("CREATE VIEW DST.V_A AS {query}");
+            objects[1].definition = "CREATE VIEW DST.V_B AS SELECT N FROM DST.V_A".into();
+            add_definition_dependencies(&mut objects, &[], "SRC", "DST").unwrap();
+            assert!(objects[0].dependencies.is_empty(), "{query}");
+            let ordered = order_objects(objects).unwrap();
+            assert_eq!(ordered[0].name, "V_A");
+            assert_eq!(ordered[1].name, "V_B");
+        }
+    }
+
+    #[test]
+    fn cte_scopes_preserve_real_qualified_outer_and_function_dependencies() {
+        use TransferObjectKind::*;
+        for query in [
+            // A non-recursive CTE cannot shadow the relation in its own body.
+            "WITH V_B AS (SELECT * FROM V_B) SELECT * FROM V_B",
+            "WITH V_B AS (SELECT 1 AS N) SELECT * FROM DST.V_B",
+            "SELECT * FROM (WITH V_B AS (SELECT 1 AS N) SELECT N FROM V_B) Q JOIN V_B ON 1=1",
+            // Quoted CTE names retain exact case.
+            "WITH \"v_b\" AS (SELECT 1 AS N) SELECT * FROM V_B",
+            // Relation aliases do not shadow the function namespace.
+            "WITH V_B AS (SELECT 1 AS N) SELECT V_B() FROM V_B",
+            // CTE declarations in a later statement cannot affect earlier ones.
+            "SELECT * FROM V_B; WITH V_B AS (SELECT 1 AS N) SELECT N FROM V_B",
+        ] {
+            let mut objects = vec![planned(View, "V_A", &[]), planned(View, "V_B", &[])];
+            objects[0].definition = format!("CREATE VIEW DST.V_A AS {query}");
+            add_definition_dependencies(&mut objects, &[], "SRC", "DST").unwrap();
+            assert!(objects[0].dependencies.contains("V_B"), "{query}");
+        }
+    }
+
+    #[test]
+    fn ctes_in_programmable_objects_have_statement_local_scope() {
+        use TransferObjectKind::*;
+        let mut objects = vec![planned(Procedure, "P", &[]), planned(View, "V", &[])];
+        objects[0].definition =
+            "CREATE PROCEDURE DST.P AS BEGIN WITH V AS (SELECT 1 AS N) SELECT N FROM V; SELECT * FROM DST.V; END;"
+                .into();
+        add_definition_dependencies(&mut objects, &[], "SRC", "DST").unwrap();
+        assert!(objects[0].dependencies.contains("V"));
+        objects[0].dependencies.clear();
+        objects[0].definition =
+            "CREATE PROCEDURE DST.P AS BEGIN WITH V AS (SELECT 1 AS N) SELECT N FROM V; END;".into();
+        add_definition_dependencies(&mut objects, &[], "SRC", "DST").unwrap();
+        assert!(objects[0].dependencies.is_empty());
+    }
+
+    #[test]
+    fn package_phase_cycles_are_explicitly_rejected_before_execution() {
+        use TransferObjectKind::*;
+        let mut package = planned(Package, "PKG", &[]);
+        package.package_body = Some(
+            "CREATE PACKAGE BODY DST.PKG AS FUNCTION F(N INT) RETURN INT AS BEGIN RETURN DST.G(N); END; END;".into(),
+        );
+        let mut function = planned(Function, "G", &[]);
+        function.definition = "CREATE FUNCTION DST.G(N INT) RETURN INT AS BEGIN RETURN DST.PKG.BASE(N); END;".into();
+        let mut objects = vec![package, function];
+        add_definition_dependencies(&mut objects, &[], "SRC", "DST").unwrap();
+        let error = order_objects(objects).unwrap_err();
+        assert!(error.contains("Cyclic Xugu object dependencies"));
+        assert!(error.contains("separate package specification/body compilation phases are not supported"));
+    }
+
+    #[test]
+    fn same_named_package_and_schema_never_rewrite_ambiguous_member_calls() {
+        for kind in [db::ObjectSourceKind::Package, db::ObjectSourceKind::PackageBody] {
+            let source = format!(
+                "CREATE {} SRC.SRC AS FUNCTION F RETURN INT AS BEGIN RETURN SRC.G(); END; END;",
+                keyword(&kind)
+            );
+            let error = render_definition(&source, &kind, "SRC", "SRC", "DST").unwrap_err();
+            assert!(error.contains("Ambiguous package/schema qualifier"));
+            let unchanged = render_definition(&source, &kind, "SRC", "SRC", "SRC").unwrap();
+            assert!(unchanged.contains("RETURN \"SRC\".G()"));
+        }
+        let literal = render_definition(
+            "PACKAGE SRC.SRC AS V VARCHAR := 'SRC.G()'; END;",
+            &db::ObjectSourceKind::Package,
+            "SRC",
+            "SRC",
+            "DST",
+        )
+        .unwrap();
+        assert!(literal.contains("'SRC.G()'"));
+    }
+
+    #[test]
+    fn only_the_first_schema_qualifier_is_rewritten() {
+        let ddl = render_definition(
+            "SELECT OTHER.SRC.ID, SRC.T.ID FROM OTHER.SRC JOIN SRC.T ON 1=1",
+            &db::ObjectSourceKind::View,
+            "V",
+            "SRC",
+            "DST",
+        );
+        // An unqualified schema-name occurrence remains conservatively rejected.
+        assert!(ddl.is_err());
+        let ddl = render_definition("SELECT OTHER.SRC.ID FROM OTHER.T", &db::ObjectSourceKind::View, "V", "SRC", "DST")
+            .unwrap();
+        assert!(ddl.contains("OTHER.SRC.ID"));
+        assert!(!ddl.contains("OTHER.\"DST\""));
+    }
+
+    #[test]
+    fn unselected_same_named_packages_also_guard_view_and_routine_rewrites() {
+        for (kind, source) in [
+            (db::ObjectSourceKind::View, "SELECT SRC.G(1) AS N FROM DUAL"),
+            (db::ObjectSourceKind::Function, "FUNCTION F RETURN INT AS BEGIN RETURN SRC.G(1); END;"),
+        ] {
+            assert!(render_definition_in_scope(source, &kind, "F", "SRC", "DST", true)
+                .unwrap_err()
+                .contains("Ambiguous package/schema qualifier"));
+            let sql = render_definition_in_scope(source, &kind, "F", "SRC", "DST", false).unwrap();
+            assert!(sql.contains("\"DST\".G(1)"));
+        }
+        let sql =
+            render_definition_in_scope("SELECT N FROM SRC.V", &db::ObjectSourceKind::View, "F", "SRC", "DST", true)
+                .unwrap();
+        assert!(sql.contains("FROM \"DST\".V"));
     }
 
     #[test]
