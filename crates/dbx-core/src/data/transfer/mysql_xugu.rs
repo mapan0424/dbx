@@ -627,6 +627,21 @@ pub(super) fn validate_rows(columns: &[db::ColumnInfo], rows: &[Vec<serde_json::
     Ok(())
 }
 
+/// Doris/SelectDB/StarRocks/OceanBase-MySQL/TiDB/Manticore/Dolt connections are
+/// saved as `db_type=mysql` plus a `driver_profile` and deliberately surface as
+/// MySQL in the transfer dialog; this pair's contract is a native MySQL server
+/// only, so any of those profiles must be rejected before the first query.
+fn profile_allows_native_mysql_pair(config: &ConnectionConfig) -> bool {
+    let db_type = &config.db_type;
+    let profile = config.driver_profile.as_deref();
+    !(db::doris::is_profile(db_type, profile)
+        || db::starrocks::is_profile(db_type, profile)
+        || db::oceanbase_mysql::is_profile(db_type, profile)
+        || db::tidb::is_profile(db_type, profile)
+        || db::manticoresearch::is_profile(db_type, profile)
+        || db::dolt::is_config(config))
+}
+
 /// Run before the overwrite pre-pass, not just before CREATE TABLE. Reading an
 /// unsupported source must never clear an existing target first.
 pub(crate) fn preflight<'a>(
@@ -638,6 +653,16 @@ pub(crate) fn preflight<'a>(
     // Keep metadata's large async implementation out of the runner's future
     // layout (including downstream consumers' default recursion limit).
     Box::pin(async move {
+        let source_is_plain_mysql = {
+            let configs = state.configs.read().await;
+            configs.get(&request.source_connection_id).is_some_and(profile_allows_native_mysql_pair)
+        };
+        if !source_is_plain_mysql {
+            return Err("MySQL → Xugu currently requires a native MySQL server: MySQL-compatible product \
+                 profiles (Doris/SelectDB/StarRocks/OceanBase/TiDB/Manticore/Dolt) are not enabled \
+                 for this pair"
+                .into());
+        }
         let version = execute_read_on_pool(
             state,
             source_pool,
@@ -765,6 +790,30 @@ mod tests {
             assert!(!is_pair(&engine, &DatabaseType::Xugu));
             assert!(!is_pair(&DatabaseType::Xugu, &engine));
         }
+    }
+
+    fn profile_config(db_type: &str, driver_profile: Option<&str>) -> ConnectionConfig {
+        serde_json::from_value(json!({
+            "id": "test",
+            "name": "test",
+            "db_type": db_type,
+            "driver_profile": driver_profile,
+            "host": "",
+            "port": 3306,
+            "username": "",
+            "password": "",
+        }))
+        .expect("test connection config")
+    }
+
+    #[test]
+    fn native_mysql_pair_rejects_compatible_product_profiles() {
+        assert!(profile_allows_native_mysql_pair(&profile_config("mysql", None)));
+        for profile in ["doris", "selectdb", "starrocks", "oceanbase", "tidb", "manticoresearch", "dolt"] {
+            let config = profile_config("mysql", Some(profile));
+            assert!(!profile_allows_native_mysql_pair(&config), "profile {profile} must be rejected");
+        }
+        assert!(!profile_allows_native_mysql_pair(&profile_config("doris", None)));
     }
 
     #[test]
