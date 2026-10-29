@@ -362,7 +362,7 @@ fn default_sql(expr: &Expr, column: &db::ColumnInfo) -> Result<String, String> {
                 if text.is_empty() {
                     return Ok("NULL".into());
                 }
-                validate_rows(&[column.clone()], &[vec![text.clone().into()]])?;
+                validate_rows(std::slice::from_ref(column), &[vec![text.clone().into()]])?;
                 Ok(quote_string_literal(text))
             }
             _ => Err(format!("Unsupported Oracle default on '{}'", column.name)),
@@ -576,10 +576,7 @@ pub(super) fn normalize_lob_rows(
                 Some(2)
                     if row[index]
                         .as_str()
-                        .is_some_and(|value| !value.is_empty() && (!binary || !value.eq_ignore_ascii_case("0x"))) =>
-                {
-                    ()
-                }
+                        .is_some_and(|value| !value.is_empty() && (!binary || !value.eq_ignore_ascii_case("0x"))) => {}
                 _ => {
                     return Err(format!(
                         "Oracle LOB '{}' has missing or conflicting state evidence",
