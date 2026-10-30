@@ -279,6 +279,20 @@ not-live-tested entries, is [the type coverage matrix](postgres-xugu-type-covera
 This does not fix the separately deferred native Go-driver BIT grid-display
 issue; bit data was checked through explicit server-side text projection.
 
+The screenshot below is an actual packaged DEV query result, cropped to remove
+all connection, account and endpoint information. It shows all four extended
+fixture rows passing value checks through the ordinary target connection.
+
+![Packaged DEV extended-value checks](../screenshots/postgres-xugu-transfer-values.png)
+
+### Submission base
+
+The implementation was rebased without conflicts onto upstream main `493ddf946`
+after its packaged UI verification. The pair-specific production files had no
+intervening upstream changes. Submission-time unit and public-API live checks
+were rerun against that base. The earlier packaged verification is not claimed
+to be a newly generated package of that later base.
+
 ### Opt-in live test
 
 Provide disposable JSON connection configurations in
