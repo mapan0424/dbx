@@ -44,7 +44,7 @@ async fn live_xugu_text_transfer_retains_exact_escapes_across_pages_and_modes() 
     }
     let src_pool = state.get_or_create_pool(&source.id, source.database.as_deref()).await.unwrap();
     let dst_pool = state.get_or_create_pool(&target.id, target.database.as_deref()).await.unwrap();
-    let table = format!("DBX_TEXT_{}", &uuid::Uuid::new_v4().simple().to_string()[..8].to_uppercase());
+    let table = format!("DBX_TEXT_{}", uuid::Uuid::new_v4().simple().to_string()[..8].to_uppercase());
     let src = format!("{}.{}", quote(&source_schema), quote(&table));
     let dst = format!("{}.{}", quote(&target_schema), quote(&table));
     let same_database_dst = format!("{}.{}", quote(&target_schema), quote(&table));
